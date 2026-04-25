@@ -214,24 +214,61 @@ macOS-version-specific bugs.
   can read/write the tree (issue #38, open).
 - Last release 0.10.2 (Apr 2024). Small-team project.
 
-### 4.3 The FUSE question
+### 4.3 Transport: recommended architecture
 
-For a Linux-first project, **FUSE is probably the better fit**:
+Researched separately; punch line: **no off-the-shelf NFS↔FUSE bridge is
+worth taking on.** Survey of options:
 
-- Rootless mount via `fusermount3` (setuid helper bundled with `fuse3`).
-- Real client-side invalidation (`notify_inval_inode`, `notify_store`).
-- No port games, no `actimeo=0` workaround.
-- macOS story is uglier (macFUSE kext is increasingly hostile to install;
-  FUSE-T is itself NFS-loopback under the hood).
+- **FUSE-T** (macOS) goes the wrong direction (FUSE → NFS) and ships under
+  a non-commercial-only license. Its NFS server is not a reusable library.
+- **fuse-nfs** consumes NFS, doesn't expose it. Wrong direction.
+- **NFS-Ganesha** has the right plugin architecture (FSAL) but is hundreds
+  of kloc of C with no Rust bindings; wildly disproportionate for a
+  per-user, single-mount daemon.
+- **9P** doesn't help — Linux already has FUSE; macOS has no 9P client.
 
-Recommended architectural option to discuss: **build the VFS abstraction so
-the transport is swappable**. Ship FUSE on Linux first (rootless, real
-invalidation), nfsserve on macOS as a second adapter. The current
-`VirtualFileSystem` already implements `nfsserve::NFSFileSystem` directly,
-so this would mean splitting it — the tree/inode model is transport-agnostic;
-only the trait impl would differ.
+The actually-useful finding: **`fuse3::Filesystem` (the Rust crate) and
+`nfsserve::NFSFileSystem` have nearly identical trait shapes** — both
+async, both `Result`-returning, both inode-keyed, ~15 ops each. A thin
+shared trait shaped like the existing `NFSFileSystem` impl in
+`daemon/src/vfs.rs` covers both. Concretely:
 
-Decision needed before M3.
+```
+trait JjYakFs (≈15 async methods, our own type names)
+   ├── NfsAdapter:  impl nfsserve::NFSFileSystem for &dyn JjYakFs
+   └── FuseAdapter: impl fuse3::Filesystem      for &dyn JjYakFs
+```
+
+**Recommended architecture:**
+
+- **Linux primary path: `fuse3` crate.** Rootless mount via the bundled
+  `fusermount3` setuid helper. Real client-side invalidation via FUSE
+  notify ops (`notify_inval_inode`, `notify_inval_entry`) — closes the
+  fsmonitor problem in §4.1 by giving us a real way to push tree changes.
+  No port games, no `actimeo=0`.
+- **macOS path: keep nfsserve.** macOS mounts `nfs://localhost:N` cleanly
+  with `mount_nfs -o port=N,mountport=N,nolocks,vers=3` and no kext.
+  macFUSE is increasingly hostile to install on Apple Silicon and ships
+  with kext-signing requirements; FUSE-T avoids the kext but trades it
+  for a license problem.
+- **`fuser` vs `fuse3`:** prefer `fuse3`. `fuser` uses sync reply
+  callbacks and explicit file handles; `fuse3` is async and value-returning,
+  which lines up cleanly with `nfsserve::NFSFileSystem`. Less impedance
+  mismatch in the shared trait.
+
+**Why this is still "minimal abstractions":** the existing
+`daemon/src/vfs.rs` is *already* shaped like the proposed shared trait —
+it just happens to be named `NFSFileSystem`. The refactor is mostly
+renaming a trait and adding a second `impl` block. Estimated glue:
+~200-line trait file, ~300–500-line nfsserve adapter (attr conversions),
+~600–1000-line fuse3 adapter (more because of `open`/`release` lifecycle).
+The tree/inode/store model — the actually-interesting code — is written
+once.
+
+**License surface:** `fuse3` is MIT, `nfsserve` is BSD/Apache, system
+`libfuse3` is LGPL. No restrictions on distribution.
+
+Decision is in §7.1 — implementation gates M3.
 
 ## 5. Corrections folded in from code review
 
@@ -290,13 +327,14 @@ M1–M2 don't depend on any of them, so work can start now.
 
 
 
-1. **Transport: NFS-only, FUSE-only, or a swappable abstraction?** Blocks
-   M3. Currently under research — see `docs/transport-research.md` (TBD).
-   The original plan implicitly commits to NFS; Linux mount privilege
-   (decision 2) likely forces FUSE on Linux regardless.
-2. **Mount privilege on Linux.** Blocks M4. If staying with NFS: setuid
-   helper, `sudo` prompt, or admin-managed fstab. If FUSE: `fusermount3`'s
-   setuid helper handles it. Falls out of decision 1.
+1. **Transport.** Blocks M3. Recommendation (§4.3): thin internal trait,
+   `fuse3` adapter on Linux, `nfsserve` adapter on macOS. Existing
+   `daemon/src/vfs.rs` already approximates the shared trait. Awaiting
+   sign-off, but the work in M1–M2 is unaffected by the choice.
+2. **Mount privilege on Linux.** Resolved by decision 1: `fusermount3`'s
+   setuid helper handles rootless mount. No `sudo` flow needed for
+   `jj yak init` on Linux. macOS path uses NFS over a high port, also no
+   privilege escalation.
 3. **fsmonitor strategy.** Blocks M6 (snapshot RPC contract). Options:
    (a) disable fsmonitor and accept O(tree) snapshots; (b) run watchman
    inside the daemon against the backing store; (c) add a side-channel
