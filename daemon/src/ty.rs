@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context};
 use jj_lib_proc_macros::ContentHash;
 
 use crate::hash::blake3;
@@ -14,39 +15,58 @@ impl jj_lib::content_hash::ContentHash for Id {
     }
 }
 
-impl Into<Vec<u8>> for Id {
-    fn into(self) -> Vec<u8> {
-        self.0.to_vec()
+impl From<Id> for Vec<u8> {
+    fn from(id: Id) -> Self {
+        id.0.to_vec()
     }
 }
 
-impl From<proto::jj_interface::FileId> for Id {
-    fn from(proto: proto::jj_interface::FileId) -> Self {
-        proto.file_id.into()
+// Proto-to-Id conversions are fallible because the wire format is `bytes` of
+// arbitrary length while `Id` is a fixed-size 32-byte hash. Previously these
+// were `From` impls that panicked on length mismatch — corrupt or misrouted
+// bytes from a peer would then crash the daemon. RPC handlers map the
+// resulting error to `Status::invalid_argument`.
+impl TryFrom<Vec<u8>> for Id {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        let actual_len = value.len();
+        let arr: [u8; 32] = value
+            .try_into()
+            .map_err(|_| anyhow!("expected 32-byte id, got {} bytes", actual_len))?;
+        Ok(Id(arr))
     }
 }
 
-impl From<proto::jj_interface::CommitId> for Id {
-    fn from(proto: proto::jj_interface::CommitId) -> Self {
-        proto.commit_id.into()
+impl TryFrom<proto::jj_interface::FileId> for Id {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::FileId) -> Result<Self, Self::Error> {
+        proto.file_id.try_into().context("FileId")
     }
 }
 
-impl From<proto::jj_interface::SymlinkId> for Id {
-    fn from(proto: proto::jj_interface::SymlinkId) -> Self {
-        proto.symlink_id.into()
+impl TryFrom<proto::jj_interface::CommitId> for Id {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::CommitId) -> Result<Self, Self::Error> {
+        proto.commit_id.try_into().context("CommitId")
     }
 }
 
-impl From<proto::jj_interface::TreeId> for Id {
-    fn from(proto: proto::jj_interface::TreeId) -> Self {
-        proto.tree_id.into()
+impl TryFrom<proto::jj_interface::SymlinkId> for Id {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::SymlinkId) -> Result<Self, Self::Error> {
+        proto.symlink_id.try_into().context("SymlinkId")
     }
 }
 
-impl From<Vec<u8>> for Id {
-    fn from(proto: Vec<u8>) -> Self {
-        Id(proto.as_slice().try_into().expect("should fit in Id"))
+impl TryFrom<proto::jj_interface::TreeId> for Id {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::TreeId) -> Result<Self, Self::Error> {
+        proto.tree_id.try_into().context("TreeId")
     }
 }
 
@@ -62,17 +82,17 @@ impl Symlink {
     }
 
     pub fn as_proto(&self) -> proto::jj_interface::Symlink {
-        let mut proto = proto::jj_interface::Symlink::default();
-        proto.target = self.target.clone();
-        proto
+        proto::jj_interface::Symlink {
+            target: self.target.clone(),
+        }
     }
 }
 
 impl From<proto::jj_interface::Symlink> for Symlink {
     fn from(proto: proto::jj_interface::Symlink) -> Self {
-        let mut symlink = Symlink::default();
-        symlink.target = proto.target;
-        symlink
+        Symlink {
+            target: proto.target,
+        }
     }
 }
 
@@ -83,39 +103,49 @@ pub struct CommitTimestamp {
 }
 impl CommitTimestamp {
     pub fn as_proto(&self) -> proto::jj_interface::commit::Timestamp {
-        let mut proto = proto::jj_interface::commit::Timestamp::default();
-        proto.millis_since_epoch = self.millis_since_epoch;
-        proto.tz_offset = self.tz_offset;
-        proto
+        proto::jj_interface::commit::Timestamp {
+            millis_since_epoch: self.millis_since_epoch,
+            tz_offset: self.tz_offset,
+        }
     }
 }
 
 impl CommitSignature {
     pub fn as_proto(&self) -> proto::jj_interface::commit::Signature {
-        let mut proto = proto::jj_interface::commit::Signature::default();
-        proto.name = self.name.clone();
-        proto.email = self.email.clone();
-        proto.timestamp = Some(self.timestamp.as_proto());
-        proto
+        proto::jj_interface::commit::Signature {
+            name: self.name.clone(),
+            email: self.email.clone(),
+            timestamp: Some(self.timestamp.as_proto()),
+        }
     }
 }
 
 impl From<proto::jj_interface::commit::Timestamp> for CommitTimestamp {
     fn from(proto: proto::jj_interface::commit::Timestamp) -> Self {
-        let mut ts = CommitTimestamp::default();
-        ts.millis_since_epoch = proto.millis_since_epoch;
-        ts.tz_offset = proto.tz_offset;
-        ts
+        CommitTimestamp {
+            millis_since_epoch: proto.millis_since_epoch,
+            tz_offset: proto.tz_offset,
+        }
     }
 }
 
-impl From<proto::jj_interface::commit::Signature> for CommitSignature {
-    fn from(proto: proto::jj_interface::commit::Signature) -> Self {
-        let mut sig = CommitSignature::default();
-        sig.name = proto.name;
-        sig.email = proto.email;
-        sig.timestamp = proto.timestamp.unwrap().into();
-        sig
+impl TryFrom<proto::jj_interface::commit::Signature> for CommitSignature {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::commit::Signature) -> Result<Self, Self::Error> {
+        // The wire schema marks timestamp as `optional`, but jj's data model
+        // requires every signature to carry one. A missing timestamp means
+        // either a corrupted entry or a peer running with a stale schema; in
+        // either case a hard crash is worse than surfacing the failure.
+        let timestamp = proto
+            .timestamp
+            .ok_or_else(|| anyhow!("CommitSignature missing required timestamp"))?
+            .into();
+        Ok(CommitSignature {
+            name: proto.name,
+            email: proto.email,
+            timestamp,
+        })
     }
 }
 
@@ -161,33 +191,48 @@ impl Commit {
     }
 
     pub fn as_proto(&self) -> proto::jj_interface::Commit {
-        let mut proto = proto::jj_interface::Commit::default();
-        proto.parents = self.parents.clone();
-        proto.predecessors = self.predecessors.clone();
-        proto.root_tree = self.root_tree.clone();
-        proto.conflict_labels = self.conflict_labels.clone();
-        proto.uses_tree_conflict_format = self.uses_tree_conflict_format.clone();
-        proto.change_id = self.change_id.clone();
-        proto.description = self.description.clone();
-        proto.author = self.author.clone().map(|a| a.as_proto());
-        proto.committer = self.committer.clone().map(|a| a.as_proto());
-        proto
+        proto::jj_interface::Commit {
+            parents: self.parents.clone(),
+            predecessors: self.predecessors.clone(),
+            root_tree: self.root_tree.clone(),
+            conflict_labels: self.conflict_labels.clone(),
+            uses_tree_conflict_format: self.uses_tree_conflict_format,
+            change_id: self.change_id.clone(),
+            description: self.description.clone(),
+            author: self.author.as_ref().map(CommitSignature::as_proto),
+            committer: self.committer.as_ref().map(CommitSignature::as_proto),
+            ..Default::default()
+        }
     }
 }
 
-impl From<proto::jj_interface::Commit> for Commit {
-    fn from(proto: proto::jj_interface::Commit) -> Self {
-        let mut commit = Commit::default();
-        commit.parents = proto.parents;
-        commit.predecessors = proto.predecessors;
-        commit.root_tree = proto.root_tree.clone();
-        commit.conflict_labels = proto.conflict_labels.clone();
-        commit.uses_tree_conflict_format = proto.uses_tree_conflict_format.clone();
-        commit.change_id = proto.change_id.clone();
-        commit.description = proto.description.clone();
-        commit.author = proto.author.map(Into::into);
-        commit.committer = proto.committer.map(Into::into);
-        commit
+impl TryFrom<proto::jj_interface::Commit> for Commit {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::Commit) -> Result<Self, Self::Error> {
+        // `Option::map` won't compose with a fallible conversion, so unfold
+        // the author/committer signatures by hand.
+        let author = proto
+            .author
+            .map(CommitSignature::try_from)
+            .transpose()
+            .context("author")?;
+        let committer = proto
+            .committer
+            .map(CommitSignature::try_from)
+            .transpose()
+            .context("committer")?;
+        Ok(Commit {
+            parents: proto.parents,
+            predecessors: proto.predecessors,
+            root_tree: proto.root_tree,
+            conflict_labels: proto.conflict_labels,
+            uses_tree_conflict_format: proto.uses_tree_conflict_format,
+            change_id: proto.change_id,
+            description: proto.description,
+            author,
+            committer,
+        })
     }
 }
 
@@ -202,17 +247,17 @@ impl File {
     }
 
     pub fn as_proto(&self) -> proto::jj_interface::File {
-        let mut proto = proto::jj_interface::File::default();
-        proto.data = self.content.clone();
-        proto
+        proto::jj_interface::File {
+            data: self.content.clone(),
+        }
     }
 }
 
 impl From<proto::jj_interface::File> for File {
     fn from(proto: proto::jj_interface::File) -> Self {
-        let mut file = File::default();
-        file.content = proto.data;
-        file
+        File {
+            content: proto.data,
+        }
     }
 }
 
@@ -235,27 +280,33 @@ impl Tree {
     pub fn as_proto(&self) -> proto::jj_interface::Tree {
         let mut proto = proto::jj_interface::Tree::default();
         for entry in &self.entries {
-            let mut proto_entry = proto::jj_interface::tree::Entry::default();
-            proto_entry.name = entry.name.clone();
-            proto_entry.value = Some(entry.entry.as_proto());
-            proto.entries.push(proto_entry);
+            proto.entries.push(proto::jj_interface::tree::Entry {
+                name: entry.name.clone(),
+                value: Some(entry.entry.as_proto()),
+            });
         }
         proto
     }
 }
 
-impl From<proto::jj_interface::Tree> for Tree {
-    fn from(proto: proto::jj_interface::Tree) -> Self {
+impl TryFrom<proto::jj_interface::Tree> for Tree {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::Tree) -> Result<Self, Self::Error> {
         let mut tree = Tree::default();
         for proto_entry in proto.entries {
-            let proto_val = proto_entry.value.unwrap();
-            let entry = proto_val.into();
+            let proto_val = proto_entry
+                .value
+                .ok_or_else(|| anyhow!("tree entry {:?} missing value oneof", proto_entry.name))?;
+            let entry: TreeEntry = proto_val
+                .try_into()
+                .with_context(|| format!("decoding tree entry {:?}", proto_entry.name))?;
             tree.entries.push(TreeEntryMapping {
                 name: proto_entry.name,
                 entry,
             });
         }
-        tree
+        Ok(tree)
     }
 }
 
@@ -302,38 +353,41 @@ impl jj_lib::content_hash::ContentHash for TreeEntry {
     }
 }
 
-impl From<proto::jj_interface::TreeValue> for TreeEntry {
-    fn from(proto: proto::jj_interface::TreeValue) -> Self {
-        let value: proto::jj_interface::tree_value::Value = proto.value.unwrap();
+impl TryFrom<proto::jj_interface::TreeValue> for TreeEntry {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::jj_interface::TreeValue) -> Result<Self, Self::Error> {
+        let value = proto
+            .value
+            .ok_or_else(|| anyhow!("TreeValue missing value oneof"))?;
         use proto::jj_interface::tree_value::Value::*;
-        match value {
-            TreeId(id) => TreeEntry::TreeId(id.into()),
-            SymlinkId(id) => TreeEntry::SymlinkId(id.into()),
-            ConflictId(id) => TreeEntry::ConflictId(id.into()),
+        Ok(match value {
+            TreeId(id) => TreeEntry::TreeId(id.try_into().context("tree id")?),
+            SymlinkId(id) => TreeEntry::SymlinkId(id.try_into().context("symlink id")?),
+            ConflictId(id) => TreeEntry::ConflictId(id.try_into().context("conflict id")?),
             File(file) => TreeEntry::File {
-                id: file.id.try_into().unwrap(),
+                id: file.id.try_into().context("file id")?,
                 executable: file.executable,
                 copy_id: file.copy_id,
             },
-        }
+        })
     }
 }
 
 impl TreeEntry {
     pub fn as_proto(&self) -> proto::jj_interface::TreeValue {
-        let mut proto = proto::jj_interface::TreeValue::default();
-        proto.value = Some(match self {
+        let value = match self {
             TreeEntry::File {
                 id,
                 executable,
                 copy_id,
-            } => {
-                let mut proto_entry = proto::jj_interface::tree_value::File::default();
-                proto_entry.id = id.0.to_vec();
-                proto_entry.executable = *executable;
-                proto_entry.copy_id = copy_id.clone();
-                proto::jj_interface::tree_value::Value::File(proto_entry)
-            }
+            } => proto::jj_interface::tree_value::Value::File(
+                proto::jj_interface::tree_value::File {
+                    id: id.0.to_vec(),
+                    executable: *executable,
+                    copy_id: copy_id.clone(),
+                },
+            ),
             TreeEntry::TreeId(id) => proto::jj_interface::tree_value::Value::TreeId(id.0.to_vec()),
             TreeEntry::SymlinkId(id) => {
                 proto::jj_interface::tree_value::Value::SymlinkId(id.0.to_vec())
@@ -341,7 +395,66 @@ impl TreeEntry {
             TreeEntry::ConflictId(id) => {
                 proto::jj_interface::tree_value::Value::ConflictId(id.0.to_vec())
             }
-        });
-        proto
+        };
+        proto::jj_interface::TreeValue { value: Some(value) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_try_from_wrong_length_errors() {
+        let err = Id::try_from(vec![0u8; 31]).expect_err("expected length error");
+        assert!(err.to_string().contains("31 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn id_try_from_correct_length_succeeds() {
+        let id: Id = vec![0xab; 32].try_into().expect("32 bytes should fit");
+        assert_eq!(id.0[0], 0xab);
+    }
+
+    #[test]
+    fn commit_signature_missing_timestamp_errors() {
+        let proto = proto::jj_interface::commit::Signature {
+            name: "n".into(),
+            email: "e".into(),
+            timestamp: None,
+        };
+        let err = CommitSignature::try_from(proto).expect_err("expected missing-timestamp error");
+        assert!(err.to_string().contains("timestamp"), "got: {err}");
+    }
+
+    #[test]
+    fn tree_value_missing_oneof_errors() {
+        let proto = proto::jj_interface::TreeValue { value: None };
+        let err = TreeEntry::try_from(proto).expect_err("expected missing-oneof error");
+        assert!(err.to_string().contains("missing"), "got: {err}");
+    }
+
+    #[test]
+    fn tree_entry_with_short_id_errors() {
+        let proto = proto::jj_interface::TreeValue {
+            value: Some(proto::jj_interface::tree_value::Value::TreeId(vec![1; 16])),
+        };
+        let err = TreeEntry::try_from(proto).expect_err("expected short-id error");
+        // anyhow's Display only shows the top-level context; use the
+        // alternate formatter to walk the source chain.
+        let chained = format!("{err:#}");
+        assert!(chained.contains("32-byte id"), "got: {chained}");
+    }
+
+    #[test]
+    fn tree_from_proto_missing_entry_value_errors() {
+        let proto = proto::jj_interface::Tree {
+            entries: vec![proto::jj_interface::tree::Entry {
+                name: "foo".into(),
+                value: None,
+            }],
+        };
+        let err = Tree::try_from(proto).expect_err("expected missing-value error");
+        assert!(err.to_string().contains("foo"), "got: {err}");
     }
 }

@@ -1,3 +1,11 @@
+// VFS manager scaffolding. The handle/message-channel plumbing below is not
+// yet driven by any caller — `VfsManagerHandle::bind` is the future entry
+// point used by the gRPC service to mount a workspace. Keeping the shape
+// in place (rather than deleting and re-deriving it) avoids churn when the
+// NFS milestone wires this up; suppress the dead-code warnings explicitly so
+// future work doesn't have to fight `#![deny(warnings)]` if it ever lands.
+#![allow(dead_code)]
+
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use rand::Rng;
 use tokio::sync::mpsc;
@@ -46,12 +54,17 @@ impl VfsManager {
                     let port = rand::thread_rng()
                         .gen_range(self.config.min_nfs_port..self.config.max_nfs_port);
                     let _join_handle = tokio::spawn(async move {
+                        // The bind itself is plumbing for an upcoming
+                        // milestone, but the unwrap below would crash the
+                        // daemon on any port collision. Once `bind` is
+                        // wired up, this should propagate the error back
+                        // through the channel response.
                         let listener = NFSTcpListener::bind(
                             &format!("127.0.0.1:{port}"),
                             VirtualFileSystem::default(),
                         )
                         .await
-                        .unwrap();
+                        .expect("NFS listener bind failed (TODO: surface to caller)");
                         listener.handle_forever().await
                     });
                 }

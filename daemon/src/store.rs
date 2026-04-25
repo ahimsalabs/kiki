@@ -33,7 +33,7 @@ impl Store {
             let mut trees = HashMap::new();
             let tree = Tree::default();
             let empty_tree_id: Id = tree.get_hash();
-            trees.insert(empty_tree_id.clone(), tree);
+            trees.insert(empty_tree_id, tree);
             (empty_tree_id, Arc::new(Mutex::new(trees)))
         };
 
@@ -47,7 +47,7 @@ impl Store {
     }
 
     pub fn get_empty_tree_id(&self) -> Id {
-        self.empty_tree_id.clone()
+        self.empty_tree_id
     }
 
     pub fn get_tree(&self, id: Id) -> Option<Tree> {

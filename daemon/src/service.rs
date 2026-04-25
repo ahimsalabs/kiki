@@ -1,11 +1,27 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use proto::jj_interface::*;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::{store::Store, ty::Id};
+use crate::{store::Store, ty};
+
+/// Map a fallible proto-decode error onto an `invalid_argument` gRPC status.
+/// Use for any conversion that came off the wire — peers that send malformed
+/// requests should get a clean error, not crash the daemon.
+fn decode_status<E: std::fmt::Display>(context: &str) -> impl FnOnce(E) -> Status + '_ {
+    move |e| Status::invalid_argument(format!("{context}: {e}"))
+}
+
+fn hex(id: &ty::Id) -> String {
+    let mut s = String::with_capacity(id.0.len() * 2);
+    for b in id.0 {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
 
 #[derive(Clone)]
 struct Session {
@@ -84,8 +100,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
     #[tracing::instrument(skip(self))]
     async fn read_file(&self, request: Request<FileId>) -> Result<Response<File>, Status> {
-        let file_id: Id = request.into_inner().into();
-        let file = self.store.get_file(file_id).unwrap();
+        let file_id: ty::Id = request
+            .into_inner()
+            .try_into()
+            .map_err(decode_status("file id"))?;
+        let file = self
+            .store
+            .get_file(file_id)
+            .ok_or_else(|| Status::not_found(format!("file {} not found", hex(&file_id))))?;
         Ok(Response::new(file.as_proto()))
     }
 
@@ -101,41 +123,62 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
     #[tracing::instrument(skip(self))]
     async fn read_symlink(&self, request: Request<SymlinkId>) -> Result<Response<Symlink>, Status> {
-        let symlink_id: Id = request.into_inner().into();
-        let symlink = self.store.get_symlink(symlink_id).unwrap();
+        let symlink_id: ty::Id = request
+            .into_inner()
+            .try_into()
+            .map_err(decode_status("symlink id"))?;
+        let symlink = self
+            .store
+            .get_symlink(symlink_id)
+            .ok_or_else(|| Status::not_found(format!("symlink {} not found", hex(&symlink_id))))?;
         Ok(Response::new(symlink.as_proto()))
     }
 
     #[tracing::instrument(skip(self))]
     async fn write_tree(&self, request: Request<Tree>) -> Result<Response<TreeId>, Status> {
-        let tree = request.into_inner();
-        let tree_id = self.store.write_tree(tree.into()).await.into();
+        let tree: ty::Tree = request
+            .into_inner()
+            .try_into()
+            .map_err(decode_status("tree"))?;
+        let tree_id = self.store.write_tree(tree).await.into();
         Ok(Response::new(TreeId { tree_id }))
     }
 
     #[tracing::instrument(skip(self))]
     async fn read_tree(&self, request: Request<TreeId>) -> Result<Response<Tree>, Status> {
-        let tree_id: Id = request.into_inner().into();
-        let tree = self.store.get_tree(tree_id).unwrap();
+        let tree_id: ty::Id = request
+            .into_inner()
+            .try_into()
+            .map_err(decode_status("tree id"))?;
+        let tree = self
+            .store
+            .get_tree(tree_id)
+            .ok_or_else(|| Status::not_found(format!("tree {} not found", hex(&tree_id))))?;
         Ok(Response::new(tree.as_proto()))
     }
 
     #[tracing::instrument(skip(self))]
     async fn write_commit(&self, request: Request<Commit>) -> Result<Response<CommitId>, Status> {
-        let commit = request.into_inner();
-        if commit.parents.is_empty() {
+        let commit_proto = request.into_inner();
+        if commit_proto.parents.is_empty() {
             return Err(Status::internal("Cannot write a commit with no parents"));
         }
-        let commit_id = self.store.write_commit(commit.into()).await.into();
+        let commit: ty::Commit = commit_proto.try_into().map_err(decode_status("commit"))?;
+        let commit_id = self.store.write_commit(commit).await.into();
         Ok(Response::new(CommitId { commit_id }))
     }
 
     #[tracing::instrument(skip(self))]
     async fn read_commit(&self, request: Request<CommitId>) -> Result<Response<Commit>, Status> {
-        let commit_id: Id = request.into_inner().into();
+        let commit_id: ty::Id = request
+            .into_inner()
+            .try_into()
+            .map_err(decode_status("commit id"))?;
         let commits = self.store.commits.lock();
-        let commit = commits.get(&commit_id).unwrap();
-        Ok(Response::new((*commit).as_proto()))
+        let commit = commits
+            .get(&commit_id)
+            .ok_or_else(|| Status::not_found(format!("commit {} not found", hex(&commit_id))))?;
+        Ok(Response::new(commit.as_proto()))
     }
 
     #[tracing::instrument(skip(self))]
@@ -193,10 +236,11 @@ mod tests {
             store: Store::new(),
             sessions: Arc::new(Mutex::new(vec![])),
         };
-        let mut commit = Commit::default();
-
         // No parents
-        commit.parents = vec![];
+        let mut commit = Commit {
+            parents: vec![],
+            ..Default::default()
+        };
 
         assert_matches!(
             svc.write_commit(Request::new(commit.clone())).await,

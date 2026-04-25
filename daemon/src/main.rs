@@ -28,7 +28,10 @@ struct Args {
 struct Config {
     /// Address the jj CLI connects over
     pub grpc_addr: String,
-    /// local cache
+    /// Local cache. Required in the config file but not yet consumed by the
+    /// daemon — kept here so existing `daemon.toml` files continue to parse
+    /// and so the field shows up in the `Debug` log line at startup.
+    #[allow(dead_code)]
     pub cache: PathBuf,
     /// NFS configuration
     pub nfs: NfsConfig,
@@ -97,5 +100,5 @@ async fn main() -> Result<(), anyhow::Error> {
     // use that subscriber to process traces emitted after this point
     tracing::subscriber::set_global_default(subscriber)?;
 
-    Ok(run_with_config(config).await?)
+    run_with_config(config).await
 }
