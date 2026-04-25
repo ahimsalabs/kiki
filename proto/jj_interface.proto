@@ -112,6 +112,7 @@ message TreeValue {
   message File {
     bytes id = 1;
     bool executable = 2;
+    bytes copy_id = 3;
   }
 
   oneof value {
@@ -142,6 +143,8 @@ message Commit {
   repeated bytes predecessors = 2;
   // Alternating positive and negative terms
   repeated bytes root_tree = 3;
+  // Labels for conflicted tree terms. Empty means unlabeled/resolved.
+  repeated string conflict_labels = 10;
   // TODO(#1624): delete when all code paths can handle this format
   bool uses_tree_conflict_format = 8;
   bytes change_id = 4;

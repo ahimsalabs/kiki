@@ -98,3 +98,34 @@ fn test_repos_are_independent() {
     $TEST_ENV/repo2 - localhost
     ");
 }
+
+#[test]
+fn test_nested_tree_round_trips() {
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo"]);
+    let repo_path = test_env.env_root().join("repo");
+    let dir_path = repo_path.join("dir");
+    std::fs::create_dir(&dir_path).unwrap();
+    std::fs::write(dir_path.join("file"), "content").unwrap();
+
+    test_env.jj_cmd_ok(&repo_path, &["new"]);
+    let stdout = test_env.jj_cmd_success(&repo_path, &["file", "list", "-r", "@-"]);
+    insta::assert_snapshot!(stdout, @r"
+    dir/file
+    ");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_symlink_tree_round_trips() {
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo"]);
+    let repo_path = test_env.env_root().join("repo");
+    std::os::unix::fs::symlink("target", repo_path.join("link")).unwrap();
+
+    test_env.jj_cmd_ok(&repo_path, &["new"]);
+    let stdout = test_env.jj_cmd_success(&repo_path, &["file", "list", "-r", "@-"]);
+    insta::assert_snapshot!(stdout, @r"
+    link
+    ");
+}

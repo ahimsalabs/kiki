@@ -126,16 +126,33 @@ pub struct CommitSignature {
     timestamp: CommitTimestamp,
 }
 
-#[derive(Clone, Debug, Default, ContentHash)]
+#[derive(Clone, Debug, Default)]
 pub struct Commit {
     pub parents: Vec<Vec<u8>>,
     pub predecessors: Vec<Vec<u8>>,
     pub root_tree: Vec<Vec<u8>>,
+    pub conflict_labels: Vec<String>,
     pub uses_tree_conflict_format: bool,
     pub change_id: Vec<u8>,
     pub description: String,
     pub author: Option<CommitSignature>,
     pub committer: Option<CommitSignature>,
+}
+
+impl jj_lib::content_hash::ContentHash for Commit {
+    fn hash(&self, state: &mut impl digest::Update) {
+        self.parents.hash(state);
+        self.predecessors.hash(state);
+        self.root_tree.hash(state);
+        if !self.conflict_labels.is_empty() {
+            self.conflict_labels.hash(state);
+        }
+        self.uses_tree_conflict_format.hash(state);
+        self.change_id.hash(state);
+        self.description.hash(state);
+        self.author.hash(state);
+        self.committer.hash(state);
+    }
 }
 
 impl Commit {
@@ -148,6 +165,7 @@ impl Commit {
         proto.parents = self.parents.clone();
         proto.predecessors = self.predecessors.clone();
         proto.root_tree = self.root_tree.clone();
+        proto.conflict_labels = self.conflict_labels.clone();
         proto.uses_tree_conflict_format = self.uses_tree_conflict_format.clone();
         proto.change_id = self.change_id.clone();
         proto.description = self.description.clone();
@@ -163,6 +181,7 @@ impl From<proto::jj_interface::Commit> for Commit {
         commit.parents = proto.parents;
         commit.predecessors = proto.predecessors;
         commit.root_tree = proto.root_tree.clone();
+        commit.conflict_labels = proto.conflict_labels.clone();
         commit.uses_tree_conflict_format = proto.uses_tree_conflict_format.clone();
         commit.change_id = proto.change_id.clone();
         commit.description = proto.description.clone();
@@ -240,12 +259,47 @@ impl From<proto::jj_interface::Tree> for Tree {
     }
 }
 
-#[derive(Clone, Debug, ContentHash)]
+#[derive(Clone, Debug)]
 pub enum TreeEntry {
-    File { id: Id, executable: bool },
+    File {
+        id: Id,
+        executable: bool,
+        copy_id: Vec<u8>,
+    },
     TreeId(Id),
     SymlinkId(Id),
     ConflictId(Id),
+}
+
+impl jj_lib::content_hash::ContentHash for TreeEntry {
+    fn hash(&self, state: &mut impl digest::Update) {
+        match self {
+            TreeEntry::File {
+                id,
+                executable,
+                copy_id,
+            } => {
+                0_u32.hash(state);
+                id.hash(state);
+                executable.hash(state);
+                if !copy_id.is_empty() {
+                    copy_id.hash(state);
+                }
+            }
+            TreeEntry::TreeId(id) => {
+                1_u32.hash(state);
+                id.hash(state);
+            }
+            TreeEntry::SymlinkId(id) => {
+                2_u32.hash(state);
+                id.hash(state);
+            }
+            TreeEntry::ConflictId(id) => {
+                3_u32.hash(state);
+                id.hash(state);
+            }
+        }
+    }
 }
 
 impl From<proto::jj_interface::TreeValue> for TreeEntry {
@@ -259,6 +313,7 @@ impl From<proto::jj_interface::TreeValue> for TreeEntry {
             File(file) => TreeEntry::File {
                 id: file.id.try_into().unwrap(),
                 executable: file.executable,
+                copy_id: file.copy_id,
             },
         }
     }
@@ -268,13 +323,24 @@ impl TreeEntry {
     pub fn as_proto(&self) -> proto::jj_interface::TreeValue {
         let mut proto = proto::jj_interface::TreeValue::default();
         proto.value = Some(match self {
-            TreeEntry::File { id, executable } => {
+            TreeEntry::File {
+                id,
+                executable,
+                copy_id,
+            } => {
                 let mut proto_entry = proto::jj_interface::tree_value::File::default();
                 proto_entry.id = id.0.to_vec();
                 proto_entry.executable = *executable;
+                proto_entry.copy_id = copy_id.clone();
                 proto::jj_interface::tree_value::Value::File(proto_entry)
             }
-            _ => todo!(),
+            TreeEntry::TreeId(id) => proto::jj_interface::tree_value::Value::TreeId(id.0.to_vec()),
+            TreeEntry::SymlinkId(id) => {
+                proto::jj_interface::tree_value::Value::SymlinkId(id.0.to_vec())
+            }
+            TreeEntry::ConflictId(id) => {
+                proto::jj_interface::tree_value::Value::ConflictId(id.0.to_vec())
+            }
         });
         proto
     }

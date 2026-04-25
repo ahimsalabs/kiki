@@ -1,20 +1,20 @@
-use std::io::Cursor;
-use std::path::Path;
-use std::pin::Pin;
-use std::time::SystemTime;
+use std::{io::Cursor, path::Path, pin::Pin, time::SystemTime};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use jj_lib::backend::{
-    Backend, BackendError, BackendInitError, BackendResult, ChangeId, Commit, CommitId,
-    CopyHistory, CopyId, CopyRecord, FileId, MillisSinceEpoch, RelatedCopy, SecureSig, Signature,
-    SigningFn, SymlinkId, Timestamp, Tree, TreeId, TreeValue, make_root_commit,
+use jj_lib::{
+    backend::{
+        make_root_commit, Backend, BackendError, BackendInitError, BackendResult, ChangeId, Commit,
+        CommitId, CopyHistory, CopyId, CopyRecord, FileId, MillisSinceEpoch, RelatedCopy,
+        SecureSig, Signature, SigningFn, SymlinkId, Timestamp, Tree, TreeId, TreeValue,
+    },
+    conflict_labels::ConflictLabels,
+    index::Index,
+    merge::MergeBuilder,
+    object_id::ObjectId,
+    repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf},
+    settings::UserSettings,
 };
-use jj_lib::index::Index;
-use jj_lib::merge::MergeBuilder;
-use jj_lib::object_id::ObjectId;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
-use jj_lib::settings::UserSettings;
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -263,6 +263,9 @@ pub fn commit_to_proto(commit: &Commit) -> proto::jj_interface::Commit {
     // merge) but we keep it set for forward-compatibility with older readers.
     proto.uses_tree_conflict_format = true;
     proto.root_tree = commit.root_tree.iter().map(|id| id.to_bytes()).collect();
+    if !commit.conflict_labels.is_resolved() {
+        proto.conflict_labels = commit.conflict_labels.as_slice().to_owned();
+    }
     proto.change_id = commit.change_id.to_bytes();
     proto.description = commit.description.clone();
     proto.author = Some(signature_to_proto(&commit.author));
@@ -283,13 +286,13 @@ fn commit_from_proto(mut proto: proto::jj_interface::Commit) -> Commit {
     let merge_builder: MergeBuilder<TreeId> =
         proto.root_tree.into_iter().map(TreeId::new).collect();
     let root_tree = merge_builder.build();
+    let conflict_labels = ConflictLabels::from_vec(proto.conflict_labels);
     let change_id = ChangeId::new(proto.change_id);
     Commit {
         parents,
         predecessors,
         root_tree,
-        // Yak doesn't track conflict labels (yet); hand jj a resolved-empty merge.
-        conflict_labels: jj_lib::merge::Merge::resolved(String::new()),
+        conflict_labels: conflict_labels.into_merge(),
         change_id,
         description: proto.description,
         author: signature_from_proto(proto.author.unwrap_or_default()),
@@ -335,17 +338,18 @@ fn tree_to_proto(tree: &Tree) -> proto::jj_interface::Tree {
 fn tree_value_to_proto(value: &TreeValue) -> proto::jj_interface::TreeValue {
     let mut proto = proto::jj_interface::TreeValue::default();
     match value {
-        // Yak doesn't track copy histories yet; copy_id is dropped on the wire
-        // and rehydrated as a placeholder on read.
+        // Yak stores copy ids on tree entries, but the backend's copy-history
+        // APIs still report Unsupported until the daemon has real copy objects.
         TreeValue::File {
             id,
             executable,
-            copy_id: _,
+            copy_id,
         } => {
             proto.value = Some(proto::jj_interface::tree_value::Value::File(
                 proto::jj_interface::tree_value::File {
                     id: id.to_bytes(),
                     executable: *executable,
+                    copy_id: copy_id.to_bytes(),
                 },
             ));
         }
@@ -389,10 +393,11 @@ fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> TreeValue {
         proto::jj_interface::tree_value::Value::File(proto::jj_interface::tree_value::File {
             id,
             executable,
+            copy_id,
         }) => TreeValue::File {
             id: FileId::new(id),
             executable,
-            copy_id: CopyId::placeholder(),
+            copy_id: CopyId::new(copy_id),
         },
         proto::jj_interface::tree_value::Value::SymlinkId(id) => {
             TreeValue::Symlink(SymlinkId::new(id))
@@ -403,5 +408,74 @@ fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> TreeValue {
         proto::jj_interface::tree_value::Value::ConflictId(_) => {
             panic!("yak backend: stored conflict_id no longer supported by jj")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jj_lib::merge::Merge;
+
+    use super::*;
+
+    fn test_signature() -> Signature {
+        Signature {
+            name: "Test User".to_string(),
+            email: "test.user@example.com".to_string(),
+            timestamp: Timestamp {
+                timestamp: MillisSinceEpoch(0),
+                tz_offset: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn commit_conflict_labels_round_trip() {
+        let root_tree = Merge::from_vec(vec![
+            TreeId::new(vec![1; 32]),
+            TreeId::new(vec![2; 32]),
+            TreeId::new(vec![3; 32]),
+        ]);
+        let conflict_labels = Merge::from_vec(vec![
+            "left".to_string(),
+            "base".to_string(),
+            "right".to_string(),
+        ]);
+        let commit = Commit {
+            parents: vec![CommitId::new(vec![4; 32])],
+            predecessors: vec![],
+            root_tree: root_tree.clone(),
+            conflict_labels: conflict_labels.clone(),
+            change_id: ChangeId::new(vec![5; 16]),
+            description: "conflicted".to_string(),
+            author: test_signature(),
+            committer: test_signature(),
+            secure_sig: None,
+        };
+
+        let proto = commit_to_proto(&commit);
+        assert_eq!(
+            proto.conflict_labels,
+            vec!["left".to_string(), "base".to_string(), "right".to_string()]
+        );
+        let round_tripped = commit_from_proto(proto);
+        assert_eq!(round_tripped.root_tree, root_tree);
+        assert_eq!(round_tripped.conflict_labels, conflict_labels);
+    }
+
+    #[test]
+    fn file_copy_id_round_trip() {
+        let copy_id = CopyId::new(vec![9, 8, 7]);
+        let value = TreeValue::File {
+            id: FileId::new(vec![1; 32]),
+            executable: true,
+            copy_id: copy_id.clone(),
+        };
+
+        let proto = tree_value_to_proto(&value);
+        assert!(matches!(
+            proto.value.as_ref().unwrap(),
+            proto::jj_interface::tree_value::Value::File(file) if file.copy_id == copy_id.to_bytes()
+        ));
+        assert_eq!(tree_value_from_proto(proto), value);
     }
 }
