@@ -73,37 +73,47 @@ better post-M1 smoke test.
 
 If anything breaks, that tells you something M1 missed.
 
-### M3 — NFS read path
+### M3 — VFS read path (depends on §7.1 sign-off)
 
-Implement these methods in `daemon/src/vfs.rs` (currently all return
-`NFS3ERR_NOTSUPP`):
+Refactor `daemon/src/vfs.rs` along the recommendation in §4.3: extract a
+`JjYakFs` trait that the existing nfsserve impl already approximates,
+implement the read methods on the inode/tree model, and add the second
+adapter (`fuse3` on Linux). The methods to fill in:
 
 - `lookup(dirid, name)` — walk into a tree by component
 - `getattr(id)` — file/dir mode + size
 - `read(id, offset, count)` — pull file from `Store`
 - `readdir(dirid, ...)` — list tree entries
 
-Each resolves a `fileid3` (NFS's u64 inode-equivalent) to a tree path or
-file id. Need a stable `fileid3 ↔ (TreeId, RepoPath)` mapping inside
-`VirtualFileSystem` — standard approach is a slab of `Inode` entries that
-lazily expands as paths are walked.
+Each resolves an inode (u64) to a `(TreeId, RepoPath)`. Standard approach:
+a slab of `Inode` entries that lazily expands as paths are walked. The
+slab lives behind the trait so both adapters share it.
 
-After M3 you can mount the export from a separate terminal and `ls`/`cat` an
-empty repo. Won't show anything yet — no commit checked out.
+After M3 you can mount the export and `ls`/`cat` an empty repo. Won't show
+anything yet — no commit checked out.
+
+If §7.1 is rejected and we ship NFS-only, the same methods land directly
+on `NFSFileSystem` and the trait extraction is dropped.
 
 ### M4 — `jj yak init` actually mounts
 
 Today `Initialize` just stores a session. It needs to:
 
-1. Spawn an NFS server on a port (call into `VfsManager` — the `Bind` message
-   exists at `vfs_mgr.rs:18-20`, the `VfsManagerHandle::bind()` wrapper
-   exists at `vfs_mgr.rs:26-29`, but `handle()` is never called from
-   `main.rs`, so nothing currently sends `Bind`).
-2. Mount the NFS share at `working_copy_path` (shell out to `mount.nfs` —
-   nfsserve has no built-in helper).
-3. Return the port to the CLI so the WC factory can talk to the right server.
+1. Bring up the per-mount filesystem instance via `VfsManager` (the
+   `Bind` message exists at `vfs_mgr.rs:18-20`; `VfsManagerHandle::bind()`
+   exists at `vfs_mgr.rs:26-29`; but `handle()` is never called from
+   `main.rs`, so nothing currently sends `Bind`). Per-mount lifecycle
+   has to expand to cover both transports.
+2. Mount the share at `working_copy_path`:
+   - **Linux:** `fuse3` does the mount itself via `fusermount3` —
+     no shell out, no root.
+   - **macOS:** shell out to `mount_nfs -o port=N,mountport=N,nolocks,vers=3`.
+3. Return whatever handle the CLI needs (port for NFS, nothing for FUSE)
+   so subsequent RPCs hit the right mount.
 
-This is the **"is this idea even tractable"** milestone. See §4 for risks.
+This is the **"is this idea even tractable"** milestone — once a mount
+survives `init` and basic file ops work, the rest of M5/M6 is mostly
+filling in trait methods.
 
 ### M5 — `check_out` writes files
 
