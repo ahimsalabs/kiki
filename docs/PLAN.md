@@ -1,6 +1,6 @@
 # jj-yak: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C).
+Status: active. Transport architecture decided (§4.3 Path C). M1 done.
 Last updated: 2026-04-25
 
 This document captures the roadmap for getting jj-yak from "scaffold with
@@ -28,49 +28,68 @@ wasted effort. If it does, B and C are routine engineering.
 
 Smallest first; each is a meaningful demo.
 
-### M1 — Daemon owns per-mount WC state
+### M1 — Daemon owns per-mount WC state ✅
 
-Replace the today-global `JujutsuService { sessions: Vec<Session>, store: Store }`
+**Status: done.** Landed as `daemon: M1 — per-mount state map + WC RPCs`.
+
+Replaced the global `JujutsuService { sessions: Vec<Session>, store: Store }`
 with a per-mount state map keyed by `working_copy_path`:
 
 ```rust
 struct Mount {
-    working_copy_path: PathBuf,
-    workspace_id: WorkspaceId,             // matches proto: bytes, not string
-    op_id: OperationId,
-    root_tree_id: TreeId,
-    sparse_patterns: Vec<RepoPathBuf>,
-    transport: TransportHandle,            // FUSE handle or NFS port; M4
-    fs: Arc<JjYakFs>,                      // shared VFS state; M3
+    working_copy_path: String,    // canonical path; matches proto wire type
+    remote: String,               // surfaced via DaemonStatus
+    op_id: Vec<u8>,               // empty until SetCheckoutState
+    workspace_id: Vec<u8>,        // empty until SetCheckoutState; matches proto bytes
+    root_tree_id: Vec<u8>,        // defaults to store.empty_tree_id
 }
 ```
 
-Plumb this through:
-- `Initialize` creates a `Mount` and inserts it into the map.
+Plumbing now in place:
+- `Initialize` creates a `Mount` and inserts it into the map. Re-init on the
+  same path returns `AlreadyExists` (rather than silently clobbering state).
 - `set_checkout_state` / `get_checkout_state` / `get_tree_state` / `snapshot`
-  stop being `todo!()` and read/write `Mount` fields.
-- The single global `Store` stays global for now; per-mount stores arrive with
+  read/write `Mount` fields. `SetCheckoutState` requires a prior `Initialize`
+  (`NotFound` otherwise). `GetCheckoutState` returns `FailedPrecondition`
+  before the first `SetCheckoutState`. `Snapshot` returns the cached
+  `root_tree_id` for now — real snapshot logic lands in M6.
+- The global `Store` stays global for now; per-mount stores arrive with
   remote backends in Layer C.
+- `DaemonStatus` now sorts entries by path so output is deterministic.
 
-Drops the four `todo!()`s in `daemon/src/service.rs` (lines 148, 158, 167, 176).
-No NFS work yet — just state. Also worth filling in the unrelated `todo!()` at
-`daemon/src/ty.rs:277` (non-File `TreeEntry` variants) before it panics in
-production.
+`transport: TransportHandle` and `fs: Arc<JjYakFs>` from the original sketch
+were dropped from the M1 struct — they belong to M3/M4 and have no
+consumer yet. Field types match the proto wire format directly (`Vec<u8>`
+for `bytes`, `String` for `string`) so RPC handlers copy in/out without
+intermediate conversions.
 
-**Scope:** ~150 lines new in `service.rs`, ~40 in `main.rs` to thread state,
-0 changes to CLI (it already calls these RPCs, they'll start working).
-One new test in `cli/tests/` doing `jj yak init` → `jj log` → `jj op log` to
-exercise op_id round-trip.
+**Scope (actual):** +295 / −32 LoC in `daemon/src/service.rs`; no
+`main.rs` plumbing was needed (the service owns the state map directly,
+keyed by `Arc<Mutex<HashMap<…>>>`). Zero changes to CLI; existing
+`test_multiple_init` / `test_repos_are_independent` integration tests
+already exercise `Initialize` + `DaemonStatus` through the new map and
+still pass. WC-RPC coverage is in `service.rs` unit tests
+(`checkout_state_round_trip`, `mounts_are_isolated_by_path`,
+`duplicate_initialize_rejected`, `set_checkout_state_requires_initialize`)
+because the CLI doesn't yet call those RPCs — that path turns on at M2.
+
+The end-to-end `jj yak init` → `jj log` → `jj op log` op_id round-trip
+test moves to M2's scope: it's the natural smoke test once the factory
+flip routes `YakWorkingCopy::init` through `SetCheckoutState`.
 
 ### M2 — Wire YakWorkingCopyFactory at init
 
-`cli/src/main.rs:138` is `&*default_working_copy_factory()`. The `// NOTE`
-comment block at 135–138 explains why. With M1 done, flip it to
+`cli/src/main.rs:157` is `&*default_working_copy_factory()`. The `// NOTE`
+comment block at 154–156 explains why. With M1 done, flip it to
 `&YakWorkingCopyFactory {}`. Integration tests will start hitting
 `YakWorkingCopy::init` → `set_checkout_state` RPC. `test_init` (read-only)
 should still pass; `test_multiple_init` and `test_repos_are_independent` do
 call `jj new` and `yak status`, so they exercise more state — they're a
 better post-M1 smoke test.
+
+Add the `jj yak init` → `jj log` → `jj op log` op_id round-trip test
+here (originally scoped under M1, but that path is dead until the factory
+flip).
 
 If anything breaks, that tells you something M1 missed.
 
@@ -290,9 +309,13 @@ here so reviewers can spot-check.
 - **Mount field naming.** Original sketch used `workspace_name: WorkspaceNameBuf`.
   Proto has `workspace_id: bytes` (`proto/jj_interface.proto:72-75`). M1's
   struct uses `workspace_id` to avoid a gratuitous rename.
-- **Fifth `todo!()`.** `daemon/src/ty.rs:277` panics for non-File `TreeEntry`
+- ~~**Fifth `todo!()`.** `daemon/src/ty.rs:277` panics for non-File `TreeEntry`
   variants. Cheap to fill while in the area for M1; will hit it as soon as
-  symlinks or subtrees flow through.
+  symlinks or subtrees flow through.~~ Already handled by the
+  `TryFrom<proto::jj_interface::TreeValue> for TreeEntry` impl at
+  `daemon/src/ty.rs:356` (commit `ba36e622`). All four variants —
+  `File`, `TreeId`, `SymlinkId`, `ConflictId` — now round-trip with
+  proto-decode errors instead of panics.
 - **M2 smoke test.** Original plan said `test_init.rs` is read-only — only
   the first of three tests is. `test_multiple_init` and
   `test_repos_are_independent` already exercise `jj new` and `yak status`,
@@ -363,14 +386,14 @@ Worth doing in passing, not blocking:
 
 ## 8. Recommended starting point
 
-**M1 is the right first step.** Self-contained, mechanical, unblocks
-everything else. Concrete scope:
+**M1 is done.** Daemon now owns per-mount state; landed in
+`daemon: M1 — per-mount state map + WC RPCs` (+295 / −32 LoC in
+`daemon/src/service.rs`, all in-tree tests green).
 
-- `daemon/src/service.rs`: ~150 lines (state map + 4 RPC bodies).
-- `daemon/src/main.rs`: ~40 lines to thread state through.
-- `cli/`: 0 changes (calls these RPCs already; they'll start working).
-- One new test in `cli/tests/` exercising `jj yak init` → `jj log` →
-  `jj op log` to round-trip op_id.
+**Next: M2.** Flip `cli/src/main.rs:157` to `&YakWorkingCopyFactory {}`,
+let `test_multiple_init` / `test_repos_are_independent` smoke-test the
+new path, and add the `jj yak init` → `jj log` → `jj op log` op_id
+round-trip test that was originally scoped under M1.
 
 M3 (trait extraction + FUSE adapter) can start as soon as M1–M2 are
 green. Add `fuse3` to `Cargo.toml` as part of M3; the existing
