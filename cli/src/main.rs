@@ -18,7 +18,6 @@ mod blocking_client;
 mod working_copy;
 
 use backend::YakBackend;
-use jj_lib::{local_working_copy::LocalWorkingCopyFactory, working_copy::WorkingCopyFactory};
 use working_copy::{YakWorkingCopy, YakWorkingCopyFactory};
 
 /// Create a new repo in the given directory
@@ -73,10 +72,6 @@ fn create_store_factories() -> StoreFactories {
         }),
     );
     store_factories
-}
-
-pub fn default_working_copy_factory() -> Box<dyn WorkingCopyFactory> {
-    Box::new(LocalWorkingCopyFactory {})
 }
 
 async fn run_yak_command(
@@ -151,10 +146,13 @@ async fn run_yak_command(
                 ReadonlyRepo::default_op_heads_store_initializer(),
                 ReadonlyRepo::default_index_store_initializer(),
                 ReadonlyRepo::default_submodule_store_initializer(),
-                // NOTE: YakWorkingCopy is registered but not wired in here
-                // yet; it needs the daemon's snapshot/checkout RPCs filled
-                // in before we can flip this over.
-                &*default_working_copy_factory(),
+                // M2: route Workspace::init_with_factories through
+                // YakWorkingCopyFactory so the freshly-initialised workspace
+                // talks to the daemon (SetCheckoutState) rather than spinning
+                // up a local on-disk working copy. The daemon mount is
+                // guaranteed to exist here because the Initialize RPC above
+                // ran first.
+                &YakWorkingCopyFactory {},
                 WorkspaceName::DEFAULT.to_owned(),
             )
             .await?;
