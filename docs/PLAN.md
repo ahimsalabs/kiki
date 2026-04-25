@@ -1,6 +1,6 @@
 # jj-yak: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C). M1 done.
+Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 done.
 Last updated: 2026-04-25
 
 This document captures the roadmap for getting jj-yak from "scaffold with
@@ -77,21 +77,45 @@ The end-to-end `jj yak init` → `jj log` → `jj op log` op_id round-trip
 test moves to M2's scope: it's the natural smoke test once the factory
 flip routes `YakWorkingCopy::init` through `SetCheckoutState`.
 
-### M2 — Wire YakWorkingCopyFactory at init
+### M2 — Wire YakWorkingCopyFactory at init ✅
 
-`cli/src/main.rs:157` is `&*default_working_copy_factory()`. The `// NOTE`
-comment block at 154–156 explains why. With M1 done, flip it to
-`&YakWorkingCopyFactory {}`. Integration tests will start hitting
-`YakWorkingCopy::init` → `set_checkout_state` RPC. `test_init` (read-only)
-should still pass; `test_multiple_init` and `test_repos_are_independent` do
-call `jj new` and `yak status`, so they exercise more state — they're a
-better post-M1 smoke test.
+**Status: done.** Landed as `cli: M2 — route YakWorkingCopyFactory at
+workspace init` and `cli/tests: add op_id round-trip smoke test`.
 
-Add the `jj yak init` → `jj log` → `jj op log` op_id round-trip test
-here (originally scoped under M1, but that path is dead until the factory
-flip).
+`Workspace::init_with_factories` in `cli/src/main.rs` now passes
+`&YakWorkingCopyFactory {}` instead of a `LocalWorkingCopyFactory`
+fallback. The `default_working_copy_factory()` helper and its
+`LocalWorkingCopyFactory` import are gone — the factory map registered in
+`main()` already covers the load path.
 
-If anything breaks, that tells you something M1 missed.
+End-to-end behaviour:
+
+- `jj yak init` → `Initialize` RPC → `Workspace::init_with_factories` →
+  `YakWorkingCopyFactory::init_working_copy` → `YakWorkingCopy::init` →
+  `SetCheckoutState` RPC. The op id and workspace id flow into the
+  daemon's per-mount `Mount`.
+- Subsequent commands (`jj log`, `jj op log`) call
+  `WorkingCopy::operation_id()` which fetches via `GetCheckoutState`.
+
+`test_init` and `test_multiple_init` pass through this path unchanged.
+A new `test_op_id_round_trip` runs `jj op log` with an `if(current_operation,
+"@", " ")` template to assert the daemon hands back the same op id jj
+wrote.
+
+**Tests that needed reslotting:** `test_repos_are_independent`,
+`test_nested_tree_round_trips`, `test_symlink_tree_round_trips` were green
+pre-flip only because `LocalWorkingCopyFactory` was masking the gap — they
+all call `jj new`, which routes through `LockedYakWorkingCopy::check_out`
+(M5 `todo!`) or the VFS write path (M6). They are now `#[ignore =
+"needs M5/M6: …"]` with a milestone marker. §6 still owns moving them
+into `test_workingcopy.rs` once those milestones land. The plan
+originally implied `test_multiple_init` exercised `jj new`; it does not —
+only `yak status`. Corrected.
+
+**Other corrections folded in:** the original plan paragraph claimed
+"if anything breaks, that tells you something M1 missed." Nothing M1
+missed — the breakages are exactly the M5/M6 surfaces the next milestones
+are scoped to fill. Fix is documentary, not code.
 
 ### M3 — VFS read path
 
@@ -386,15 +410,16 @@ Worth doing in passing, not blocking:
 
 ## 8. Recommended starting point
 
-**M1 is done.** Daemon now owns per-mount state; landed in
-`daemon: M1 — per-mount state map + WC RPCs` (+295 / −32 LoC in
-`daemon/src/service.rs`, all in-tree tests green).
+**M1 and M2 are done.** Per-mount state lives in the daemon, and a fresh
+`jj yak init` now routes the workspace through `YakWorkingCopyFactory` —
+operation id and workspace id round-trip through the daemon's checkout
+cache. CLI integration tests (`test_init`, `test_multiple_init`,
+`test_op_id_round_trip`) exercise the path; three M5/M6-dependent tests
+are `#[ignore]`'d with milestone markers.
 
-**Next: M2.** Flip `cli/src/main.rs:157` to `&YakWorkingCopyFactory {}`,
-let `test_multiple_init` / `test_repos_are_independent` smoke-test the
-new path, and add the `jj yak init` → `jj log` → `jj op log` op_id
-round-trip test that was originally scoped under M1.
-
-M3 (trait extraction + FUSE adapter) can start as soon as M1–M2 are
-green. Add `fuse3` to `Cargo.toml` as part of M3; the existing
-`nfsserve` dep stays.
+**Next: M3 — VFS read path.** Refactor `daemon/src/vfs.rs` along §4.3:
+extract a `JjYakFs` trait, add a `fuse3::Filesystem` adapter alongside
+the existing `nfsserve::NFSFileSystem`, and implement the read ops
+(`lookup`, `getattr`, `read`, `readdir`). Add `fuse3` to `Cargo.toml` as
+part of M3; the existing `nfsserve` dep stays. Once M3 lands, an empty
+mounted repo can be `ls`'d and `cat`'d on Linux (FUSE) and macOS (NFS).
