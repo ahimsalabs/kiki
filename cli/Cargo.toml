@@ -24,7 +24,7 @@ futures.workspace = true
 name = "runner"
 
 [dev-dependencies]
-jj-cli = { version = "0.24", features = ["test-fakes"], default-features = false }   
+jj-cli = { version = "0.40", features = ["test-fakes"], default-features = false }
 assert_cmd.workspace = true
 assert_matches.workspace = true
 regex.workspace = true
