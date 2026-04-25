@@ -1,1 +1,6 @@
 /target
+
+# insta review intermediates — pending-snap files are only for `cargo
+# insta review`, not committed.
+**/.*.pending-snap
+

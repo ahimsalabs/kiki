@@ -17,6 +17,37 @@ fn test_init() {
     ");
 }
 
+/// Round-trip the operation id through the daemon: `jj yak init` makes
+/// `YakWorkingCopy::init` push the workspace op id via `SetCheckoutState`,
+/// and subsequent commands fetch it back via `GetCheckoutState` whenever
+/// they need the workspace's current operation. `jj op log` exercises that
+/// fetch — the `current_operation` keyword resolves to whichever op id the
+/// workspace reports, which for `YakWorkingCopy` is the daemon's cached
+/// value. If the round-trip drops bytes (e.g. workspace_id<->op_id swapped
+/// in the proto, hex/decode mismatch) the `@` marker either attaches to
+/// the wrong op or no op at all, and this assertion fails.
+#[test]
+fn test_op_id_round_trip() {
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo"]);
+    let repo_path = test_env.env_root().join("repo");
+
+    let stdout = test_env.jj_cmd_success(
+        &repo_path,
+        &[
+            "op",
+            "log",
+            "--no-graph",
+            "-T",
+            r#"if(current_operation, "@", " ") ++ " " ++ id.short() ++ " " ++ description.first_line() ++ "\n""#,
+        ],
+    );
+    insta::assert_snapshot!(stdout, @r"
+    @ e69ffce1f5bb add workspace 'default'
+      000000000000
+    ");
+}
+
 #[test]
 fn test_multiple_init() {
     let test_env = TestEnvironment::default();
