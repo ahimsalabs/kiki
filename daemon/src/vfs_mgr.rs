@@ -6,11 +6,14 @@
 // future work doesn't have to fight `#![deny(warnings)]` if it ever lands.
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use rand::Rng;
 use tokio::sync::mpsc;
 
-use crate::vfs::VirtualFileSystem;
+use crate::store::Store;
+use crate::vfs::{JjYakFs, NfsAdapter, YakFs};
 
 pub struct VfsManager {
     config: VfsManagerConfig,
@@ -53,18 +56,26 @@ impl VfsManager {
                 VfsManagerMessage::Bind => {
                     let port = rand::thread_rng()
                         .gen_range(self.config.min_nfs_port..self.config.max_nfs_port);
+                    // M3 keeps the empty-mount stub: `Bind` is still not
+                    // sent by anyone (M4 wires that up), but if it were,
+                    // it would now serve a `YakFs` over a fresh empty
+                    // store rather than the placeholder `VirtualFileSystem`.
+                    // M4 will swap this for a per-mount `Arc<dyn JjYakFs>`
+                    // handed in by the gRPC service.
+                    let store = Arc::new(Store::new());
+                    let empty_tree = store.get_empty_tree_id();
+                    let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, empty_tree));
+                    let adapter = NfsAdapter::new(yak);
                     let _join_handle = tokio::spawn(async move {
                         // The bind itself is plumbing for an upcoming
                         // milestone, but the unwrap below would crash the
                         // daemon on any port collision. Once `bind` is
                         // wired up, this should propagate the error back
                         // through the channel response.
-                        let listener = NFSTcpListener::bind(
-                            &format!("127.0.0.1:{port}"),
-                            VirtualFileSystem::default(),
-                        )
-                        .await
-                        .expect("NFS listener bind failed (TODO: surface to caller)");
+                        let listener =
+                            NFSTcpListener::bind(&format!("127.0.0.1:{port}"), adapter)
+                                .await
+                                .expect("NFS listener bind failed (TODO: surface to caller)");
                         listener.handle_forever().await
                     });
                 }
