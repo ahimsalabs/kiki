@@ -1,17 +1,20 @@
-use std::{any::Any, cell::OnceCell, path::PathBuf, sync::Arc};
+use std::cell::OnceCell;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use jj_lib::{
-    backend::{MergedTreeId, TreeId},
-    commit::Commit,
-    merge::MergeBuilder,
-    object_id::ObjectId,
-    op_store::{OperationId, WorkspaceId},
-    repo_path::RepoPathBuf,
-    store::Store,
-    working_copy::{
-        CheckoutError, CheckoutOptions, CheckoutStats, LockedWorkingCopy, ResetError,
-        SnapshotError, SnapshotOptions, WorkingCopy, WorkingCopyFactory, WorkingCopyStateError,
-    },
+use async_trait::async_trait;
+use jj_lib::backend::TreeId;
+use jj_lib::commit::Commit;
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::object_id::ObjectId;
+use jj_lib::op_store::OperationId;
+use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::settings::UserSettings;
+use jj_lib::store::Store;
+use jj_lib::working_copy::{
+    CheckoutError, CheckoutStats, LockedWorkingCopy, ResetError, SnapshotError, SnapshotOptions,
+    SnapshotStats, WorkingCopy, WorkingCopyFactory, WorkingCopyStateError,
 };
 use proto::jj_interface::{GetCheckoutStateReq, GetTreeStateReq, SnapshotReq};
 use tracing::{info, warn};
@@ -27,13 +30,15 @@ impl WorkingCopyFactory for YakWorkingCopyFactory {
         working_copy_path: PathBuf,
         _state_path: PathBuf,
         operation_id: OperationId,
-        workspace_id: WorkspaceId,
+        workspace_name: WorkspaceNameBuf,
+        settings: &UserSettings,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         Ok(Box::new(YakWorkingCopy::init(
             store,
             working_copy_path,
             operation_id,
-            workspace_id,
+            workspace_name,
+            settings,
         )?))
     }
 
@@ -42,8 +47,13 @@ impl WorkingCopyFactory for YakWorkingCopyFactory {
         store: Arc<Store>,
         working_copy_path: PathBuf,
         _state_path: PathBuf,
-    ) -> Result<Box<dyn WorkingCopy + 'static>, WorkingCopyStateError> {
-        Ok(Box::new(YakWorkingCopy::load(store, working_copy_path)))
+        settings: &UserSettings,
+    ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
+        Ok(Box::new(YakWorkingCopy::load(
+            store,
+            working_copy_path,
+            settings,
+        )))
     }
 }
 
@@ -53,7 +63,7 @@ pub struct YakWorkingCopy {
     client: BlockingJujutsuInterfaceClient,
     /// Only access through get_checkout_state
     checkout_state: OnceCell<CheckoutState>,
-    tree_state: OnceCell<TreeState>,
+    tree_state: OnceCell<MergedTree>,
 }
 
 impl YakWorkingCopy {
@@ -61,19 +71,29 @@ impl YakWorkingCopy {
         "yak"
     }
 
+    fn connect_client(settings: &UserSettings) -> BlockingJujutsuInterfaceClient {
+        // Pull the daemon port from user settings (matches YakBackend); the
+        // integration test harness assigns a random port per env, so this
+        // must not be hardcoded.
+        let grpc_port = settings.get::<usize>("grpc_port").unwrap();
+        BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
+            .expect("connect to yak daemon")
+    }
+
     fn init(
         store: Arc<Store>,
         working_copy_path: PathBuf,
         operation_id: OperationId,
-        workspace_id: WorkspaceId,
+        workspace_name: WorkspaceNameBuf,
+        settings: &UserSettings,
     ) -> Result<Self, WorkingCopyStateError> {
-        let client = BlockingJujutsuInterfaceClient::connect("http://[::1]:10000").unwrap();
+        let client = Self::connect_client(settings);
         client
             .set_checkout_state(proto::jj_interface::SetCheckoutStateReq {
                 working_copy_path: working_copy_path.to_str().unwrap().to_string(),
                 checkout_state: Some(proto::jj_interface::CheckoutState {
                     op_id: operation_id.as_bytes().into(),
-                    workspace_id: workspace_id.as_str().into(),
+                    workspace_id: workspace_name.as_str().as_bytes().to_vec(),
                 }),
             })
             .unwrap();
@@ -86,8 +106,8 @@ impl YakWorkingCopy {
         })
     }
 
-    fn load(store: Arc<Store>, working_copy_path: PathBuf) -> Self {
-        let client = BlockingJujutsuInterfaceClient::connect("http://[::1]:10000").unwrap();
+    fn load(store: Arc<Store>, working_copy_path: PathBuf, settings: &UserSettings) -> Self {
+        let client = Self::connect_client(settings);
         YakWorkingCopy {
             store,
             working_copy_path,
@@ -102,21 +122,11 @@ impl YakWorkingCopy {
 #[derive(Clone, Debug)]
 struct CheckoutState {
     operation_id: OperationId,
-    workspace_id: WorkspaceId,
-}
-
-#[derive(Clone, Debug)]
-struct TreeState {
-    tree_id: MergedTreeId,
-}
-impl TreeState {
-    pub fn current_tree_id(&self) -> &MergedTreeId {
-        &self.tree_id
-    }
+    workspace_name: WorkspaceNameBuf,
 }
 
 impl YakWorkingCopy {
-    fn get_tree_state<'a>(&'a self) -> &'a TreeState {
+    fn get_tree(&self) -> &MergedTree {
         self.tree_state.get_or_init(|| {
             let tree_state = self
                 .client
@@ -125,15 +135,11 @@ impl YakWorkingCopy {
                 })
                 .unwrap()
                 .into_inner();
-            let tree_ids_builder: MergeBuilder<TreeId> =
-                MergeBuilder::from_iter([TreeId::new(tree_state.tree_id)]);
-            TreeState {
-                tree_id: MergedTreeId::Merge(tree_ids_builder.build()),
-            }
+            MergedTree::resolved(self.store.clone(), TreeId::new(tree_state.tree_id))
         })
     }
 
-    fn get_checkout_state<'a>(&'a self) -> &'a CheckoutState {
+    fn get_checkout_state(&self) -> &CheckoutState {
         self.checkout_state.get_or_init(|| {
             let checkout_state = self
                 .client
@@ -142,13 +148,12 @@ impl YakWorkingCopy {
                 })
                 .unwrap()
                 .into_inner();
+            let workspace_name = std::str::from_utf8(&checkout_state.workspace_id)
+                .expect("daemon returned non-UTF-8 workspace name")
+                .to_string();
             CheckoutState {
                 operation_id: OperationId::new(checkout_state.op_id),
-                workspace_id: WorkspaceId::new(
-                    std::str::from_utf8(&checkout_state.workspace_id)
-                        .unwrap()
-                        .to_string(),
-                ),
+                workspace_name: WorkspaceNameBuf::from(workspace_name),
             }
         })
     }
@@ -157,7 +162,7 @@ impl YakWorkingCopy {
         DaemonLock::new()
     }
 
-    fn snapshot(&mut self, _options: &SnapshotOptions) -> TreeState {
+    fn snapshot_via_daemon(&mut self) -> MergedTree {
         let tree_state = self
             .client
             .snapshot(SnapshotReq {
@@ -165,11 +170,7 @@ impl YakWorkingCopy {
             })
             .unwrap()
             .into_inner();
-        let tree_ids_builder: MergeBuilder<TreeId> =
-            MergeBuilder::from_iter([TreeId::new(tree_state.tree_id)]);
-        TreeState {
-            tree_id: MergedTreeId::Merge(tree_ids_builder.build()),
-        }
+        MergedTree::resolved(self.store.clone(), TreeId::new(tree_state.tree_id))
     }
 }
 
@@ -184,24 +185,20 @@ impl DaemonLock {
 }
 
 impl WorkingCopy for YakWorkingCopy {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         Self::name()
     }
 
-    fn workspace_id(&self) -> &WorkspaceId {
-        &self.get_checkout_state().workspace_id
+    fn workspace_name(&self) -> &WorkspaceName {
+        &self.get_checkout_state().workspace_name
     }
 
     fn operation_id(&self) -> &OperationId {
         &self.get_checkout_state().operation_id
     }
 
-    fn tree_id(&self) -> Result<&MergedTreeId, WorkingCopyStateError> {
-        Ok(self.get_tree_state().current_tree_id())
+    fn tree(&self) -> Result<&MergedTree, WorkingCopyStateError> {
+        Ok(self.get_tree())
     }
 
     fn sparse_patterns(&self) -> Result<&[RepoPathBuf], WorkingCopyStateError> {
@@ -219,12 +216,12 @@ impl WorkingCopy for YakWorkingCopy {
             tree_state: OnceCell::new(),
         };
         let old_operation_id = wc.operation_id().clone();
-        let old_tree_id = wc.tree_id()?.clone();
+        // Force the tree to be loaded so old_tree() can return a borrow.
+        let _ = wc.tree()?;
         Ok(Box::new(LockedYakWorkingCopy {
             wc,
             lock,
             old_operation_id,
-            old_tree_id,
         }))
     }
 }
@@ -234,49 +231,44 @@ struct LockedYakWorkingCopy {
     #[allow(dead_code)]
     lock: DaemonLock,
     old_operation_id: OperationId,
-    old_tree_id: MergedTreeId,
 }
 
+#[async_trait]
 impl LockedWorkingCopy for LockedYakWorkingCopy {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
     fn old_operation_id(&self) -> &OperationId {
         &self.old_operation_id
     }
 
-    fn old_tree_id(&self) -> &MergedTreeId {
-        &self.old_tree_id
+    fn old_tree(&self) -> &MergedTree {
+        // tree was forced to load in start_mutation.
+        self.wc
+            .tree_state
+            .get()
+            .expect("old_tree called before tree was loaded in start_mutation")
     }
 
-    fn recover(&mut self, _commit: &Commit) -> Result<(), ResetError> {
+    async fn recover(&mut self, _commit: &Commit) -> Result<(), ResetError> {
         todo!()
     }
 
-    fn snapshot(&mut self, options: &SnapshotOptions) -> Result<MergedTreeId, SnapshotError> {
-        let tree_state = self.wc.snapshot(options);
-        Ok(tree_state.tree_id)
-    }
-
-    fn check_out(
+    async fn snapshot(
         &mut self,
-        commit: &Commit,
-        _options: &CheckoutOptions,
-    ) -> Result<CheckoutStats, CheckoutError> {
-        let _new_tree = commit.tree()?;
+        _options: &SnapshotOptions,
+    ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
+        let tree = self.wc.snapshot_via_daemon();
+        Ok((tree, SnapshotStats::default()))
+    }
+
+    async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError> {
+        let _new_tree = commit.tree();
         todo!()
     }
 
-    fn rename_workspace(&mut self, _new_workspace_id: WorkspaceId) {
+    fn rename_workspace(&mut self, _new_workspace_name: WorkspaceNameBuf) {
         todo!()
     }
 
-    fn reset(&mut self, _commit: &Commit) -> Result<(), ResetError> {
+    async fn reset(&mut self, _commit: &Commit) -> Result<(), ResetError> {
         todo!()
     }
 
@@ -284,15 +276,14 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
         todo!()
     }
 
-    fn set_sparse_patterns(
+    async fn set_sparse_patterns(
         &mut self,
         _new_sparse_patterns: Vec<RepoPathBuf>,
-        _options: &CheckoutOptions,
     ) -> Result<CheckoutStats, CheckoutError> {
         todo!()
     }
 
-    fn finish(
+    async fn finish(
         self: Box<Self>,
         operation_id: OperationId,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
