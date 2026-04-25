@@ -1,5 +1,5 @@
-remote_addr = "[::1]:23000"
 grpc_addr = "[::1]:12000"
+cache = "/tmp/yak-cache"
 
 [nfs]
 min_port = 12000
