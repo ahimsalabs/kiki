@@ -1,26 +1,27 @@
 # jj-yak: Implementation Plan
 
-Status: draft, under review
+Status: active. Transport architecture decided (§4.3 Path C).
 Last updated: 2026-04-25
 
-This document captures the proposed roadmap for getting jj-yak from "scaffold
-with stubs" to "usable read/write VCS", along with a review of the plan's
-assumptions against the current code and external feasibility risks.
+This document captures the roadmap for getting jj-yak from "scaffold with
+stubs" to "usable read/write VCS", along with a review of assumptions
+against the current code and external feasibility risks.
 
 ## 1. Big picture
 
-The project's goal is a daemon that serves the working copy over NFS, backed
-by storage that eventually goes to a remote. Three orthogonal layers:
+The project's goal is a daemon that serves the working copy as a virtual
+filesystem (FUSE on Linux, NFS on macOS — see §4.3), backed by storage
+that eventually goes to a remote. Three orthogonal layers:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Layer A: WC-over-NFS         <── core architectural bet        │
+│  Layer A: WC-over-VFS         <── core architectural bet        │
 │  Layer B: Backend persistence <── scaling / durability          │
 │  Layer C: Remote storage      <── the "yak" in jj-yak           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Recommendation: **do A first**. If WC-over-NFS doesn't work, B and C are
+Recommendation: **do A first**. If WC-over-VFS doesn't work, B and C are
 wasted effort. If it does, B and C are routine engineering.
 
 ## 2. Milestones
@@ -39,8 +40,8 @@ struct Mount {
     op_id: OperationId,
     root_tree_id: TreeId,
     sparse_patterns: Vec<RepoPathBuf>,
-    nfs_port: u16,                         // assigned by VfsManager (M4)
-    fs: VirtualFileSystem,                 // NFS server state (M3)
+    transport: TransportHandle,            // FUSE handle or NFS port; M4
+    fs: Arc<JjYakFs>,                      // shared VFS state; M3
 }
 ```
 
@@ -73,27 +74,28 @@ better post-M1 smoke test.
 
 If anything breaks, that tells you something M1 missed.
 
-### M3 — VFS read path (depends on §7.1 sign-off)
+### M3 — VFS read path
 
-Refactor `daemon/src/vfs.rs` along the recommendation in §4.3: extract a
-`JjYakFs` trait that the existing nfsserve impl already approximates,
-implement the read methods on the inode/tree model, and add the second
-adapter (`fuse3` on Linux). The methods to fill in:
+Refactor `daemon/src/vfs.rs` along §4.3:
 
-- `lookup(dirid, name)` — walk into a tree by component
-- `getattr(id)` — file/dir mode + size
-- `read(id, offset, count)` — pull file from `Store`
-- `readdir(dirid, ...)` — list tree entries
+1. Extract a `JjYakFs` trait shaped like the current `NFSFileSystem` impl
+   (which is mostly already the right shape, just renamed).
+2. Move the inode/tree state into the trait's owning type. Add a slab of
+   `Inode` entries that lazily expands as paths are walked, keyed by
+   `fileid3`-equivalent u64. The slab is the canonical state; both
+   adapters read from it.
+3. Add two adapters:
+   - `impl nfsserve::NFSFileSystem` — keep current scaffolding.
+   - `impl fuse3::Filesystem` — new. Pulls in `fuse3` as a workspace dep.
+4. Implement the read ops on the trait:
+   - `lookup(dirid, name)` — walk into a tree by component
+   - `getattr(id)` — file/dir mode + size
+   - `read(id, offset, count)` — pull file from `Store`
+   - `readdir(dirid, ...)` — list tree entries
 
-Each resolves an inode (u64) to a `(TreeId, RepoPath)`. Standard approach:
-a slab of `Inode` entries that lazily expands as paths are walked. The
-slab lives behind the trait so both adapters share it.
-
-After M3 you can mount the export and `ls`/`cat` an empty repo. Won't show
-anything yet — no commit checked out.
-
-If §7.1 is rejected and we ship NFS-only, the same methods land directly
-on `NFSFileSystem` and the trait extraction is dropped.
+Once M3 lands you can mount the export — Linux via FUSE, macOS via NFS —
+and `ls`/`cat` an empty repo. Won't show anything yet (no commit checked
+out), but the transport plumbing is real.
 
 ### M4 — `jj yak init` actually mounts
 
@@ -123,22 +125,29 @@ Flow:
 1. Get the new tree from `commit.tree()`.
 2. Send the tree id (and a list of changed paths) to the daemon via a new
    `CheckOut` RPC.
-3. Daemon updates `Mount.root_tree_id` and notifies the `VirtualFileSystem`
-   that the tree changed.
-4. NFS clients see new files on next `readdir`/`lookup`.
+3. Daemon updates `Mount.root_tree_id` and notifies the VFS that the tree
+   changed.
+4. Clients see new files:
+   - **FUSE:** push invalidations via `notify_inval_inode` /
+     `notify_inval_entry` for the changed paths. Kernel re-reads on next
+     access.
+   - **NFS:** rely on attr-cache TTL (`actimeo=0` mount option) plus
+     bumped `mtime`/`ctime` on changed entries. Kernel re-stats on
+     access.
 
-After M5, `jj new` populates the WC and `test_init` becomes a real end-to-end
-NFS round trip.
+After M5, `jj new` populates the WC and `test_init` becomes a real
+end-to-end VFS round trip.
 
-### M6 — NFS write path + snapshot
+### M6 — VFS write path + snapshot
 
-Implement `write` / `create` / `remove` / `mkdir` / `setattr` in `vfs.rs`.
-Each mutates an in-memory tree under the `Mount`. `snapshot` RPC computes
-the current `root_tree_id` (or returns it cached if no writes since last
-snapshot).
+Implement `write` / `create` / `remove` / `mkdir` / `setattr` on the
+`JjYakFs` trait. Each mutates an in-memory tree under the `Mount`. The
+ops land once on the trait and both adapters dispatch to them.
+`snapshot` RPC computes the current `root_tree_id` (or returns it cached
+if no writes since last snapshot).
 
-After M6, `jj describe` / `jj st` work over NFS. **First point at which
-jj-yak is a usable VCS.**
+After M6, `jj describe` / `jj st` work end-to-end. **First point at
+which jj-yak is a usable VCS.**
 
 ## 3. What's deferred
 
@@ -146,8 +155,6 @@ jj-yak is a usable VCS.**
   restart. Add `sled` or `redb` after M6.
 - **Layer C (remote):** `Initialize.remote` is currently a string that's
   stored and ignored. Make it real after M6.
-- **NFS-over-UNIX-socket / FUSE alternative:** see §4 — this may need to move
-  earlier, not later.
 - **Sparse patterns:** `set_sparse_patterns` can stay `todo!` until there's
   a real reason. Most yak users probably don't want sparse if the FS is
   already lazy.
@@ -156,64 +163,61 @@ jj-yak is a usable VCS.**
 
 ## 4. Areas of concern
 
-The original plan mentions some of these (privileges, Watchman) in passing.
-Investigation suggests they are **larger risks than the plan suggests** and
-deserve explicit decisions before M3.
+These are the risks the original sketch glossed over. The §4.3
+architecture decision routes around the worst ones; the rest are still
+live and listed here so they don't get forgotten.
 
-### 4.1 P0 — Likely blockers
+### 4.1 Risks the architecture closes
 
-**Mounting NFS on Linux requires root.** The plan asserts "nfsserve claims
-it works unprivileged via TCP on a high port. Verify." Verified: nfsserve's
-*server* side runs unprivileged, but `mount(2)` on Linux is gated on
-`CAP_SYS_ADMIN`. The kernel NFS *client* needs root to attach the mount.
-There is no clean rootless path on stock Linux:
+For the record, since the original sketch worried about these:
 
-- `/etc/fstab` with `user` option → admin one-time setup, doesn't fit
-  `jj yak init`.
-- Setuid `mount.nfs` → only honors fstab.
-- User namespaces → NFS isn't in the user-ns mountable filesystem list.
+**Mounting NFS on Linux would have required root.** `mount(2)` on Linux
+is gated on `CAP_SYS_ADMIN`; nfsserve's server runs unprivileged but the
+kernel NFS *client* doesn't. **Closed by §4.3:** Linux uses FUSE
+(`fusermount3` is setuid; `jj yak init` runs as the user with no `sudo`).
 
-**Implication:** `jj yak init` on Linux needs `sudo`, OR a setuid helper
-shipped with jj-yak, OR a fundamentally different transport (FUSE, see below).
-This needs an explicit decision before M4.
+**inotify/Watchman wouldn't see server-side mutations over NFS.** True,
+and `snapshot` without fsmonitor walks the entire WC. **Closed by §4.3
+on Linux:** FUSE adapter pushes invalidations via `notify_inval_inode`
+when `check_out` mutates the tree, so the kernel re-stats on next access
+without scanning. macOS still has the original problem; see §4.2.
 
-**inotify/Watchman do not see server-side mutations over NFS.** The plan
-says "Watchman won't see writes via NFS — disable in the WC config." That's
-correct, but the cost is bigger than the plan implies: jj's `snapshot`
-without fsmonitor walks the entire WC. For large repos this dominates
-command latency. Mitigation options:
+**fsmonitor strategy still TBD for snapshot.** Even with FUSE
+invalidation, snapshot needs to know which paths the *client* (editors,
+build tools) wrote since the last revision. Options:
 
 - (a) Stamp `mtime`/`ctime` and rely on jj's stat-based scan (still O(tree)).
 - (b) Bypass fsmonitor and feed jj a precomputed dirty set out-of-band
-  (requires upstream jj changes or a wrapper).
-- (c) Run watchman *inside* the daemon against the backing store and
-  pretend its events came from the mount.
+  (the daemon already knows what was written via the FUSE/NFS write path).
+  Requires upstream jj cooperation or a wrapper.
+- (c) Run watchman *inside* the daemon against the backing store.
 
-Worth deciding before M6 — this affects the snapshot RPC's contract.
+(b) is most aligned with how jj-yak already mediates the WC. Decide
+before M6 — affects the snapshot RPC's contract.
 
-### 4.2 P1 — Significant friction
+### 4.2 Live risks (mostly macOS NFS)
 
-**Cache coherency.** Linux NFS attribute cache (`acdirmin/acdirmax`,
-default 30–60s) means `stat()` on the client may return stale data for up
-to a minute *after* the daemon updates. nfsserve has no client-side
-invalidation channel. Mitigation:
+**Cache coherency on the macOS NFS path.** Linux NFS attribute cache
+(`acdirmin/acdirmax`, default 30–60s) means `stat()` on the client may
+return stale data for up to a minute *after* the daemon updates.
+`nfsserve` has no client-side invalidation channel, so on macOS we live
+with the polling model. Mitigation:
 
-- Mount with `actimeo=0` (or `noac`) to force every access to revalidate.
+- Mount with `actimeo=0` (or `noac`) — every access revalidates.
   Localhost perf hit is small.
 - Bump `mtime`/`ctime`/change-attr on every daemon-side mutation.
 - The xetdata blog/README assume read-mostly workloads; we don't.
 
-The plan does not currently mention attribute caching. It should.
+(Linux FUSE path doesn't have this problem — kernel respects the
+explicit invalidation we push.)
 
 **macOS quirks.** Apple's `mount_nfs` works against a custom port via
 `-o port=N,mountport=N` and requires `nolocks`. nfsserve serves MOUNT3
-statelessly which is enough for both Linux and macOS clients. macOS Big Sur+
-has periodically broken loopback NFS and sometimes wants `resvport`
-(reserved source port < 1024 → root client-side). FUSE-T uses this
-exact approach in production, so it's viable, but expect intermittent
-macOS-version-specific bugs.
+statelessly, which is enough. macOS Big Sur+ has periodically broken
+loopback NFS and sometimes wants `resvport` (reserved source port < 1024
+→ root client-side). Expect intermittent macOS-version-specific bugs.
 
-**nfsserve maturity gaps.**
+**nfsserve maturity gaps (macOS only after §4.3).**
 
 - NFSv3 only — no v4 → no delegations, no callbacks, no compounds.
 - No locking (NLM not implemented; mount with `nolock`). Editors and jj's
@@ -224,10 +228,10 @@ macOS-version-specific bugs.
   can read/write the tree (issue #38, open).
 - Last release 0.10.2 (Apr 2024). Small-team project.
 
-### 4.3 Transport: recommended architecture
+### 4.3 Transport: adopted architecture
 
-Researched separately; punch line: **no off-the-shelf NFS↔FUSE bridge is
-worth taking on.** Survey of options:
+Decided. Punch line: **no off-the-shelf NFS↔FUSE bridge is worth taking
+on.** Survey of options that ruled them out:
 
 - **FUSE-T** (macOS) goes the wrong direction (FUSE → NFS) and ships under
   a non-commercial-only license. Its NFS server is not a reusable library.
@@ -249,7 +253,7 @@ trait JjYakFs (≈15 async methods, our own type names)
    └── FuseAdapter: impl fuse3::Filesystem      for &dyn JjYakFs
 ```
 
-**Recommended architecture:**
+**Adopted:**
 
 - **Linux primary path: `fuse3` crate.** Rootless mount via the bundled
   `fusermount3` setuid helper. Real client-side invalidation via FUSE
@@ -278,8 +282,6 @@ once.
 **License surface:** `fuse3` is MIT, `nfsserve` is BSD/Apache, system
 `libfuse3` is LGPL. No restrictions on distribution.
 
-Decision is in §7.1 — implementation gates M3.
-
 ## 5. Corrections folded in from code review
 
 These adjustments to the original sketch are already applied above; listed
@@ -298,9 +300,9 @@ here so reviewers can spot-check.
 - **Attribute caching (§4.2).** Original plan mentioned mount privileges and
   Watchman but not NFS attribute caching. Added — `actimeo=0` + ctime
   stamping is mandatory for a mutable WC.
-- **FUSE alternative (§4.3).** Original plan deferred FUSE to "decide later
-  when M3 reveals what's clunky." Promoted to a pre-M3 decision because the
-  Linux mount-privilege answer (§4.1) probably forces it anyway.
+- **FUSE on Linux (§4.3).** Original plan deferred FUSE to "decide later
+  when M3 reveals what's clunky." Promoted, decided, and adopted as the
+  Linux primary path. macOS keeps NFS.
 - **Other ambient findings worth noting.**
   - `LockedYakWorkingCopy` has 6 `todo!`s, not just `check_out`: `recover`
     (251), `rename_workspace` (268), `reset` (272), `sparse_patterns` (276),
@@ -319,8 +321,11 @@ Worth doing in passing, not blocking:
 - **Tests for the WC path** — once M2 lands, copy `cli/tests/test_init.rs`
   into `test_workingcopy.rs` exercising `jj st`, `jj new`, `jj describe -m foo`,
   `jj st`.
-- **Drop predecessors from `commit_to_proto`** if/when jj-lib upstream
-  removes the field — track in a TODO; will need a proto v2.
+- **jj-lib 0.40 metadata round-trip.** `cli/src/backend.rs` now preserves
+  `conflict_labels` and tree-entry `copy_id` (commit `ba36e622`). Still
+  TODO: drop `predecessors` from `commit_to_proto` if/when jj-lib
+  upstream removes the field — track and bump to proto v2 when it
+  happens.
 - **Tracing for the CLI.** Daemon has it; CLI doesn't. `RUST_LOG=cli=info,jj_lib=info`
   would help during M3/M4. Note the comment about CliRunner initializing
   late — any pre-CliRunner setup needs to use `eprintln!`.
@@ -330,35 +335,31 @@ Worth doing in passing, not blocking:
   don't forget.
 - **Delete `server/` crate** — 30 seconds, do it next time in `Cargo.toml`.
 
-## 7. Decisions that gate later milestones
+## 7. Decisions
 
-Listed in the order they have to be made. Each blocks specific milestones;
-M1–M2 don't depend on any of them, so work can start now.
+### Decided
 
-
-
-1. **Transport.** Blocks M3. Recommendation (§4.3): thin internal trait,
+1. **Transport architecture (§4.3).** Thin internal `JjYakFs` trait,
    `fuse3` adapter on Linux, `nfsserve` adapter on macOS. Existing
-   `daemon/src/vfs.rs` already approximates the shared trait. Awaiting
-   sign-off, but the work in M1–M2 is unaffected by the choice.
-2. **Mount privilege on Linux.** Resolved by decision 1: `fusermount3`'s
-   setuid helper handles rootless mount. No `sudo` flow needed for
-   `jj yak init` on Linux. macOS path uses NFS over a high port, also no
-   privilege escalation.
-3. **fsmonitor strategy.** Blocks M6 (snapshot RPC contract). Options:
-   (a) disable fsmonitor and accept O(tree) snapshots; (b) run watchman
-   inside the daemon against the backing store; (c) add a side-channel
-   "dirty set" RPC and feed jj a precomputed working-copy delta. (c) is
-   the most aligned with how jj-yak already mediates the WC, but requires
-   upstream jj cooperation or a wrapper.
+   `daemon/src/vfs.rs` already approximates the trait. M3 does the
+   extraction.
+2. **Linux mount privilege.** Falls out of (1): `fusermount3` setuid
+   helper handles rootless mount; no `sudo` flow needed.
+
+### Still open
+
+3. **fsmonitor strategy.** Blocks M6 (snapshot RPC contract). See §4.1.
+   Leaning toward (b) — daemon feeds jj a precomputed dirty set
+   out-of-band, since the FUSE/NFS write path already knows what was
+   written. Decide while building M6.
 4. **Inode handle stability across daemon restarts.** Blocks Layer B
    design. NFSv3 file handles must survive restart or all clients see
    ESTALE; FUSE has the same constraint via `generation`. Persist the
    inode slab (sled/redb) or regenerate deterministically from a
-   content-addressed tree?
-5. **Concurrency model.** Multiple `Mount`s, single `Store`. If two mounts
-   point at the same remote (Layer C), how do snapshot/checkout serialize?
-   Deferrable past M6.
+   content-addressed tree? Decide alongside Layer B.
+5. **Concurrency model.** Multiple `Mount`s, single `Store`. If two
+   mounts point at the same remote (Layer C), how do snapshot/checkout
+   serialize? Deferrable past M6.
 
 ## 8. Recommended starting point
 
@@ -371,6 +372,6 @@ everything else. Concrete scope:
 - One new test in `cli/tests/` exercising `jj yak init` → `jj log` →
   `jj op log` to round-trip op_id.
 
-In parallel with M1, **make a decision on §7.1 (transport) and §7.2 (mount
-privilege)** before starting M3/M4 — those choices can invalidate large
-chunks of M3+.
+M3 (trait extraction + FUSE adapter) can start as soon as M1–M2 are
+green. Add `fuse3` to `Cargo.toml` as part of M3; the existing
+`nfsserve` dep stays.
