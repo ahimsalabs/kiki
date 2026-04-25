@@ -233,28 +233,35 @@ only the trait impl would differ.
 
 Decision needed before M3.
 
-## 5. Validation against current code
+## 5. Corrections folded in from code review
 
-The original plan was checked against the codebase. Most claims are
-accurate; corrections:
+These adjustments to the original sketch are already applied above; listed
+here so reviewers can spot-check.
 
-| Claim | Reality |
-|-------|---------|
-| 4 `todo!()`s in `service.rs` | Accurate (`service.rs:148, 158, 167, 176`). Plus a 5th in `daemon/src/ty.rs:277` for non-File `TreeEntry` variants. |
-| `Initialize` stores a `Session` in a `Vec` | Accurate (`service.rs:11-14, 18, 43-46`). Session has only `remote, path` — no NFS state. |
-| Empty nfsserve server scaffolded | Accurate. All `NFSFileSystem` methods return `NFS3ERR_NOTSUPP` (`vfs.rs:28-113`). `NFSTcpListener::bind` is wired in `vfs_mgr.rs:49-55`. |
-| `Bind` message exists, nothing sends it | Accurate. `VfsManager::handle()` (`vfs_mgr.rs:38-40`) is never called from `main.rs`. |
-| Plan's `Mount.workspace_name: WorkspaceNameBuf` | Proto uses `workspace_id: bytes` (`proto/jj_interface.proto:72-75`). Keep the proto's name to avoid an unnecessary rename. |
-| `cli/src/main.rs:138` has `&*default_working_copy_factory()` | Accurate. Comment at 135–138 explains the gating condition. |
-| `LockedYakWorkingCopy::check_out` is `todo!` | Accurate (`cli/src/working_copy.rs:262`). Also `todo!`: `recover` (251), `rename_workspace` (268), `reset` (272), `sparse_patterns` (276), `set_sparse_patterns` (280). |
-| Every gRPC call has `.unwrap()` | Accurate. No `?` propagation anywhere. |
-| Daemon has tracing-subscriber, CLI doesn't | Accurate (`daemon/src/main.rs:87-98`). CLI delegates to `CliRunner::init()` (`main.rs:163`). |
-| nfsserve fully wired | Accurate (`Cargo.toml:24` → `nfsserve = "0.10"`). Trait fully stubbed; binding code present. |
-| `server/` crate is a 3-line placeholder | Accurate. `server/src/main.rs` is exactly `Hello, world!`. |
-| `test_init.rs` only does `jj log` | Partially accurate. Only the first test (`test_init`) is read-only. `test_multiple_init` and `test_repos_are_independent` exercise `jj new` and `yak status`. M2's smoke test should use those. |
-| `commit_to_proto` copies predecessors; jj-lib 0.40 has TODO to delete | First half confirmed (`backend.rs:258-260`). The deprecation timeline can't be verified from source — needs a check against jj-lib's CHANGELOG before assuming a v2 proto migration. |
-| jj-lib version | `Cargo.toml:22` pins `jj-lib = "0.40"`. |
-| Taskfile.yml | Does not exist. Worth adding (per global CLAUDE.md). |
+- **Mount field naming.** Original sketch used `workspace_name: WorkspaceNameBuf`.
+  Proto has `workspace_id: bytes` (`proto/jj_interface.proto:72-75`). M1's
+  struct uses `workspace_id` to avoid a gratuitous rename.
+- **Fifth `todo!()`.** `daemon/src/ty.rs:277` panics for non-File `TreeEntry`
+  variants. Cheap to fill while in the area for M1; will hit it as soon as
+  symlinks or subtrees flow through.
+- **M2 smoke test.** Original plan said `test_init.rs` is read-only — only
+  the first of three tests is. `test_multiple_init` and
+  `test_repos_are_independent` already exercise `jj new` and `yak status`,
+  so they're a better post-M1 signal.
+- **Attribute caching (§4.2).** Original plan mentioned mount privileges and
+  Watchman but not NFS attribute caching. Added — `actimeo=0` + ctime
+  stamping is mandatory for a mutable WC.
+- **FUSE alternative (§4.3).** Original plan deferred FUSE to "decide later
+  when M3 reveals what's clunky." Promoted to a pre-M3 decision because the
+  Linux mount-privilege answer (§4.1) probably forces it anyway.
+- **Other ambient findings worth noting.**
+  - `LockedYakWorkingCopy` has 6 `todo!`s, not just `check_out`: `recover`
+    (251), `rename_workspace` (268), `reset` (272), `sparse_patterns` (276),
+    `set_sparse_patterns` (280).
+  - jj-lib pinned to 0.40 (`Cargo.toml:22`). Predecessors-deletion TODO is
+    upstream lore; verify against jj-lib's CHANGELOG before pre-emptively
+    versioning the proto.
+  - No `Taskfile.yml`. Adding one is on the hygiene list (§6).
 
 ## 6. Cross-cutting hygiene
 
@@ -276,24 +283,34 @@ Worth doing in passing, not blocking:
   don't forget.
 - **Delete `server/` crate** — 30 seconds, do it next time in `Cargo.toml`.
 
-## 7. Open questions for discussion
+## 7. Decisions that gate later milestones
 
-1. **Transport: NFS-only, FUSE-only, or both?** The plan implicitly commits
-   to NFS. FUSE has materially better Linux ergonomics. Decide before M3.
-2. **Mount privilege story on Linux.** If staying with NFS, how does
-   `jj yak init` get root? Setuid helper? `sudo` prompt? Documented manual
-   fstab? This needs an answer before M4.
-3. **fsmonitor strategy.** Disable fsmonitor and accept O(tree) snapshots?
-   Run watchman inside the daemon? Add a side-channel "dirty set" RPC? Pick
-   before M6.
-4. **Inode handle stability across daemon restarts.** NFSv3 file handles
-   must survive restart or all clients see ESTALE. Will the inode slab be
-   persisted (sled/redb) or regenerated? Loosely related to Layer B.
-5. **Workspace identity.** Plan calls it `workspace_name: WorkspaceNameBuf`;
-   proto has `workspace_id: bytes`. Pick one and align proto + Rust types.
-6. **Concurrency model.** Multiple `Mount`s, single `Store`. If two mounts
-   point at the same remote in Layer C, how do snapshot/checkout
-   serialize? Deferrable past M6 but worth noting now.
+Listed in the order they have to be made. Each blocks specific milestones;
+M1–M2 don't depend on any of them, so work can start now.
+
+
+
+1. **Transport: NFS-only, FUSE-only, or a swappable abstraction?** Blocks
+   M3. Currently under research — see `docs/transport-research.md` (TBD).
+   The original plan implicitly commits to NFS; Linux mount privilege
+   (decision 2) likely forces FUSE on Linux regardless.
+2. **Mount privilege on Linux.** Blocks M4. If staying with NFS: setuid
+   helper, `sudo` prompt, or admin-managed fstab. If FUSE: `fusermount3`'s
+   setuid helper handles it. Falls out of decision 1.
+3. **fsmonitor strategy.** Blocks M6 (snapshot RPC contract). Options:
+   (a) disable fsmonitor and accept O(tree) snapshots; (b) run watchman
+   inside the daemon against the backing store; (c) add a side-channel
+   "dirty set" RPC and feed jj a precomputed working-copy delta. (c) is
+   the most aligned with how jj-yak already mediates the WC, but requires
+   upstream jj cooperation or a wrapper.
+4. **Inode handle stability across daemon restarts.** Blocks Layer B
+   design. NFSv3 file handles must survive restart or all clients see
+   ESTALE; FUSE has the same constraint via `generation`. Persist the
+   inode slab (sled/redb) or regenerate deterministically from a
+   content-addressed tree?
+5. **Concurrency model.** Multiple `Mount`s, single `Store`. If two mounts
+   point at the same remote (Layer C), how do snapshot/checkout serialize?
+   Deferrable past M6.
 
 ## 8. Recommended starting point
 
