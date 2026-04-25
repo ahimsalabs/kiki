@@ -7,7 +7,7 @@ use jj_cli::{
 };
 use jj_lib::{
     file_util,
-    op_store::WorkspaceId,
+    ref_name::WorkspaceName,
     repo::{ReadonlyRepo, StoreFactories},
     signing::Signer,
     workspace::{WorkingCopyFactories, Workspace, WorkspaceInitError},
@@ -72,7 +72,7 @@ pub fn default_working_copy_factory() -> Box<dyn WorkingCopyFactory> {
     Box::new(LocalWorkingCopyFactory {})
 }
 
-fn run_yak_command(
+async fn run_yak_command(
     ui: &mut Ui,
     command_helper: &CommandHelper,
     command: YakSubcommand,
@@ -132,10 +132,13 @@ fn run_yak_command(
                 ReadonlyRepo::default_op_heads_store_initializer(),
                 ReadonlyRepo::default_index_store_initializer(),
                 ReadonlyRepo::default_submodule_store_initializer(),
-                //&YakWorkingCopyFactory {},
+                // NOTE: YakWorkingCopy is registered but not wired in here
+                // yet; it needs the daemon's snapshot/checkout RPCs filled
+                // in before we can flip this over.
                 &*default_working_copy_factory(),
-                WorkspaceId::default(),
-            )?;
+                WorkspaceName::DEFAULT.to_owned(),
+            )
+            .await?;
 
             let relative_wc_path = file_util::relative_path(cwd, &wc_path);
             writeln!(
@@ -162,4 +165,5 @@ fn main() -> std::process::ExitCode {
         .add_working_copy_factories(working_copy_factories)
         .add_subcommand(run_yak_command)
         .run()
+        .into()
 }
