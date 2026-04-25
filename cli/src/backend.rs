@@ -1,25 +1,22 @@
-use std::{
-    any::Any,
-    io::{Cursor, Read},
-    path::Path,
-    time::SystemTime,
-};
+use std::io::Cursor;
+use std::path::Path;
+use std::pin::Pin;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use jj_lib::{
-    backend::{
-        make_root_commit, Backend, BackendError, BackendInitError, BackendResult, ChangeId, Commit,
-        CommitId, Conflict, ConflictId, CopyRecord, FileId, MergedTreeId, MillisSinceEpoch,
-        SecureSig, Signature, SigningFn, SymlinkId, Timestamp, Tree, TreeId, TreeValue,
-    },
-    index::Index,
-    merge::MergeBuilder,
-    object_id::ObjectId,
-    repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf},
-    settings::UserSettings,
+use jj_lib::backend::{
+    Backend, BackendError, BackendInitError, BackendResult, ChangeId, Commit, CommitId,
+    CopyHistory, CopyId, CopyRecord, FileId, MillisSinceEpoch, RelatedCopy, SecureSig, Signature,
+    SigningFn, SymlinkId, Timestamp, Tree, TreeId, TreeValue, make_root_commit,
 };
+use jj_lib::index::Index;
+use jj_lib::merge::MergeBuilder;
+use jj_lib::object_id::ObjectId;
+use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
+use jj_lib::settings::UserSettings;
 use prost::Message;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::blocking_client::BlockingJujutsuInterfaceClient;
 
@@ -62,10 +59,6 @@ impl YakBackend {
 
 #[async_trait]
 impl Backend for YakBackend {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         Self::name()
     }
@@ -94,23 +87,37 @@ impl Backend for YakBackend {
         1
     }
 
-    async fn read_file(&self, _path: &RepoPath, id: &FileId) -> BackendResult<Box<dyn Read>> {
+    async fn read_file(
+        &self,
+        _path: &RepoPath,
+        id: &FileId,
+    ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
         let proto = self
             .client
             .read_file(file_id_to_proto(id))
             .unwrap()
             .into_inner();
-        Ok(file_from_proto(proto))
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(proto.data.as_slice(), &mut decoded)
+            .map_err(|e| BackendError::Other(e.into()))?;
+        Ok(Box::pin(Cursor::new(decoded)))
     }
 
     async fn write_file(
         &self,
         _path: &RepoPath,
-        contents: &mut (dyn Read + Send),
+        contents: &mut (dyn AsyncRead + Send + Unpin),
     ) -> BackendResult<FileId> {
-        let proto = file_to_proto(contents);
-        let id = self.client.write_file(proto).unwrap();
-        let id = id.into_inner();
+        let mut buf = Vec::new();
+        contents
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| BackendError::Other(e.into()))?;
+        let mut encoded = Vec::new();
+        zstd::stream::copy_encode(buf.as_slice(), &mut encoded, 0)
+            .map_err(|e| BackendError::Other(e.into()))?;
+        let proto = proto::jj_interface::File { data: encoded };
+        let id = self.client.write_file(proto).unwrap().into_inner();
         Ok(FileId::new(id.file_id))
     }
 
@@ -120,14 +127,34 @@ impl Backend for YakBackend {
             .read_symlink(symlink_id_to_proto(id))
             .unwrap()
             .into_inner();
-        Ok(symlink_from_proto(proto))
+        Ok(proto.target)
     }
 
     async fn write_symlink(&self, _path: &RepoPath, target: &str) -> BackendResult<SymlinkId> {
-        let proto = symlink_to_proto(target);
-        let id = self.client.write_symlink(proto).unwrap();
-        let id = id.into_inner();
+        let proto = proto::jj_interface::Symlink {
+            target: target.to_string(),
+        };
+        let id = self.client.write_symlink(proto).unwrap().into_inner();
         Ok(SymlinkId::new(id.symlink_id))
+    }
+
+    // Copy tracking is not supported by yak yet.
+    async fn read_copy(&self, _id: &CopyId) -> BackendResult<CopyHistory> {
+        Err(BackendError::Unsupported(
+            "yak backend does not support copy tracking".into(),
+        ))
+    }
+
+    async fn write_copy(&self, _contents: &CopyHistory) -> BackendResult<CopyId> {
+        Err(BackendError::Unsupported(
+            "yak backend does not support copy tracking".into(),
+        ))
+    }
+
+    async fn get_related_copies(&self, _copy_id: &CopyId) -> BackendResult<Vec<RelatedCopy>> {
+        Err(BackendError::Unsupported(
+            "yak backend does not support copy tracking".into(),
+        ))
     }
 
     #[tracing::instrument]
@@ -143,17 +170,8 @@ impl Backend for YakBackend {
     #[tracing::instrument]
     async fn write_tree(&self, _path: &RepoPath, tree: &Tree) -> BackendResult<TreeId> {
         let proto = tree_to_proto(tree);
-        let id = self.client.write_tree(proto).unwrap();
-        let id = id.into_inner();
+        let id = self.client.write_tree(proto).unwrap().into_inner();
         Ok(TreeId::new(id.tree_id))
-    }
-
-    fn read_conflict(&self, _path: &RepoPath, _id: &ConflictId) -> BackendResult<Conflict> {
-        todo!("Support conflict")
-    }
-
-    fn write_conflict(&self, _path: &RepoPath, _contents: &Conflict) -> BackendResult<ConflictId> {
-        todo!("Support conflict")
     }
 
     #[tracing::instrument]
@@ -187,8 +205,7 @@ impl Backend for YakBackend {
             ));
         }
         let proto = commit_to_proto(&commit);
-        let id = self.client.write_commit(proto).unwrap();
-        let id = id.into_inner();
+        let id = self.client.write_commit(proto).unwrap().into_inner();
         Ok((CommitId::new(id.commit_id), commit))
     }
 
@@ -200,35 +217,37 @@ impl Backend for YakBackend {
     fn get_copy_records(
         &self,
         _paths: Option<&[RepoPathBuf]>,
-        _roots: &CommitId,
-        _heads: &CommitId,
-    ) -> BackendResult<BoxStream<BackendResult<CopyRecord>>> {
+        _root: &CommitId,
+        _head: &CommitId,
+    ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
         Ok(Box::pin(stream::empty()))
     }
 }
 
+// ---------- proto conversions ----------
+
 pub fn file_id_to_proto(file_id: &FileId) -> proto::jj_interface::FileId {
-    let mut proto = proto::jj_interface::FileId::default();
-    proto.file_id = file_id.to_bytes();
-    proto
+    proto::jj_interface::FileId {
+        file_id: file_id.to_bytes(),
+    }
 }
 
 pub fn commit_id_to_proto(commit_id: &CommitId) -> proto::jj_interface::CommitId {
-    let mut proto = proto::jj_interface::CommitId::default();
-    proto.commit_id = commit_id.to_bytes();
-    proto
+    proto::jj_interface::CommitId {
+        commit_id: commit_id.to_bytes(),
+    }
 }
 
 pub fn tree_id_to_proto(tree_id: &TreeId) -> proto::jj_interface::TreeId {
-    let mut proto = proto::jj_interface::TreeId::default();
-    proto.tree_id = tree_id.to_bytes();
-    proto
+    proto::jj_interface::TreeId {
+        tree_id: tree_id.to_bytes(),
+    }
 }
 
 pub fn symlink_id_to_proto(symlink_id: &SymlinkId) -> proto::jj_interface::SymlinkId {
-    let mut proto = proto::jj_interface::SymlinkId::default();
-    proto.symlink_id = symlink_id.to_bytes();
-    proto
+    proto::jj_interface::SymlinkId {
+        symlink_id: symlink_id.to_bytes(),
+    }
 }
 
 pub fn commit_to_proto(commit: &Commit) -> proto::jj_interface::Commit {
@@ -239,15 +258,11 @@ pub fn commit_to_proto(commit: &Commit) -> proto::jj_interface::Commit {
     for predecessor in &commit.predecessors {
         proto.predecessors.push(predecessor.to_bytes());
     }
-    match &commit.root_tree {
-        MergedTreeId::Legacy(tree_id) => {
-            proto.root_tree = vec![tree_id.to_bytes()];
-        }
-        MergedTreeId::Merge(tree_ids) => {
-            proto.uses_tree_conflict_format = true;
-            proto.root_tree = tree_ids.iter().map(|id| id.to_bytes()).collect();
-        }
-    }
+    // Commit::root_tree is now Merge<TreeId>; serialize as a flat list of bytes.
+    // The "uses_tree_conflict_format" field is now redundant (everything is a
+    // merge) but we keep it set for forward-compatibility with older readers.
+    proto.uses_tree_conflict_format = true;
+    proto.root_tree = commit.root_tree.iter().map(|id| id.to_bytes()).collect();
     proto.change_id = commit.change_id.to_bytes();
     proto.description = commit.description.clone();
     proto.author = Some(signature_to_proto(&commit.author));
@@ -256,8 +271,8 @@ pub fn commit_to_proto(commit: &Commit) -> proto::jj_interface::Commit {
 }
 
 fn commit_from_proto(mut proto: proto::jj_interface::Commit) -> Commit {
-    // Note how .take() sets the secure_sig field to None before we encode the data.
-    // Needs to be done first since proto is partially moved a bunch below
+    // Note: .take() sets secure_sig to None before encoding, mirroring the
+    // approach in jj's GitBackend.
     let secure_sig = proto.secure_sig.take().map(|sig| SecureSig {
         data: proto.encode_to_vec(),
         sig,
@@ -265,18 +280,16 @@ fn commit_from_proto(mut proto: proto::jj_interface::Commit) -> Commit {
 
     let parents = proto.parents.into_iter().map(CommitId::new).collect();
     let predecessors = proto.predecessors.into_iter().map(CommitId::new).collect();
-    let root_tree = if proto.uses_tree_conflict_format {
-        let merge_builder: MergeBuilder<_> = proto.root_tree.into_iter().map(TreeId::new).collect();
-        MergedTreeId::Merge(merge_builder.build())
-    } else {
-        assert_eq!(proto.root_tree.len(), 1);
-        MergedTreeId::Legacy(TreeId::new(proto.root_tree[0].to_vec()))
-    };
+    let merge_builder: MergeBuilder<TreeId> =
+        proto.root_tree.into_iter().map(TreeId::new).collect();
+    let root_tree = merge_builder.build();
     let change_id = ChangeId::new(proto.change_id);
     Commit {
         parents,
         predecessors,
         root_tree,
+        // Yak doesn't track conflict labels (yet); hand jj a resolved-empty merge.
+        conflict_labels: jj_lib::merge::Merge::resolved(String::new()),
         change_id,
         description: proto.description,
         author: signature_from_proto(proto.author.unwrap_or_default()),
@@ -284,6 +297,7 @@ fn commit_from_proto(mut proto: proto::jj_interface::Commit) -> Commit {
         secure_sig,
     }
 }
+
 fn signature_to_proto(signature: &Signature) -> proto::jj_interface::commit::Signature {
     proto::jj_interface::commit::Signature {
         name: signature.name.clone(),
@@ -307,14 +321,6 @@ fn signature_from_proto(proto: proto::jj_interface::commit::Signature) -> Signat
     }
 }
 
-fn file_to_proto(file: &mut dyn Read) -> proto::jj_interface::File {
-    let mut proto = proto::jj_interface::File::default();
-    let mut out = vec![];
-    zstd::stream::copy_encode(file, &mut out, 0).unwrap();
-    proto.data = out;
-    proto
-}
-
 fn tree_to_proto(tree: &Tree) -> proto::jj_interface::Tree {
     let mut proto = proto::jj_interface::Tree::default();
     for entry in tree.entries() {
@@ -326,20 +332,16 @@ fn tree_to_proto(tree: &Tree) -> proto::jj_interface::Tree {
     proto
 }
 
-fn symlink_to_proto(target: &str) -> proto::jj_interface::Symlink {
-    let mut proto = proto::jj_interface::Symlink::default();
-    proto.target = target.to_string();
-    proto
-}
-
-fn symlink_from_proto(proto: proto::jj_interface::Symlink) -> String {
-    proto.target.to_string()
-}
-
 fn tree_value_to_proto(value: &TreeValue) -> proto::jj_interface::TreeValue {
     let mut proto = proto::jj_interface::TreeValue::default();
     match value {
-        TreeValue::File { id, executable } => {
+        // Yak doesn't track copy histories yet; copy_id is dropped on the wire
+        // and rehydrated as a placeholder on read.
+        TreeValue::File {
+            id,
+            executable,
+            copy_id: _,
+        } => {
             proto.value = Some(proto::jj_interface::tree_value::Value::File(
                 proto::jj_interface::tree_value::File {
                     id: id.to_bytes(),
@@ -360,28 +362,25 @@ fn tree_value_to_proto(value: &TreeValue) -> proto::jj_interface::TreeValue {
                 id.to_bytes(),
             ));
         }
-        TreeValue::Conflict(id) => {
-            proto.value = Some(proto::jj_interface::tree_value::Value::ConflictId(
-                id.to_bytes(),
-            ));
-        }
     }
     proto
 }
 
-fn file_from_proto(proto: proto::jj_interface::File) -> Box<dyn Read> {
-    let mut file = vec![];
-    zstd::stream::copy_decode(proto.data.as_slice(), &mut file).unwrap();
-    Box::new(Cursor::new(file))
-}
-
 fn tree_from_proto(proto: proto::jj_interface::Tree) -> Tree {
-    let mut tree = Tree::default();
-    for proto_entry in proto.entries {
-        let value = tree_value_from_proto(proto_entry.value.unwrap());
-        tree.set(RepoPathComponentBuf::from(proto_entry.name), value);
-    }
-    tree
+    // Tree entries must be sorted by name for `Tree::from_sorted_entries`.
+    // The daemon emits entries in insertion order, so we sort here defensively.
+    let mut entries: Vec<(RepoPathComponentBuf, TreeValue)> = proto
+        .entries
+        .into_iter()
+        .map(|e| {
+            (
+                RepoPathComponentBuf::new(e.name).expect("invalid path component from daemon"),
+                tree_value_from_proto(e.value.unwrap()),
+            )
+        })
+        .collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Tree::from_sorted_entries(entries)
 }
 
 fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> TreeValue {
@@ -390,16 +389,19 @@ fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> TreeValue {
         proto::jj_interface::tree_value::Value::File(proto::jj_interface::tree_value::File {
             id,
             executable,
-            ..
         }) => TreeValue::File {
             id: FileId::new(id),
             executable,
+            copy_id: CopyId::placeholder(),
         },
         proto::jj_interface::tree_value::Value::SymlinkId(id) => {
             TreeValue::Symlink(SymlinkId::new(id))
         }
-        proto::jj_interface::tree_value::Value::ConflictId(id) => {
-            TreeValue::Conflict(ConflictId::new(id))
+        // jj-lib 0.40 dropped TreeValue::Conflict from the trait surface; the
+        // wire type still carries it for legacy data, but yak should never
+        // produce it.
+        proto::jj_interface::tree_value::Value::ConflictId(_) => {
+            panic!("yak backend: stored conflict_id no longer supported by jj")
         }
     }
 }
