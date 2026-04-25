@@ -39,14 +39,21 @@ impl YakBackend {
     pub fn new(settings: &UserSettings, _store_path: &Path) -> Result<Self, BackendInitError> {
         let root_commit_id = CommitId::from_bytes(&[0; COMMIT_ID_LENGTH]);
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
-        let grpc_port = settings.get::<usize>("grpc_port").unwrap();
+        let grpc_port = settings
+            .get::<usize>("grpc_port")
+            .map_err(|e| BackendInitError(e.into()))?;
 
         let client = crate::blocking_client::BlockingJujutsuInterfaceClient::connect(format!(
             "http://[::1]:{grpc_port}"
         ))
-        .unwrap();
-        let empty_tree_id =
-            TreeId::from_bytes(&client.get_empty_tree_id().unwrap().into_inner().tree_id);
+        .map_err(|e| BackendInitError(e.into()))?;
+        let empty_tree_id = TreeId::from_bytes(
+            &client
+                .get_empty_tree_id()
+                .map_err(|e| BackendInitError(e.into()))?
+                .into_inner()
+                .tree_id,
+        );
 
         Ok(YakBackend {
             client,
@@ -89,17 +96,17 @@ impl Backend for YakBackend {
 
     async fn read_file(
         &self,
-        _path: &RepoPath,
+        path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
         let proto = self
             .client
             .read_file(file_id_to_proto(id))
-            .unwrap()
+            .map_err(|e| read_file_err(path, id, e))?
             .into_inner();
         let mut decoded = Vec::new();
         zstd::stream::copy_decode(proto.data.as_slice(), &mut decoded)
-            .map_err(|e| BackendError::Other(e.into()))?;
+            .map_err(|e| read_file_err(path, id, e))?;
         Ok(Box::pin(Cursor::new(decoded)))
     }
 
@@ -112,12 +119,16 @@ impl Backend for YakBackend {
         contents
             .read_to_end(&mut buf)
             .await
-            .map_err(|e| BackendError::Other(e.into()))?;
+            .map_err(|e| write_err("file", e))?;
         let mut encoded = Vec::new();
         zstd::stream::copy_encode(buf.as_slice(), &mut encoded, 0)
-            .map_err(|e| BackendError::Other(e.into()))?;
+            .map_err(|e| write_err("file", e))?;
         let proto = proto::jj_interface::File { data: encoded };
-        let id = self.client.write_file(proto).unwrap().into_inner();
+        let id = self
+            .client
+            .write_file(proto)
+            .map_err(|e| write_err("file", e))?
+            .into_inner();
         Ok(FileId::new(id.file_id))
     }
 
@@ -125,7 +136,7 @@ impl Backend for YakBackend {
         let proto = self
             .client
             .read_symlink(symlink_id_to_proto(id))
-            .unwrap()
+            .map_err(|e| read_object_err("symlink", id, e))?
             .into_inner();
         Ok(proto.target)
     }
@@ -134,7 +145,11 @@ impl Backend for YakBackend {
         let proto = proto::jj_interface::Symlink {
             target: target.to_string(),
         };
-        let id = self.client.write_symlink(proto).unwrap().into_inner();
+        let id = self
+            .client
+            .write_symlink(proto)
+            .map_err(|e| write_err("symlink", e))?
+            .into_inner();
         Ok(SymlinkId::new(id.symlink_id))
     }
 
@@ -162,15 +177,19 @@ impl Backend for YakBackend {
         let proto = self
             .client
             .read_tree(tree_id_to_proto(id))
-            .unwrap()
+            .map_err(|e| read_object_err("tree", id, e))?
             .into_inner();
-        Ok(tree_from_proto(proto))
+        tree_from_proto(proto)
     }
 
     #[tracing::instrument]
     async fn write_tree(&self, _path: &RepoPath, tree: &Tree) -> BackendResult<TreeId> {
-        let proto = tree_to_proto(tree);
-        let id = self.client.write_tree(proto).unwrap().into_inner();
+        let proto = tree_to_proto(tree)?;
+        let id = self
+            .client
+            .write_tree(proto)
+            .map_err(|e| write_err("tree", e))?
+            .into_inner();
         Ok(TreeId::new(id.tree_id))
     }
 
@@ -185,7 +204,7 @@ impl Backend for YakBackend {
         let proto = self
             .client
             .read_commit(commit_id_to_proto(id))
-            .unwrap()
+            .map_err(|e| read_object_err("commit", id, e))?
             .into_inner();
         Ok(commit_from_proto(proto))
     }
@@ -196,6 +215,8 @@ impl Backend for YakBackend {
         commit: Commit,
         sign_with: Option<&mut SigningFn>,
     ) -> BackendResult<(CommitId, Commit)> {
+        // Yak does not yet support signing commits. Both invariants below would
+        // be programmer errors at the call site rather than user-facing failures.
         assert!(commit.secure_sig.is_none(), "commit.secure_sig was set");
         assert!(sign_with.is_none(), "sign_with was set");
 
@@ -205,7 +226,11 @@ impl Backend for YakBackend {
             ));
         }
         let proto = commit_to_proto(&commit);
-        let id = self.client.write_commit(proto).unwrap().into_inner();
+        let id = self
+            .client
+            .write_commit(proto)
+            .map_err(|e| write_err("commit", e))?
+            .into_inner();
         Ok((CommitId::new(id.commit_id), commit))
     }
 
@@ -221,6 +246,43 @@ impl Backend for YakBackend {
         _head: &CommitId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
         Ok(Box::pin(stream::empty()))
+    }
+}
+
+// Helpers for mapping internal failures (RPC, decompression, decode) onto
+// jj's BackendError variants. The closures are tiny but show up at every RPC
+// site, so the helpers cut down on noise without hiding the variant in use.
+fn read_object_err<I: ObjectId>(
+    object_type: &str,
+    id: &I,
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> BackendError {
+    BackendError::ReadObject {
+        object_type: object_type.to_owned(),
+        hash: id.hex(),
+        source: source.into(),
+    }
+}
+
+fn read_file_err(
+    path: &RepoPath,
+    id: &FileId,
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> BackendError {
+    BackendError::ReadFile {
+        path: path.to_owned(),
+        id: id.clone(),
+        source: source.into(),
+    }
+}
+
+fn write_err(
+    object_type: &'static str,
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> BackendError {
+    BackendError::WriteObject {
+        object_type,
+        source: source.into(),
     }
 }
 
@@ -324,71 +386,68 @@ fn signature_from_proto(proto: proto::jj_interface::commit::Signature) -> Signat
     }
 }
 
-fn tree_to_proto(tree: &Tree) -> proto::jj_interface::Tree {
+fn tree_to_proto(tree: &Tree) -> BackendResult<proto::jj_interface::Tree> {
     let mut proto = proto::jj_interface::Tree::default();
     for entry in tree.entries() {
         proto.entries.push(proto::jj_interface::tree::Entry {
             name: entry.name().as_internal_str().to_owned(),
-            value: Some(tree_value_to_proto(entry.value())),
+            value: Some(tree_value_to_proto(entry.value())?),
         });
     }
-    proto
+    Ok(proto)
 }
 
-fn tree_value_to_proto(value: &TreeValue) -> proto::jj_interface::TreeValue {
-    let mut proto = proto::jj_interface::TreeValue::default();
-    match value {
+fn tree_value_to_proto(value: &TreeValue) -> BackendResult<proto::jj_interface::TreeValue> {
+    let value = match value {
         // Yak stores copy ids on tree entries, but the backend's copy-history
         // APIs still report Unsupported until the daemon has real copy objects.
         TreeValue::File {
             id,
             executable,
             copy_id,
-        } => {
-            proto.value = Some(proto::jj_interface::tree_value::Value::File(
-                proto::jj_interface::tree_value::File {
-                    id: id.to_bytes(),
-                    executable: *executable,
-                    copy_id: copy_id.to_bytes(),
-                },
+        } => proto::jj_interface::tree_value::Value::File(proto::jj_interface::tree_value::File {
+            id: id.to_bytes(),
+            executable: *executable,
+            copy_id: copy_id.to_bytes(),
+        }),
+        TreeValue::Symlink(id) => proto::jj_interface::tree_value::Value::SymlinkId(id.to_bytes()),
+        TreeValue::Tree(id) => proto::jj_interface::tree_value::Value::TreeId(id.to_bytes()),
+        TreeValue::GitSubmodule(_) => {
+            return Err(BackendError::Unsupported(
+                "yak backend does not support git submodules".into(),
             ));
         }
-        TreeValue::Symlink(id) => {
-            proto.value = Some(proto::jj_interface::tree_value::Value::SymlinkId(
-                id.to_bytes(),
-            ));
-        }
-        TreeValue::GitSubmodule(_id) => {
-            panic!("cannot store git submodules");
-        }
-        TreeValue::Tree(id) => {
-            proto.value = Some(proto::jj_interface::tree_value::Value::TreeId(
-                id.to_bytes(),
-            ));
-        }
-    }
-    proto
+    };
+    Ok(proto::jj_interface::TreeValue { value: Some(value) })
 }
 
-fn tree_from_proto(proto: proto::jj_interface::Tree) -> Tree {
-    // Tree entries must be sorted by name for `Tree::from_sorted_entries`.
-    // The daemon emits entries in insertion order, so we sort here defensively.
+fn tree_from_proto(proto: proto::jj_interface::Tree) -> BackendResult<Tree> {
+    // Tree entries must be sorted by name for `Tree::from_sorted_entries`
+    // (which only debug_asserts the invariant — release builds would silently
+    // corrupt via the binary search in `Tree::entry`). The daemon emits
+    // entries in insertion order, so we sort here defensively.
     let mut entries: Vec<(RepoPathComponentBuf, TreeValue)> = proto
         .entries
         .into_iter()
         .map(|e| {
-            (
-                RepoPathComponentBuf::new(e.name).expect("invalid path component from daemon"),
-                tree_value_from_proto(e.value.unwrap()),
-            )
+            let name = RepoPathComponentBuf::new(e.name)
+                .map_err(|e| BackendError::Other(e.into()))?;
+            let raw = e.value.ok_or_else(|| {
+                BackendError::Other("daemon returned tree entry with no value".into())
+            })?;
+            let value = tree_value_from_proto(raw)?;
+            Ok::<_, BackendError>((name, value))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-    Tree::from_sorted_entries(entries)
+    Ok(Tree::from_sorted_entries(entries))
 }
 
-fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> TreeValue {
-    match proto.value.unwrap() {
+fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> BackendResult<TreeValue> {
+    let raw = proto.value.ok_or_else(|| {
+        BackendError::Other("daemon returned TreeValue with empty oneof".into())
+    })?;
+    Ok(match raw {
         proto::jj_interface::tree_value::Value::TreeId(id) => TreeValue::Tree(TreeId::new(id)),
         proto::jj_interface::tree_value::Value::File(proto::jj_interface::tree_value::File {
             id,
@@ -404,11 +463,15 @@ fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> TreeValue {
         }
         // jj-lib 0.40 dropped TreeValue::Conflict from the trait surface; the
         // wire type still carries it for legacy data, but yak should never
-        // produce it.
+        // round-trip it. Surface this as Unsupported instead of crashing so
+        // existing daemon data containing legacy conflict objects fails the
+        // single read rather than aborting the CLI.
         proto::jj_interface::tree_value::Value::ConflictId(_) => {
-            panic!("yak backend: stored conflict_id no longer supported by jj")
+            return Err(BackendError::Unsupported(
+                "yak backend: stored conflict_id is no longer supported by jj-lib 0.40".into(),
+            ));
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -471,11 +534,37 @@ mod tests {
             copy_id: copy_id.clone(),
         };
 
-        let proto = tree_value_to_proto(&value);
+        let proto = tree_value_to_proto(&value).expect("encode");
         assert!(matches!(
             proto.value.as_ref().unwrap(),
             proto::jj_interface::tree_value::Value::File(file) if file.copy_id == copy_id.to_bytes()
         ));
-        assert_eq!(tree_value_from_proto(proto), value);
+        assert_eq!(tree_value_from_proto(proto).expect("decode"), value);
+    }
+
+    #[test]
+    fn tree_value_unknown_oneof_is_other_error() {
+        // Force a TreeValue with an empty oneof; this models a daemon that
+        // emits an entry with no value set.
+        let proto = proto::jj_interface::TreeValue { value: None };
+        let err = tree_value_from_proto(proto).expect_err("expected decode error");
+        assert!(matches!(err, BackendError::Other(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn tree_value_legacy_conflict_id_is_unsupported() {
+        let proto = proto::jj_interface::TreeValue {
+            value: Some(proto::jj_interface::tree_value::Value::ConflictId(vec![1; 32])),
+        };
+        let err = tree_value_from_proto(proto).expect_err("expected decode error");
+        assert!(matches!(err, BackendError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn tree_value_git_submodule_is_unsupported() {
+        use jj_lib::backend::CommitId;
+        let value = TreeValue::GitSubmodule(CommitId::new(vec![1; 32]));
+        let err = tree_value_to_proto(&value).expect_err("expected encode error");
+        assert!(matches!(err, BackendError::Unsupported(_)), "got {err:?}");
     }
 }

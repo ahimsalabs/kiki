@@ -1,5 +1,5 @@
 use std::cell::OnceCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,6 +20,28 @@ use proto::jj_interface::{GetCheckoutStateReq, GetTreeStateReq, SnapshotReq};
 use tracing::{info, warn};
 
 use crate::blocking_client::BlockingJujutsuInterfaceClient;
+
+fn wc_state_err(
+    message: impl Into<String>,
+    err: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> WorkingCopyStateError {
+    WorkingCopyStateError {
+        message: message.into(),
+        err: err.into(),
+    }
+}
+
+/// Working-copy paths must be UTF-8 because they cross the proto boundary as
+/// `string`. Non-UTF-8 paths (possible on Linux) need to be rejected up front
+/// instead of `unwrap()`ing inside RPC builders.
+fn path_to_str(path: &Path) -> Result<&str, WorkingCopyStateError> {
+    path.to_str().ok_or_else(|| {
+        wc_state_err(
+            format!("working copy path is not valid UTF-8: {}", path.display()),
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path"),
+        )
+    })
+}
 
 pub struct YakWorkingCopyFactory {}
 
@@ -53,7 +75,7 @@ impl WorkingCopyFactory for YakWorkingCopyFactory {
             store,
             working_copy_path,
             settings,
-        )))
+        )?))
     }
 }
 
@@ -71,13 +93,17 @@ impl YakWorkingCopy {
         "yak"
     }
 
-    fn connect_client(settings: &UserSettings) -> BlockingJujutsuInterfaceClient {
+    fn connect_client(
+        settings: &UserSettings,
+    ) -> Result<BlockingJujutsuInterfaceClient, WorkingCopyStateError> {
         // Pull the daemon port from user settings (matches YakBackend); the
         // integration test harness assigns a random port per env, so this
         // must not be hardcoded.
-        let grpc_port = settings.get::<usize>("grpc_port").unwrap();
+        let grpc_port = settings
+            .get::<usize>("grpc_port")
+            .map_err(|e| wc_state_err("grpc_port not configured", e))?;
         BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
-            .expect("connect to yak daemon")
+            .map_err(|e| wc_state_err("failed to connect to yak daemon", e))
     }
 
     fn init(
@@ -87,16 +113,17 @@ impl YakWorkingCopy {
         workspace_name: WorkspaceNameBuf,
         settings: &UserSettings,
     ) -> Result<Self, WorkingCopyStateError> {
-        let client = Self::connect_client(settings);
+        let client = Self::connect_client(settings)?;
+        let path_str = path_to_str(&working_copy_path)?.to_string();
         client
             .set_checkout_state(proto::jj_interface::SetCheckoutStateReq {
-                working_copy_path: working_copy_path.to_str().unwrap().to_string(),
+                working_copy_path: path_str,
                 checkout_state: Some(proto::jj_interface::CheckoutState {
                     op_id: operation_id.as_bytes().into(),
                     workspace_id: workspace_name.as_str().as_bytes().to_vec(),
                 }),
             })
-            .unwrap();
+            .map_err(|e| wc_state_err("daemon SetCheckoutState failed", e))?;
         Ok(YakWorkingCopy {
             store,
             working_copy_path,
@@ -106,15 +133,22 @@ impl YakWorkingCopy {
         })
     }
 
-    fn load(store: Arc<Store>, working_copy_path: PathBuf, settings: &UserSettings) -> Self {
-        let client = Self::connect_client(settings);
-        YakWorkingCopy {
+    fn load(
+        store: Arc<Store>,
+        working_copy_path: PathBuf,
+        settings: &UserSettings,
+    ) -> Result<Self, WorkingCopyStateError> {
+        // Reject non-UTF-8 paths up front so subsequent RPC builders don't
+        // need to handle them.
+        let _ = path_to_str(&working_copy_path)?;
+        let client = Self::connect_client(settings)?;
+        Ok(YakWorkingCopy {
             store,
             working_copy_path,
             client,
             checkout_state: OnceCell::new(),
             tree_state: OnceCell::new(),
-        }
+        })
     }
 }
 
@@ -126,51 +160,82 @@ struct CheckoutState {
 }
 
 impl YakWorkingCopy {
-    fn get_tree(&self) -> &MergedTree {
-        self.tree_state.get_or_init(|| {
+    fn get_tree(&self) -> Result<&MergedTree, WorkingCopyStateError> {
+        // `OnceCell::get_or_try_init` is unstable, so we manually populate the
+        // cell. Single-threaded, so no race window.
+        if self.tree_state.get().is_none() {
+            let path_str = path_to_str(&self.working_copy_path)?.to_string();
             let tree_state = self
                 .client
                 .get_tree_state(GetTreeStateReq {
-                    working_copy_path: self.working_copy_path.to_str().unwrap().to_string(),
+                    working_copy_path: path_str,
                 })
-                .unwrap()
+                .map_err(|e| wc_state_err("daemon GetTreeState failed", e))?
                 .into_inner();
-            MergedTree::resolved(self.store.clone(), TreeId::new(tree_state.tree_id))
-        })
+            let tree =
+                MergedTree::resolved(self.store.clone(), TreeId::new(tree_state.tree_id));
+            // Discard the Err that would mean another caller raced us; can't
+            // happen here (single-threaded), but it would be harmless either
+            // way (both load identical state).
+            let _ = self.tree_state.set(tree);
+        }
+        Ok(self
+            .tree_state
+            .get()
+            .expect("tree_state populated above"))
     }
 
-    fn get_checkout_state(&self) -> &CheckoutState {
-        self.checkout_state.get_or_init(|| {
+    /// Trait-required `workspace_name`/`operation_id` are infallible; if the
+    /// daemon RPC underneath fails we have no choice but to panic. Callers
+    /// that can return errors should call this helper instead.
+    fn get_checkout_state(&self) -> Result<&CheckoutState, WorkingCopyStateError> {
+        if self.checkout_state.get().is_none() {
+            let path_str = path_to_str(&self.working_copy_path)?.to_string();
             let checkout_state = self
                 .client
                 .get_checkout_state(GetCheckoutStateReq {
-                    working_copy_path: self.working_copy_path.to_str().unwrap().to_string(),
+                    working_copy_path: path_str,
                 })
-                .unwrap()
+                .map_err(|e| wc_state_err("daemon GetCheckoutState failed", e))?
                 .into_inner();
             let workspace_name = std::str::from_utf8(&checkout_state.workspace_id)
-                .expect("daemon returned non-UTF-8 workspace name")
+                .map_err(|e| {
+                    wc_state_err("daemon returned non-UTF-8 workspace name", e)
+                })?
                 .to_string();
-            CheckoutState {
+            let _ = self.checkout_state.set(CheckoutState {
                 operation_id: OperationId::new(checkout_state.op_id),
                 workspace_name: WorkspaceNameBuf::from(workspace_name),
-            }
-        })
+            });
+        }
+        Ok(self
+            .checkout_state
+            .get()
+            .expect("checkout_state populated above"))
     }
 
     fn get_working_copy_lock(&self) -> DaemonLock {
         DaemonLock::new()
     }
 
-    fn snapshot_via_daemon(&mut self) -> MergedTree {
+    fn snapshot_via_daemon(&mut self) -> Result<MergedTree, SnapshotError> {
+        // path_to_str returns WorkingCopyStateError, which converts to
+        // SnapshotError via `#[from]`.
+        let path_str = path_to_str(&self.working_copy_path)?.to_string();
         let tree_state = self
             .client
             .snapshot(SnapshotReq {
-                working_copy_path: self.working_copy_path.to_str().unwrap().to_string(),
+                working_copy_path: path_str,
             })
-            .unwrap()
+            .map_err(|e| SnapshotError::Other {
+                message: "daemon Snapshot RPC failed".into(),
+                err: e.into(),
+            })?
             .into_inner();
-        MergedTree::resolved(self.store.clone(), TreeId::new(tree_state.tree_id))
+        Ok(MergedTree::resolved(
+            self.store.clone(),
+            TreeId::new(tree_state.tree_id),
+        ))
     }
 }
 
@@ -190,15 +255,25 @@ impl WorkingCopy for YakWorkingCopy {
     }
 
     fn workspace_name(&self) -> &WorkspaceName {
-        &self.get_checkout_state().workspace_name
+        // Trait-required infallible accessor; the daemon RPC underneath can
+        // fail. Eagerly hydrate via `start_mutation` / `tree()` to avoid
+        // panicking here. If we end up here without a populated cache, that's
+        // a bug in the load path.
+        &self
+            .get_checkout_state()
+            .expect("checkout state must be loaded before workspace_name()")
+            .workspace_name
     }
 
     fn operation_id(&self) -> &OperationId {
-        &self.get_checkout_state().operation_id
+        &self
+            .get_checkout_state()
+            .expect("checkout state must be loaded before operation_id()")
+            .operation_id
     }
 
     fn tree(&self) -> Result<&MergedTree, WorkingCopyStateError> {
-        Ok(self.get_tree())
+        self.get_tree()
     }
 
     fn sparse_patterns(&self) -> Result<&[RepoPathBuf], WorkingCopyStateError> {
@@ -215,9 +290,11 @@ impl WorkingCopy for YakWorkingCopy {
             checkout_state: OnceCell::new(),
             tree_state: OnceCell::new(),
         };
-        let old_operation_id = wc.operation_id().clone();
-        // Force the tree to be loaded so old_tree() can return a borrow.
-        let _ = wc.tree()?;
+        // Hydrate both lazy caches up front so the infallible accessors on
+        // WorkingCopy / LockedWorkingCopy can borrow from them without
+        // surprise panics.
+        let old_operation_id = wc.get_checkout_state()?.operation_id.clone();
+        let _ = wc.get_tree()?;
         Ok(Box::new(LockedYakWorkingCopy {
             wc,
             lock,
@@ -255,7 +332,7 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
         &mut self,
         _options: &SnapshotOptions,
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
-        let tree = self.wc.snapshot_via_daemon();
+        let tree = self.wc.snapshot_via_daemon()?;
         Ok((tree, SnapshotStats::default()))
     }
 

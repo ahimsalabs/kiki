@@ -2,7 +2,7 @@
 
 use jj_cli::{
     cli_util::{CliRunner, CommandHelper},
-    command_error::{cli_error, user_error_with_message, CommandError},
+    command_error::{cli_error, internal_error_with_message, user_error_with_message, CommandError},
     ui::Ui,
 };
 use jj_lib::{
@@ -61,8 +61,15 @@ fn create_store_factories() -> StoreFactories {
     // must match `Backend::name()`.
     store_factories.add_backend(
         "yak",
+        // The factory closure returns BackendLoadError; map BackendInitError
+        // (which is what YakBackend::new produces) into it preserving the
+        // underlying error.
         Box::new(|settings, store_path| {
-            Ok(Box::new(YakBackend::new(settings, store_path).unwrap()))
+            let backend = YakBackend::new(settings, store_path)
+                .map_err(|jj_lib::backend::BackendInitError(e)| {
+                    jj_lib::backend::BackendLoadError(e)
+                })?;
+            Ok(Box::new(backend))
         }),
     );
     store_factories
@@ -79,16 +86,21 @@ async fn run_yak_command(
 ) -> Result<(), CommandError> {
     let YakSubcommand::Yak(YakArgs { command }) = command;
 
-    let grpc_port = command_helper.settings().get::<usize>("grpc_port").unwrap();
+    let grpc_port = command_helper
+        .settings()
+        .get::<usize>("grpc_port")
+        .map_err(|e| user_error_with_message("grpc_port not configured in jj config", e))?;
     let client = crate::blocking_client::BlockingJujutsuInterfaceClient::connect(format!(
         "http://[::1]:{grpc_port}"
     ))
-    .unwrap();
+    .map_err(|e| {
+        user_error_with_message(format!("Failed to connect to yak daemon on port {grpc_port}"), e)
+    })?;
     match command {
         YakCommands::Status => {
             let resp = client
                 .daemon_status(proto::jj_interface::DaemonStatusReq {})
-                .unwrap();
+                .map_err(|e| internal_error_with_message("daemon DaemonStatus RPC failed", e))?;
             ui.request_pager();
             let mut formatter = ui.stdout_formatter();
             for session in resp.into_inner().data {
@@ -109,15 +121,22 @@ async fn run_yak_command(
                 .and_then(|_| wc_path.canonicalize())
                 .map_err(|e| user_error_with_message("Failed to create workspace", e))?;
 
+            let wc_path_str = wc_path.as_os_str().to_str().ok_or_else(|| {
+                user_error_with_message(
+                    format!("Workspace path is not valid UTF-8: {}", wc_path.display()),
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path"),
+                )
+            })?;
+
             // NOTE: We need to tell the daemon to mount the filesystem BEFORE we
             // initalize the core jj internals or we'll have writes on-disk and on
             // vfs.
             client
                 .initialize(proto::jj_interface::InitializeReq {
                     remote: args.remote,
-                    path: wc_path.as_os_str().to_str().unwrap().to_string(),
+                    path: wc_path_str.to_string(),
                 })
-                .unwrap();
+                .map_err(|e| internal_error_with_message("daemon Initialize RPC failed", e))?;
 
             Workspace::init_with_factories(
                 command_helper.settings(),

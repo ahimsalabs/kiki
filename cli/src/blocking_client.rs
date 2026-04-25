@@ -1,3 +1,9 @@
+// `tonic::Status` is ~176 bytes; clippy flags this as `result_large_err` on
+// every RPC return. Boxing it would touch every call site in this crate; the
+// size cost on the cold error path is not worth that churn while
+// `BlockingJujutsuInterfaceClient` is the only consumer of these signatures.
+#![allow(clippy::result_large_err)]
+
 use std::sync::{Arc, Mutex};
 
 use proto::jj_interface::{jujutsu_interface_client::JujutsuInterfaceClient, *};
