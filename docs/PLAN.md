@@ -1,16 +1,14 @@
 # jj-yak: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 +
-M3 + M4 + M5 + M6 done — see [`PLAN-M1-6.md`](./PLAN-M1-6.md) for the
-implementation log. **Interim "ship (d)" landed**: TTL=0 on the FUSE
-adapter sidesteps the kernel-invalidation gate (§7 #9), and the
-previously-missing FUSE methods (`flush`, `fsync`, `fsyncdir`,
-`release`, `releasedir`, `readdirplus`, `rename`) are now implemented —
-`jj yak init` end-to-end on a real Linux FUSE mount succeeds and
-populates `.jj/` correctly. The next gate before integration tests
-can flip to `disable_mount = false` is **M7** (§10 below): split
-`.jj/` storage from the user tree at snapshot, and investigate the
-stale `@-` tree id observed after `jj new` on a real mount.
+Status: active. Transport architecture decided (§4.3 Path C). M1–M7
+done — see [`PLAN-M1-6.md`](./PLAN-M1-6.md) for M1–M6 detail and §10
+below for the M7 outcome. **Integration tests now run with
+`disable_mount = false`**: `jj yak init` + `jj new` round-trip
+through a real Linux FUSE mount, `.jj/` is excluded from snapshots,
+and the working-copy `@` advances correctly across mutations.
+The next milestone is **Layer B — durable storage** (§8). Until that
+lands the daemon's per-mount `HashMap` `Store` loses everything on
+restart.
 Last updated: 2026-04-26
 
 This document captures the roadmap for getting jj-yak from "scaffold with
@@ -68,13 +66,33 @@ One-line summaries:
   across snapshot. Adapters dispatch to the trait. `Snapshot` RPC
   delegates to `JjYakFs::snapshot`.
 
-After M6 the daemon-side VCS surface is feature-complete. The only
-remaining work before `disable_mount` can flip is M7 (§10).
+After M6 the daemon-side VCS surface is feature-complete.
+
+- **M7.** Two changes that together let `disable_mount = false` flip:
+  - **M7.1** — `.jj/` lives outside the content-addressed user tree.
+    `YakFs::jj_subtree: Mutex<Option<InodeId>>` pins the metadata
+    directory across `check_out` and excludes it from `snapshot`.
+    `mkdir(root, ".jj")` populates the pin; `lookup`/`readdir`/
+    `remove`/`rename` short-circuit at the root. Pinned subtree's
+    dirty buffers are also cleaned on snapshot (memory bound).
+  - **M7.2** — two coupled bugs that broke `jj new` end-to-end on a
+    real mount: (a) `swap_root` cleared the entire `by_parent`
+    cache, severing the chain through pinned `.jj/` so writes that
+    happened between snapshot and check_out got orphaned; fixed by
+    clearing only `(ROOT_INODE, *)` entries. (b) `LockedYakWorkingCopy::
+    finish` didn't propagate the new `operation_id` back to the
+    daemon, so subsequent `WorkingCopy::operation_id()` reads kept
+    returning the pre-mutation op and `jj log`'s `@` marker stayed
+    pinned to the old WC commit. Fixed by sending `SetCheckoutState`
+    in `finish`.
+  - Capstone: `cli/tests/common/mod.rs` flipped to `disable_mount =
+    false`, M7-gated `test_nested_tree_round_trips` and
+    `test_symlink_tree_round_trips` un-ignored.
 
 ## 3. What's deferred
 
 - **Layer B (persistence):** the daemon's `HashMap` `Store` loses state on
-  restart. Add `sled` or `redb` after M7.
+  restart. Add `sled` or `redb` next.
 - **Layer C (remote):** `Initialize.remote` is currently a string that's
   stored and ignored. Make it real after Layer B.
 - **Sparse patterns:** `set_sparse_patterns` can stay `todo!` until there's
@@ -228,7 +246,9 @@ Worth doing in passing, not blocking:
   (runs daemon with `daemon.toml`), `task tdd` (cargo watch).
 - **Tests for the WC path** — copy `cli/tests/test_init.rs` into
   `test_workingcopy.rs` exercising `jj st`, `jj new`, `jj describe -m foo`,
-  `jj st`. Blocked behind M7 since most of these need `disable_mount = false`.
+  `jj st`. Now unblocked (M7 flipped `disable_mount = false`); the
+  existing `test_nested_tree_round_trips` / `test_symlink_tree_round_trips`
+  give a starting template.
 - **jj-lib 0.40 metadata round-trip.** `cli/src/backend.rs` now preserves
   `conflict_labels` and tree-entry `copy_id` (commit `ba36e622`). Still
   TODO: drop `predecessors` from `commit_to_proto` if/when jj-lib
@@ -327,19 +347,13 @@ Worth doing in passing, not blocking:
 
 ## 8. Recommended starting point
 
-**M1–M6 are done; the "ship (d)" interim landed**: TTL=0 plus the
-previously-missing FUSE methods. `jj yak init` succeeds end-to-end on a
-real Linux FUSE mount and populates `.jj/` (verified
-manually against `RUST_LOG=daemon::vfs::fuse_adapter=info`). Detail in
-[`PLAN-M1-6.md`](./PLAN-M1-6.md).
+**M1–M7 are done.** Integration tests run with `disable_mount = false`:
+`jj yak init`, `jj new`, `jj log`, `jj op log`, and the
+`test_nested_tree_round_trips` / `test_symlink_tree_round_trips`
+end-to-end paths succeed on a real Linux FUSE mount. M7 detail in §10.
 
-**Next: M7 — split `.jj/` from the user tree, debug stale `@-`.**
-See §10. Without these, `disable_mount = false` in tests fails because
-the WC tree contains every `.jj/...` file and `@-` ends up empty after
-`jj new`.
-
-**After M7: Layer B — durable storage.** The per-mount `HashMap<Id,
-…>` `Store` loses everything on daemon restart (M6's
+**Next: Layer B — durable storage.** The per-mount `HashMap<Id, …>`
+`Store` loses everything on daemon restart (M6's
 snapshot-cleans-the-slab pattern means even an in-flight write is
 durable across `Snapshot` calls but not across daemon restarts).
 Pick `redb` or `sled`, swap the `HashMap` impls behind the same
@@ -402,81 +416,86 @@ Goal was: flip `TTL: Duration::ZERO` in the FUSE adapter and
 **Test status:** 67 daemon unit + 8 cli unit + 4 cli integration
 passing, 2 ignored (still). No regressions.
 
-## 10. M7 — split `.jj/` from user tree; debug stale `@-`
+## 10. M7 outcome — `.jj/` separation + op_id propagation (done)
 
-These two issues only surface with `disable_mount = false`. Both
-have to be fixed before integration tests can run end-to-end on a
-real mount.
+Two issues had to be fixed before `disable_mount = false` could flip.
+Both landed; integration tests now run end-to-end on a real FUSE mount.
 
-### 10.1 `.jj/` leaks into the user's snapshot tree
+### 10.1 `.jj/` separation (M7.1, landed)
 
-`JjYakFs::snapshot` walks the slab from `ROOT_INODE` and includes
-every child — including `.jj/`, which jj-lib creates inside the
-mount during `jj yak init`. So the tree returned to jj-lib for the
-WC commit contains `.jj/repo/index/segments/…`, `.jj/working_copy/…`,
-etc. as if they were user content.
+**Problem:** `JjYakFs::snapshot` walked the slab from `ROOT_INODE`
+and included every child — including `.jj/`, which jj-lib creates
+inside the mount during `jj yak init`. So the tree returned to
+jj-lib for the WC commit contained `.jj/repo/index/segments/…`,
+`.jj/working_copy/…`, etc. as if they were user content. `jj log`
+showed `(empty)` flipping off because the WC commit had ~14
+`.jj/…` entries.
 
-Visible failure mode: `test_init`'s `(empty)` marker disappears
-because the WC commit isn't actually empty (it has the metadata
-files). `jj file list -r @` shows ~14 `.jj/...` entries plus any
-real user files.
+**Adopted: option (a) refined** — pin `.jj/` outside the slab's
+root children. `YakFs` grew `jj_subtree: Mutex<Option<InodeId>>`;
+`mkdir(root, ".jj")` populates it; `lookup`/`readdir`/`remove`/
+`rename` short-circuit on `(ROOT_INODE, ".jj")`; `child_exists`
+treats the pin as occupied; `snapshot_node`'s root iteration
+defensively skips `.jj` (it isn't in `root.children` to begin with
+under this design, but legacy slabs from pre-M7 snapshots could
+have had one). `snapshot()` also walks the pinned subtree to clean
+its dirty buffers (memory bound) but discards the resulting tree id.
 
-Options:
+**Survival across `check_out`:** the pinned inode is held outside
+the slab's child maps, so `swap_root` doesn't disturb it. Pre-M7
+trees that contain `.jj/` resolve via the user-tree fall-through
+until something pins our own; jj-lib's `mkdir(".jj")` creates one
+on first use, after which the pin shadows the legacy entry.
 
-- **(a) Filter `.jj` at snapshot root.** Easy in
-  `YakFs::snapshot_node` for the root case: drop the `.jj` entry
-  before assembling the tree. **Catch:** `snapshot_node` also calls
-  `slab.replace_node(root, NodeRef::Tree(id))`, replacing the
-  dirty root with a clean reference to a tree that *doesn't*
-  contain `.jj` — subsequent `lookup .jj` on root would fail.
-  Need to either keep root as `DirtyTree` after snapshot
-  (re-walking children every time, no clean-fold optimization at
-  root) or carry `.jj` as a synthesized child outside the
-  content-addressed tree.
-- **(b) Two-keyspace storage.** Treat `.jj/` and the user tree as
-  separate logical roots backed by the same mount: kernel sees a
-  single FS, but the daemon stores `.jj/` outside the
-  user-snapshot keyspace. Cleaner, more code. Aligns with the
-  eventual remote-storage story (Layer C) — `.jj/` is local,
-  user content can be remote.
-- **(c) Have the cli explicitly tell the daemon what to filter.**
-  RPC carries an exclusion list. Pushes the policy to the
-  consumer; awkward but unblocking.
+The cleaner option (b) — two-keyspace storage with `.jj/` outside
+the per-mount Store entirely — is on the table for Layer C, when
+the user tree's storage location starts to differ from the
+daemon-managed metadata's.
 
-Recommendation: (a) for the punch list, (b) when Layer C lands
-and `.jj/` storage location matters anyway.
+### 10.2 Stale `@-` after `jj new` (M7.2, landed)
 
-### 10.2 Stale `@-` after `jj new`
+Two coupled bugs surfaced once §10.1 was in place and the M7-gated
+tests started running.
 
-After `jj yak init` → `mkdir dir` → `echo content > dir/file` →
-`jj new`, `jj file list -r @` shows `dir/file` (plus the `.jj/`
-leakage from §10.1). But `jj file list -r @-` is *empty* — even
-though `@-` should be the just-snapshotted previous WC commit
-that contained `dir/file`.
+**Bug A — `swap_root` cleared the entire `by_parent` cache.**
+`InodeSlab::swap_root` (called by `JjYakFs::check_out`) used to
+do `inner.by_parent.clear()`, which inadvertently severed the
+chain through the pinned `.jj/`: a subsequent lookup of
+`.jj/repo/op_heads/heads` re-walked the (now-stale) snapshotted
+user tree and missed any writes that had happened between the
+last snapshot and the `check_out`. Result: jj-lib's freshly-written
+op file (`a297f8…`) was attached to inode 11 in the slab but the
+next CLI invocation re-resolved the path through fresh inode ids
+that pointed at the snapshotted `.jj/` tree without it.
 
-Hypotheses (none verified yet):
+**Fix:** `swap_root` now only drops `(ROOT_INODE, name)` entries
+from `by_parent`. Sub-tree entries `(non-root-inode, name)`
+survive — they're either reachable through the pinned `.jj/` (in
+which case we *want* stable inode ids) or orphaned (harmless).
+Test: `swap_root_preserves_subtree_cache` in `inode.rs`.
 
-- `jj new`'s flow may snapshot, get a tree id, but jj-lib uses
-  the *old* WC commit's tree id for `@-` instead of the
-  freshly-snapshotted one. Bug in
-  `LockedYakWorkingCopy::finish_snapshot` or how the new commit
-  is parented?
-- Possible interaction with `swap_root` clearing the slab after
-  `check_out`: the second `cli` invocation (`file list -r @-`)
-  starts with a clean slab and might re-resolve `@-` from a stale
-  cache.
-- Could be a real upstream-jj-lib quirk we're hitting only because
-  the daemon-backed working copy returns trees in a different
-  order than the local working copy.
+**Bug B — `LockedYakWorkingCopy::finish` didn't propagate the
+new operation_id back to the daemon.** The local-disk working
+copy writes `.jj/working_copy/checkout` at this point; the
+daemon-backed equivalent is `SetCheckoutState`. Without it, the
+daemon's stored `op_id` stayed at the pre-mutation value, and the
+next CLI's `WorkingCopy::operation_id()` returned the old op,
+which made jj-lib resolve `@` to the pre-`jj new` WC commit.
+Visible as: `jj new` printed "Working copy now at: <new>" but
+`jj log` next ran showed `@` still on the old commit.
 
-Diagnostic plan:
+**Fix:** `finish` now sends `SetCheckoutStateReq` with the new
+`operation_id`, then invalidates the cached `checkout_state`
+`OnceCell`. Code in `cli/src/working_copy.rs:LockedYakWorkingCopy::finish`.
 
-1. Add `RUST_LOG=daemon::service=info` for Snapshot/CheckOut RPCs
-   and capture the tree ids on both ends across a real `jj new`.
-2. Compare with local-backend jj behaviour on the same commands.
-3. Likely fix lives in `cli/src/working_copy.rs` (the
-   `start_mutation` / `finish_snapshot` / `check_out` orchestration
-   between cli and daemon) rather than in the daemon itself.
+**Diagnostic that found the bugs:** `RUST_LOG=daemon=info` plus
+explicit `info!` in the snapshot/check_out/SetCheckoutState
+handlers (kept in the daemon as low-volume tracing — three
+mutating RPCs per CLI invocation), with FUSE-side traces added
+temporarily during the investigation. The smoking gun was
+comparing FUSE write traces (jj-lib *did* create the new op file)
+against a `readdir` of the same path post-CheckOut (different
+inode id, stale tree).
 
 ## 11. fuser migration (deferred until perf matters)
 
