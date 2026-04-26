@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fuse3::raw::reply::{
-    DirectoryEntry, FileAttr, ReplyAttr, ReplyCreated, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyInit, ReplyOpen, ReplyWrite,
+    DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyCreated, ReplyData,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyWrite,
 };
 use fuse3::raw::{Filesystem, Request};
 use fuse3::{Errno, FileType, Inode, Result as FuseResult, SetAttr, Timestamp};
@@ -50,12 +50,21 @@ impl FuseAdapter {
     }
 }
 
-/// Cache TTLs used in entry/attr replies. We deliberately use a long TTL
-/// because the VFS is the single source of truth — when the daemon
-/// rewrites a tree (M5), it pushes an explicit `notify_inval_*` to the
-/// kernel rather than relying on the TTL expiring. So a short TTL would
-/// just thrash for nothing.
-const TTL: Duration = Duration::from_secs(60);
+/// Cache TTL for entry/attr replies. Set to zero so the kernel
+/// revalidates every `getattr`/`lookup` over the FUSE channel. The
+/// "right" answer is to push `notify_inval_inode` / `notify_inval_entry`
+/// from the daemon when `check_out` rewrites a tree, but `fuse3 0.9`'s
+/// `Session::get_notify` is private *and* `mount_with_unprivileged`
+/// consumes the `Session`, so there's no public path from a
+/// `MountHandle` to a `Notify` today (see `docs/PLAN.md` §7 #9).
+///
+/// Localhost FUSE round-trip is sub-100µs and editor workloads issue
+/// O(20) syscalls per file open, so revalidation cost is dominated by
+/// daemon dispatch — acceptable until we migrate to `fuser` (whose
+/// `Session::notifier()` is public and `Notifier` is `Clone`). At that
+/// point this constant goes back up and `JujutsuService::check_out`
+/// drives invalidation explicitly.
+const TTL: Duration = Duration::ZERO;
 
 fn fs_err_to_errno(e: FsError) -> Errno {
     let raw: i32 = match e {
@@ -449,10 +458,195 @@ impl Filesystem for FuseAdapter {
         })
     }
 
+    /// Rename. jj-lib relies on the standard atomic-write pattern
+    /// (write to `.tmpXXXX`, then `rename` to the real name). Without
+    /// this, `jj yak init` fails the first time it tries to persist an
+    /// index segment / opheads file. POSIX semantics live on `JjYakFs`;
+    /// the adapter just translates names and dispatches.
+    async fn rename(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        new_parent: Inode,
+        new_name: &OsStr,
+    ) -> FuseResult<()> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
+        let new_name = new_name
+            .to_str()
+            .ok_or_else(|| Errno::from(libc::EINVAL))?;
+        self.inner
+            .rename(parent, name, new_parent, new_name)
+            .await
+            .map_err(fs_err_to_errno)
+    }
+
+    /// `flush` is called on every `close(2)` of a file the kernel has
+    /// open. Since `write` already commits to the in-memory buffer
+    /// synchronously, there's no buffered state to drain — but the
+    /// fuse3 trait defaults to `ENOSYS`, which jj-lib (and other
+    /// callers) propagate as a hard error. Return `Ok(())`.
+    async fn flush(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _lock_owner: u64,
+    ) -> FuseResult<()> {
+        Ok(())
+    }
+
+    /// `fsync` semantics are "make this durable". jj-lib `fsync`s its
+    /// index segment files after writing them. Yak's durability story
+    /// lives at Layer B (a real backing store); until then the in-memory
+    /// `Store` is "durable enough" within a daemon lifetime, so this is
+    /// a no-op rather than `ENOSYS`. Same reasoning as `flush`.
+    async fn fsync(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _datasync: bool,
+    ) -> FuseResult<()> {
+        Ok(())
+    }
+
+    /// `fsyncdir` is the directory variant of `fsync`. Same reasoning.
+    async fn fsyncdir(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _datasync: bool,
+    ) -> FuseResult<()> {
+        Ok(())
+    }
+
+    /// `release` is the close half of `open`. We hand out `fh = 0` from
+    /// `open`/`create` and don't track per-handle state, so there's
+    /// nothing to release.
+    async fn release(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+    ) -> FuseResult<()> {
+        Ok(())
+    }
+
+    /// `releasedir` is the close half of `opendir`. Same reasoning as
+    /// `release` — no per-handle state to clean up.
+    async fn releasedir(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _flags: u32,
+    ) -> FuseResult<()> {
+        Ok(())
+    }
+
     type DirEntryPlusStream<'a>
-        = stream::Empty<FuseResult<fuse3::raw::reply::DirectoryEntryPlus>>
+        = stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntryPlus>>>
     where
         Self: 'a;
+
+    /// `readdirplus` is the kernel's preferred readdir on Linux >= 3.9;
+    /// fuse3 unconditionally advertises `FUSE_DO_READDIRPLUS` during
+    /// `init`, and there's no mount-option to opt out. If our impl
+    /// returns `ENOSYS`, the kernel doesn't always fall back to plain
+    /// `readdir` (depends on `FUSE_READDIRPLUS_AUTO` heuristics) — `ls`
+    /// just sees `getdents64 -> ENOSYS` and gives up. So we have to
+    /// implement it.
+    ///
+    /// Semantically this is `readdir` + `getattr` on every entry; the
+    /// reply lets the kernel cache attrs without follow-up `lookup`s.
+    /// We `getattr` per entry, which is fine over the in-memory store
+    /// but worth revisiting when the FS grows real I/O at Layer B.
+    /// `_lock_owner` is unused — single-user mount, no posix locks.
+    async fn readdirplus(
+        &self,
+        _req: Request,
+        parent: Inode,
+        _fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'_>>> {
+        let entries = self
+            .inner
+            .readdir(parent)
+            .await
+            .map_err(fs_err_to_errno)?;
+
+        // Same `..` approximation as `readdir`. The slab doesn't give
+        // us a quick hop to the real grandparent; if a caller ever
+        // needs an accurate `..` here, plumb it through `JjYakFs`.
+        let parent_inode = if parent == ROOT_INODE { ROOT_INODE } else { parent };
+
+        let parent_attr = self
+            .inner
+            .getattr(parent)
+            .await
+            .map_err(fs_err_to_errno)?;
+        let parent_file_attr = to_file_attr(parent_attr);
+
+        let mut out: Vec<FuseResult<DirectoryEntryPlus>> = Vec::with_capacity(entries.len() + 2);
+        out.push(Ok(DirectoryEntryPlus {
+            inode: parent,
+            generation: 0,
+            kind: FileType::Directory,
+            name: OsString::from("."),
+            offset: 1,
+            attr: parent_file_attr,
+            entry_ttl: TTL,
+            attr_ttl: TTL,
+        }));
+        out.push(Ok(DirectoryEntryPlus {
+            inode: parent_inode,
+            generation: 0,
+            kind: FileType::Directory,
+            name: OsString::from(".."),
+            offset: 2,
+            attr: parent_file_attr,
+            entry_ttl: TTL,
+            attr_ttl: TTL,
+        }));
+
+        for (i, e) in entries.into_iter().enumerate() {
+            // getattr per entry — necessary for the "Plus" half of the
+            // reply. Errors here mean the entry vanished between
+            // readdir and getattr (race we're not really exposed to on
+            // a single-threaded VFS, but be defensive).
+            let attr = match self.inner.getattr(e.inode).await {
+                Ok(a) => to_file_attr(a),
+                Err(err) => {
+                    out.push(Err(fs_err_to_errno(err)));
+                    continue;
+                }
+            };
+            let next_offset: i64 = (i as i64) + 3;
+            out.push(Ok(DirectoryEntryPlus {
+                inode: e.inode,
+                generation: 0,
+                kind: file_kind_to_fuse(e.kind),
+                name: OsString::from(e.name),
+                offset: next_offset,
+                attr,
+                entry_ttl: TTL,
+                attr_ttl: TTL,
+            }));
+        }
+
+        let skip = offset as usize;
+        let remaining: Vec<FuseResult<DirectoryEntryPlus>> = out.into_iter().skip(skip).collect();
+
+        Ok(ReplyDirectoryPlus {
+            entries: stream::iter(remaining.into_iter()),
+        })
+    }
 }
 
 #[cfg(test)]

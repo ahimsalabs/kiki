@@ -48,6 +48,6 @@ tonic = "0.11.0"
 tonic-reflection = "0.11.0"
 tracing = "0.1"
 tracing-log = "0.2.0"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 zstd = "0.13.0"

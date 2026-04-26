@@ -136,10 +136,11 @@ fn test_repos_are_independent() {
     ");
 }
 
-// Needs the VFS write path (M6) to capture the on-disk write into a tree,
-// plus `check_out` (M5) for `jj new`. Will move to `test_workingcopy.rs`
-// per §6 of docs/PLAN.md once those land.
-#[ignore = "needs M5+M6: VFS write path + check_out"]
+// Round-trips through a real FUSE mount: needs `disable_mount = false`
+// in `cli/tests/common/mod.rs`, which is gated on (a) `.jj/`-vs-user
+// tree separation at snapshot time, and (b) the `@-` stale-tree bug
+// surfaced in the `jj new` flow. Tracked as PLAN §10 punch list.
+#[ignore = "needs M7: split .jj/ from user tree + investigate stale @-"]
 #[test]
 fn test_nested_tree_round_trips() {
     let test_env = TestEnvironment::default();
@@ -156,8 +157,8 @@ fn test_nested_tree_round_trips() {
     ");
 }
 
-// Same dependency as `test_nested_tree_round_trips` — needs M5+M6.
-#[ignore = "needs M5+M6: VFS write path + check_out"]
+// Same dependency as `test_nested_tree_round_trips` — needs M7.
+#[ignore = "needs M7: split .jj/ from user tree + investigate stale @-"]
 #[cfg(unix)]
 #[test]
 fn test_symlink_tree_round_trips() {

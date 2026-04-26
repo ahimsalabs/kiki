@@ -214,6 +214,21 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
     /// unreachable through the parent.
     async fn remove(&self, parent: InodeId, name: &str) -> Result<(), FsError>;
 
+    /// Rename a file or directory. POSIX semantics: if `new_name` already
+    /// exists at `new_parent`, it is replaced atomically. The orphaned
+    /// inode (if any) is left in the slab — same reasoning as `remove`.
+    ///
+    /// Required for jj-lib's atomic-write-via-temp-then-rename pattern
+    /// (used by index segments, opheads, refs, etc.). Without this,
+    /// `jj yak init` fails halfway through populating `.jj/`.
+    async fn rename(
+        &self,
+        parent: InodeId,
+        name: &str,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<(), FsError>;
+
     /// Walk the slab, persisting every dirty blob into the [`Store`], and
     /// return the rolled-up root tree id. After a successful `snapshot`,
     /// every previously-dirty inode is replaced with its clean content-
@@ -763,6 +778,107 @@ impl JjYakFs for YakFs {
         self.slab
             .detach_child(parent, name)
             .ok_or(FsError::NotFound)?;
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        parent: InodeId,
+        name: &str,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<(), FsError> {
+        // Both parents need to be DirtyTree so we can mutate their
+        // children maps. They might be the same inode (same-directory
+        // rename — the common case for jj-lib's tmpfile→final swap).
+        // Materialize both; same-parent is a no-op the second time.
+        self.ensure_dirty_tree(parent)?;
+        if new_parent != parent {
+            self.ensure_dirty_tree(new_parent)?;
+        }
+
+        // POSIX rename rules we honour:
+        // - Source must exist (ENOENT otherwise).
+        // - If destination exists:
+        //     * source is dir, dest is dir → dest must be empty.
+        //     * source is non-dir, dest is dir → EISDIR.
+        //     * source is dir, dest is non-dir → ENOTDIR.
+        //     * both non-dir → silently replace (POSIX guarantee).
+        // - Source and destination resolving to the same inode is a
+        //   no-op (POSIX: "If the old and new arguments resolve to
+        //   either the same existing directory entry or different
+        //   directory entries for the same existing file, rename()
+        //   shall return successfully and perform no other action.").
+        let src_inode_id = {
+            let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
+            match parent_inode.node {
+                NodeRef::DirtyTree { ref children } => children
+                    .get(name)
+                    .copied()
+                    .ok_or(FsError::NotFound)?,
+                _ => return Err(FsError::NotADirectory),
+            }
+        };
+
+        // Look up destination if any.
+        let dst_inode_id_opt: Option<InodeId> = {
+            let np_inode = self.slab.get(new_parent).ok_or(FsError::NotFound)?;
+            match np_inode.node {
+                NodeRef::DirtyTree { ref children } => children.get(new_name).copied(),
+                _ => return Err(FsError::NotADirectory),
+            }
+        };
+
+        if let Some(dst_id) = dst_inode_id_opt {
+            if dst_id == src_inode_id {
+                // Same path resolves to same inode — POSIX no-op.
+                return Ok(());
+            }
+            let src = self.slab.get(src_inode_id).ok_or(FsError::NotFound)?;
+            let dst = self.slab.get(dst_id).ok_or(FsError::NotFound)?;
+            let src_is_dir =
+                matches!(src.node, NodeRef::Tree(_) | NodeRef::DirtyTree { .. });
+            let dst_is_dir =
+                matches!(dst.node, NodeRef::Tree(_) | NodeRef::DirtyTree { .. });
+            match (src_is_dir, dst_is_dir) {
+                (true, false) => return Err(FsError::NotADirectory),
+                (false, true) => return Err(FsError::NotAFile),
+                (true, true) => {
+                    // Empty-check the destination directory before
+                    // clobbering. Mirrors `remove`'s rmdir-empty rule.
+                    let empty = match &dst.node {
+                        NodeRef::DirtyTree { children } => children.is_empty(),
+                        NodeRef::Tree(id) => self.read_tree(*id)?.entries.is_empty(),
+                        _ => true,
+                    };
+                    if !empty {
+                        return Err(FsError::NotEmpty);
+                    }
+                }
+                (false, false) => {
+                    // Both files (or symlinks) — POSIX silently replaces.
+                }
+            }
+            // Detach the existing destination. The orphaned inode
+            // stays live in the slab; same reasoning as `remove`.
+            self.slab.detach_child(new_parent, new_name);
+        }
+
+        // Detach source from old parent and attach under new name.
+        // detach_child returns the same id we already looked up, so the
+        // result is redundant; we still call it to actually unlink.
+        self.slab
+            .detach_child(parent, name)
+            .ok_or(FsError::NotFound)?;
+        if !self
+            .slab
+            .attach_child(new_parent, new_name.to_owned(), src_inode_id)
+        {
+            // Should not happen: we just materialized new_parent and
+            // detached any colliding entry. If it does, our slab
+            // invariants are broken.
+            return Err(FsError::AlreadyExists);
+        }
         Ok(())
     }
 

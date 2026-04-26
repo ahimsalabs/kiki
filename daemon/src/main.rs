@@ -115,12 +115,15 @@ async fn main() -> Result<(), anyhow::Error> {
 
     tracing_log::LogTracer::init()?;
 
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let subscriber = tracing_subscriber::fmt()
         .compact()
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(true)
-        .with_target(false)
+        .with_target(true)
+        .with_env_filter(env_filter)
         .finish();
 
     // use that subscriber to process traces emitted after this point

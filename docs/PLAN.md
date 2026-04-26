@@ -1,9 +1,15 @@
 # jj-yak: Implementation Plan
 
 Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 +
-M3 + M4 + M5 + M6 done; the daemon-side VCS surface is feature-complete.
-Real-mount end-to-end (§7 decision 9 — FUSE invalidation) is the
-remaining gate before integration tests can run against a real mount.
+M3 + M4 + M5 + M6 done. **Interim "ship (d)" landed**: TTL=0 on the FUSE
+adapter sidesteps the kernel-invalidation gate (§7 #9), and the
+previously-missing FUSE methods (`flush`, `fsync`, `fsyncdir`,
+`release`, `releasedir`, `readdirplus`, `rename`) are now implemented —
+`jj yak init` end-to-end on a real Linux FUSE mount succeeds and
+populates `.jj/` correctly. The next gate before integration tests
+can flip to `disable_mount = false` is **M7** (§10 below): split
+`.jj/` storage from the user tree at snapshot, and investigate the
+stale `@-` tree id observed after `jj new` on a real mount.
 Last updated: 2026-04-26
 
 This document captures the roadmap for getting jj-yak from "scaffold with
@@ -691,48 +697,47 @@ Worth doing in passing, not blocking:
    (Layer C), how do snapshot/checkout serialize against the shared
    remote? Deferrable past M6 — local mounts are independent until
    Layer C couples them.
-9. **FUSE invalidation API. ← still the gating decision.** `fuse3
-   0.8.1`'s `Session::get_notify` is `pub(crate)`, so the daemon has no
-   public API to push `notify_inval_inode` / `notify_inval_entry` after
-   `check_out` or `snapshot`. Without it, real users see up to 60s
-   (the `TTL` in `fuse_adapter.rs`) of stale `getattr`/`lookup` after
-   a daemon-side mutation. Options:
-   - **(a) Upstream PR to make `Session::get_notify` `pub`.** Smallest
-     surface, depends on review velocity. Likely minutes of code, days
-     of latency.
+9. **FUSE invalidation API. (Resolved as a non-blocker via TTL=0.)**
+   `fuse3 0.9.0`'s `Session::get_notify` is still private, and worse
+   than the original PLAN suggested: `mount_with_unprivileged` *consumes*
+   the `Session`, so even a "make `get_notify` pub" upstream PR isn't
+   enough — we'd need `MountHandle::notifier()` exposed too, and `Notify`
+   itself has one-shot async methods (`pub async fn invalid_inode(mut
+   self, …)`), so `MountHandle` would need to vend a constructor each
+   call. A real upstream patch is structural, not minutes-of-code.
+   We sidestepped this by setting `TTL: Duration::ZERO` in
+   `daemon/src/vfs/fuse_adapter.rs`. The kernel revalidates every
+   `getattr`/`lookup` over the FUSE channel; localhost round-trip is
+   sub-100µs, editor workloads issue O(20) syscalls per file open, and
+   `cat`/`ls` after a daemon-side checkout sees the correct attrs
+   immediately. Options for the eventual proper fix:
+   - **(a) Upstream PR to expose `Notify` via `MountHandle`.** Larger
+     surface than originally thought (see above). Days-to-weeks of
+     review.
    - **(b) Fork/vendor `fuse3`.** Cuts the dependency chain but
-     introduces a fork to maintain. Ugly but unblocking.
-   - **(c) Switch to `fuser`.** Sync trait surface; would touch the
-     adapter shape but not the trait. Largest LoC delta.
-   This decision blocks flipping `disable_mount = false` in
-   `cli/tests/common/mod.rs`, which in turn blocks the M5+M6-tagged
-   `test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
-   from running end-to-end. **The trait-and-RPC layer is provably
-   correct without this** (covered by `service::tests::snapshot_rpc_*`
-   and the YakFs/adapter unit tests); the gap is purely about kernel
-   cache invalidation visible to a real `cat` / `ls` after a
-   daemon-side snapshot or checkout.
+     `Notify`'s one-shot consume-self API is awkward forever.
+   - **(c) Switch to `fuser`.** Sync trait surface, but `fuser`'s
+     `Notifier` is `Clone`, public, and used in production by
+     mountpoint-s3 (AWS). The right long-term move once perf matters
+     — see §11.
+   Until then, real users (and the once-M7 lands, integration tests)
+   see correct semantics with a small per-syscall daemon-dispatch
+   tax.
 
 ## 8. Recommended starting point
 
-**M1–M6 are done.** The daemon-side VCS surface is feature-complete:
-per-mount state, `jj yak init` routing, both NFS and FUSE adapters
-implementing the full read+write surface, real FUSE mount on Linux
-(NFS on macOS), `CheckOut` swapping the visible root, and `Snapshot`
-walking the slab to produce a rolled-up root tree id from in-memory
-dirty buffers. The trait + RPC layer is exercised end-to-end by
-`service::tests::snapshot_rpc_returns_new_tree_id_after_vfs_write`.
+**M1–M6 are done; the "ship (d)" interim landed**: TTL=0 plus the
+previously-missing FUSE methods. `jj yak init` succeeds end-to-end on a
+real Linux FUSE mount and populates `.jj/` (verified
+manually against `RUST_LOG=daemon::vfs::fuse_adapter=info`).
 
-**Next: decide §7 #9 (FUSE invalidation), then flip
-`disable_mount = false`.** Until that flip, `std::fs::write` /
-`std::fs::create_dir` from the integration tests go to the local
-disk instead of through our daemon's VFS, so
-`test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
-stay `#[ignore]`. Pick (a) upstream PR, (b) fork `fuse3`, or (c)
-switch to `fuser` — see §7 #9 for the trade-offs.
+**Next: M7 — split `.jj/` from the user tree, debug stale `@-`.**
+See §10. Without these, `disable_mount = false` in tests fails because
+the WC tree contains every `.jj/...` file and `@-` ends up empty after
+`jj new`.
 
-**After that gate clears: Layer B — durable storage.** The per-mount
-`HashMap<Id, …>` `Store` loses everything on daemon restart (M6's
+**After M7: Layer B — durable storage.** The per-mount `HashMap<Id,
+…>` `Store` loses everything on daemon restart (M6's
 snapshot-cleans-the-slab pattern means even an in-flight write is
 durable across `Snapshot` calls but not across daemon restarts).
 Pick `redb` or `sled`, swap the `HashMap` impls behind the same
@@ -753,3 +758,157 @@ necessary so kernel handles survive restart.
   remove from `Cargo.toml`.
 - **Tracing for the CLI.** Daemon already has it; CLI gets `RUST_LOG`
   setup that helps debug snapshot/checkout RPC traffic.
+
+## 9. "Ship (d)" outcome (interim, 2026-04-26)
+
+Goal was: flip `TTL: Duration::ZERO` in the FUSE adapter and
+`disable_mount = false` in tests, find out the real next blocker.
+
+**What landed (committed):**
+
+- `daemon/src/vfs/fuse_adapter.rs`: `TTL = Duration::ZERO` (was
+  `Duration::from_secs(60)`). Comment updated to explain the
+  trade-off and point at §7 #9.
+- **Missing FUSE methods filled in.** The fuse3 trait defaults to
+  `ENOSYS` for many ops; we needed working implementations or stubs
+  for: `flush`, `fsync`, `fsyncdir`, `release`, `releasedir`,
+  `readdirplus`, `rename`. All but `rename` are no-op-style stubs
+  (`Ok(())`) — we have no per-fh state and durability lives at
+  Layer B, so flush/fsync/release have nothing to do.
+  `readdirplus` is a real impl (the kernel falls back to `readdir`
+  imperfectly when readdirplus returns ENOSYS), looking like
+  `readdir` + `getattr` per entry.
+- **`JjYakFs::rename`** (new trait method) + impl on `YakFs`. POSIX
+  semantics: existing destination atomic-replace, empty-dir-rmdir
+  for dir-over-dir, type-match guards. Required because jj-lib's
+  index/op-heads writes use the standard
+  atomic-write-via-`.tmpXXXX`-then-rename pattern. Plumbed through
+  both adapters: FUSE (`OsStr`→`&str`) and NFS (`filename3`→`&str`).
+- `daemon/src/main.rs`: `tracing-subscriber` now uses `EnvFilter`,
+  so `RUST_LOG` actually controls log filtering. Indispensable for
+  debugging the FUSE op flow against a real mount.
+- `Cargo.toml`: enabled the `env-filter` feature on
+  `tracing-subscriber`.
+
+**What did *not* land:**
+
+- `cli/tests/common/mod.rs:disable_mount = false`. Tried it; saw
+  the real next gate. Reverted to `true`. The two M5+M6-tagged
+  tests are still `#[ignore]`, now with a "needs M7" reason
+  pointing at §10.
+
+**Test status:** 67 daemon unit + 8 cli unit + 4 cli integration
+passing, 2 ignored (still). No regressions.
+
+## 10. M7 — split `.jj/` from user tree; debug stale `@-`
+
+These two issues only surface with `disable_mount = false`. Both
+have to be fixed before integration tests can run end-to-end on a
+real mount.
+
+### 10.1 `.jj/` leaks into the user's snapshot tree
+
+`JjYakFs::snapshot` walks the slab from `ROOT_INODE` and includes
+every child — including `.jj/`, which jj-lib creates inside the
+mount during `jj yak init`. So the tree returned to jj-lib for the
+WC commit contains `.jj/repo/index/segments/…`, `.jj/working_copy/…`,
+etc. as if they were user content.
+
+Visible failure mode: `test_init`'s `(empty)` marker disappears
+because the WC commit isn't actually empty (it has the metadata
+files). `jj file list -r @` shows ~14 `.jj/...` entries plus any
+real user files.
+
+Options:
+
+- **(a) Filter `.jj` at snapshot root.** Easy in
+  `YakFs::snapshot_node` for the root case: drop the `.jj` entry
+  before assembling the tree. **Catch:** `snapshot_node` also calls
+  `slab.replace_node(root, NodeRef::Tree(id))`, replacing the
+  dirty root with a clean reference to a tree that *doesn't*
+  contain `.jj` — subsequent `lookup .jj` on root would fail.
+  Need to either keep root as `DirtyTree` after snapshot
+  (re-walking children every time, no clean-fold optimization at
+  root) or carry `.jj` as a synthesized child outside the
+  content-addressed tree.
+- **(b) Two-keyspace storage.** Treat `.jj/` and the user tree as
+  separate logical roots backed by the same mount: kernel sees a
+  single FS, but the daemon stores `.jj/` outside the
+  user-snapshot keyspace. Cleaner, more code. Aligns with the
+  eventual remote-storage story (Layer C) — `.jj/` is local,
+  user content can be remote.
+- **(c) Have the cli explicitly tell the daemon what to filter.**
+  RPC carries an exclusion list. Pushes the policy to the
+  consumer; awkward but unblocking.
+
+Recommendation: (a) for the punch list, (b) when Layer C lands
+and `.jj/` storage location matters anyway.
+
+### 10.2 Stale `@-` after `jj new`
+
+After `jj yak init` → `mkdir dir` → `echo content > dir/file` →
+`jj new`, `jj file list -r @` shows `dir/file` (plus the `.jj/`
+leakage from §10.1). But `jj file list -r @-` is *empty* — even
+though `@-` should be the just-snapshotted previous WC commit
+that contained `dir/file`.
+
+Hypotheses (none verified yet):
+
+- `jj new`'s flow may snapshot, get a tree id, but jj-lib uses
+  the *old* WC commit's tree id for `@-` instead of the
+  freshly-snapshotted one. Bug in
+  `LockedYakWorkingCopy::finish_snapshot` or how the new commit
+  is parented?
+- Possible interaction with `swap_root` clearing the slab after
+  `check_out`: the second `cli` invocation (`file list -r @-`)
+  starts with a clean slab and might re-resolve `@-` from a stale
+  cache.
+- Could be a real upstream-jj-lib quirk we're hitting only because
+  the daemon-backed working copy returns trees in a different
+  order than the local working copy.
+
+Diagnostic plan:
+
+1. Add `RUST_LOG=daemon::service=info` for Snapshot/CheckOut RPCs
+   and capture the tree ids on both ends across a real `jj new`.
+2. Compare with local-backend jj behaviour on the same commands.
+3. Likely fix lives in `cli/src/working_copy.rs` (the
+   `start_mutation` / `finish_snapshot` / `check_out` orchestration
+   between cli and daemon) rather than in the daemon itself.
+
+## 11. fuser migration (deferred until perf matters)
+
+The user is leaning toward switching from `fuse3` to `fuser`
+once we exit the "(d) interim" mode. fuser's advantages, confirmed
+by reading sources:
+
+- `Session::notifier()` and `BackgroundSession::notifier()` are
+  public.
+- `Notifier` is `Clone`, methods take `&self`, and have proper
+  semantics (`inval_entry` swallows ENOENT for already-evicted
+  entries).
+- Used in production by mountpoint-s3 (AWS).
+- Drops the structural problem with fuse3's
+  `mount_with_unprivileged` consuming `Session`.
+
+Cost (reconfirmed against actual sources):
+
+- ~700–900 LoC in `daemon/src/vfs/fuse_adapter.rs` (sync trait
+  surface, ~25 callbacks, spawn-and-reply pattern via captured
+  `tokio::runtime::Handle` to avoid serializing kernel requests
+  behind fuser's single-threaded loop).
+- ~50–100 LoC in `daemon/src/vfs_mgr.rs` (`spawn_mount2` returns
+  `BackgroundSession`; capture `notifier()` for the per-Mount
+  state).
+- ~30 LoC in `daemon/src/service.rs` (wire `notifier` into
+  `JujutsuService::check_out` so we push `inval_inode(ROOT_INODE,
+  0, 0)` + per-child `inval_entry` after the swap).
+
+Pre-requisite reading: our `JjYakFs` async methods are "async in
+name only" — every body is sync (parking_lot mutex + Store calls
+are sync as of M6). So the sync→async bridge in the new fuser
+adapter is light: the bodies don't await anything we'd lose by
+switching to a sync trait.
+
+Land alongside Layer B if possible (we'll already be touching
+per-Mount state for stable inode ids).

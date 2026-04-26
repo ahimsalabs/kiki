@@ -11,10 +11,9 @@
 //!   (`set_mode3`, `set_size3`, …). The helpers at the bottom of this
 //!   module collapse those to `Option<T>` so the trait surface stays
 //!   protocol-agnostic.
-//! - `rename` is intentionally *not* implemented; jj's snapshot code
-//!   doesn't drive renames through the working copy, and editor temp-
-//!   file dances on macOS NFS are rare enough that "EROFS" is the right
-//!   answer until we hit a real consumer.
+//! - `rename` dispatches into `JjYakFs::rename`. jj-lib uses the standard
+//!   atomic-write-via-temp-then-rename pattern for index segments,
+//!   opheads, and refs; without rename, `jj yak init` fails halfway.
 
 use std::sync::Arc;
 
@@ -266,17 +265,24 @@ impl NFSFileSystem for NfsAdapter {
             .map_err(fs_err_to_nfs)
     }
 
-    /// Rename isn't implemented yet — see module doc. Returning `ROFS`
-    /// rather than `NOTSUPP` because the latter trips macOS Finder into
-    /// a busy-wait retry loop.
+    /// Rename. Required for jj-lib's atomic-write-via-temp-then-rename
+    /// pattern (index segments, opheads, refs). The adapter just
+    /// translates filenames to UTF-8 and dispatches to `JjYakFs::rename`,
+    /// which holds the POSIX semantics. Returns `NFS3ERR_INVAL` for
+    /// non-UTF-8 names — same convention as `lookup`.
     async fn rename(
         &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let from = name_to_string(from_filename)?;
+        let to = name_to_string(to_filename)?;
+        self.inner
+            .rename(from_dirid, &from, to_dirid, &to)
+            .await
+            .map_err(fs_err_to_nfs)
     }
 
     async fn mkdir(
