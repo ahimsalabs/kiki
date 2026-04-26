@@ -35,14 +35,27 @@ struct Config {
     pub cache: PathBuf,
     /// NFS configuration
     pub nfs: NfsConfig,
+    /// Skip mountpoint validation and the VFS attach in `Initialize`. The
+    /// service still tracks per-mount state and answers RPCs; it just
+    /// doesn't actually mount a filesystem at `working_copy_path`.
+    ///
+    /// Default `false`. Set to `true` in integration tests (M4) until the
+    /// VFS write path lands at M6 — without it, jj-lib's `.jj/`
+    /// scaffolding writes via `Workspace::init_with_factories` would hit
+    /// the FUSE/NFS mount and fail with ENOSYS. Real users get the real
+    /// mount.
+    #[serde(default)]
+    pub disable_mount: bool,
 }
 
 #[derive(Deserialize, Debug)]
 struct NfsConfig {
-    /// Minimum of the port range an NFS mount can be served over
-    pub min_port: usize,
-    /// Maximum of the port range an NFS mount can be served over
-    pub max_port: usize,
+    /// Minimum of the port range an NFS mount can be served over.
+    /// Inclusive. Stored as `u16` because `mount_nfs`'s `port=` option is
+    /// a 16-bit TCP port.
+    pub min_port: u16,
+    /// Maximum of the port range an NFS mount can be served over. Inclusive.
+    pub max_port: u16,
 }
 
 async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
@@ -54,8 +67,17 @@ async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
         min_nfs_port: config.nfs.min_port,
         max_nfs_port: config.nfs.max_port,
     });
+    // Hand the gRPC service a handle so `Initialize` can drive the
+    // manager. Cloning is cheap (mpsc sender); there's only one consumer
+    // today but the type is ready for more. With `disable_mount = true`
+    // the service never sees the handle and skips the validate+bind step
+    // entirely (test-only path; see `Config.disable_mount`).
+    let vfs_handle = (!config.disable_mount).then(|| vfs_mgr.handle());
+    if config.disable_mount {
+        info!("disable_mount=true: skipping mountpoint validation and VFS attach");
+    }
 
-    let jj_svc = service::JujutsuService::new();
+    let jj_svc = service::JujutsuService::new(vfs_handle);
 
     let reflection_svc = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
@@ -67,15 +89,19 @@ async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
         .add_service(jj_svc)
         .serve(addr);
 
-    let nfs_fut = vfs_mgr.serve();
+    let vfs_fut = vfs_mgr.serve();
     tokio::select! {
-        ret = nfs_fut => {
-            panic!("NFS: {:?}", ret );
+        () = vfs_fut => {
+            // VfsManager::serve only returns when every handle has been
+            // dropped — i.e. the gRPC service is gone too. Treat as a
+            // clean shutdown trigger rather than a panic.
+            info!("VFS manager exited; shutting down");
         }
         ret = grpc_fut => {
             panic!("GRPC: {:?}", ret );
         }
     }
+    Ok(())
 }
 
 #[tokio::main]

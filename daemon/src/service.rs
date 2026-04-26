@@ -1,18 +1,25 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use proto::jj_interface::*;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::{store::Store, ty};
+use crate::store::Store;
+use crate::ty;
+use crate::vfs::{JjYakFs, YakFs};
+use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle};
 
 /// Map a fallible proto-decode error onto an `invalid_argument` gRPC status.
 /// Use for any conversion that came off the wire — peers that send malformed
-/// requests should get a clean error, not crash the daemon.
+/// requests should get a clean error, not crash the daemon. Uses the
+/// alternate `{:#}` format so anyhow-style error chains surface their root
+/// cause (e.g. "expected 32-byte id, got N bytes") rather than just the
+/// outer context.
 fn decode_status<E: std::fmt::Display>(context: &str) -> impl FnOnce(E) -> Status + '_ {
-    move |e| Status::invalid_argument(format!("{context}: {e}"))
+    move |e| Status::invalid_argument(format!("{context}: {e:#}"))
 }
 
 fn hex(id: &ty::Id) -> String {
@@ -27,23 +34,20 @@ fn hex(id: &ty::Id) -> String {
 /// Per-mount working-copy state.
 ///
 /// Keyed by `working_copy_path` in `JujutsuService::mounts`. Holds everything
-/// the daemon needs to answer working-copy RPCs (`Get/SetCheckoutState`,
-/// `GetTreeState`, `Snapshot`) for one mount.
+/// the daemon needs to answer working-copy and store RPCs for one mount.
 ///
 /// `op_id` and `workspace_id` start empty after `Initialize`; the CLI fills
-/// them in via `SetCheckoutState` once `YakWorkingCopy::init` runs (M2 wires
-/// that path up). `root_tree_id` defaults to the store's empty tree until a
-/// real check-out lands (M5).
+/// them in via `SetCheckoutState` once `YakWorkingCopy::init` runs (M2).
+/// `root_tree_id` defaults to the store's empty tree until a real check-out
+/// lands (M5).
 ///
-/// Field types match the proto wire format (`Vec<u8>` for the `bytes` fields,
-/// `String` for `working_copy_path`/`remote`) so RPC handlers can copy in/out
-/// without conversion. The plan's `RepoPathBuf` for sparse patterns can wait
-/// until there's actually something to do with them.
-#[derive(Clone, Debug)]
+/// The `store` is per-mount so two `Mount`s at different remotes can never
+/// see each other's content-addressed blobs (decided at M4 per
+/// `docs/PLAN.md` §7). The `attachment` keeps the FUSE/NFS mount alive for
+/// as long as the `Mount` exists; dropping it tears the mount down.
 struct Mount {
     /// Canonical working-copy path. Also the map key; stored here too so the
     /// `Mount` is self-describing for `DaemonStatus` listings.
-    #[allow(dead_code)]
     working_copy_path: String,
     /// Carried from `Initialize.remote`; surfaced via `DaemonStatus`. Will
     /// become meaningful once Layer C lands.
@@ -56,29 +60,145 @@ struct Mount {
     /// Currently checked-out root tree. Initialized to the store's empty
     /// tree id; updated by `CheckOut` (M5) and `Snapshot` (M6).
     root_tree_id: Vec<u8>,
+    /// Per-mount keyspace.
+    store: Arc<Store>,
+    /// Holds the kernel mount alive. `None` only in the test path where
+    /// `JujutsuService::bare` constructed a service without a
+    /// `VfsManagerHandle`. Production `Initialize` always populates it.
+    #[allow(dead_code)] // dropped on Mount drop, never read directly
+    attachment: Option<MountAttachment>,
 }
 
 pub struct JujutsuService {
-    store: Store,
     /// Per-mount state, keyed by `working_copy_path`. Use `tokio::Mutex`
     /// because the RPC handlers are async; contention is minimal (one
     /// per-mount entry, mostly small reads/writes).
     mounts: Arc<Mutex<HashMap<String, Mount>>>,
+    /// `None` only in `bare()` test mode. Production `Initialize`
+    /// requires it.
+    vfs_handle: Option<VfsManagerHandle>,
 }
 
 impl JujutsuService {
-    pub fn new() -> jujutsu_interface_server::JujutsuInterfaceServer<Self> {
-        jujutsu_interface_server::JujutsuInterfaceServer::new(JujutsuService::bare())
+    /// Production constructor: with `Some(vfs_handle)`, `Initialize`
+    /// validates mountpoints and attaches a real FUSE/NFS mount.
+    /// `None` is the integration-test path (see `Config.disable_mount`):
+    /// per-mount state is still tracked and store/WC RPCs work, but
+    /// nothing is mounted at `working_copy_path`.
+    pub fn new(
+        vfs_handle: Option<VfsManagerHandle>,
+    ) -> jujutsu_interface_server::JujutsuInterfaceServer<Self> {
+        jujutsu_interface_server::JujutsuInterfaceServer::new(JujutsuService {
+            mounts: Arc::new(Mutex::new(HashMap::new())),
+            vfs_handle,
+        })
     }
 
-    /// Bare service without the gRPC server wrapping. Used by tests that
-    /// drive the trait methods directly.
+    /// Bare service without the gRPC server wrapping or any VFS attach.
+    /// Used by tests that drive the trait methods directly: `Initialize`
+    /// skips both mountpoint validation and VFS bind, so callers can use
+    /// arbitrary string paths (`/tmp/repo`, `/never/initialized`) without
+    /// creating real directories or spinning up a real VFS manager.
+    #[cfg(test)]
     fn bare() -> Self {
         JujutsuService {
-            store: Store::new(),
             mounts: Arc::new(Mutex::new(HashMap::new())),
+            vfs_handle: None,
         }
     }
+}
+
+/// Mountpoint validation errors. Mapped onto `FailedPrecondition` so the
+/// CLI surfaces a clean user-facing message rather than a generic
+/// internal error.
+#[derive(thiserror::Error, Debug)]
+enum MountpointError {
+    #[error("path does not exist: {0}")]
+    Missing(String),
+    #[error("path is not a directory: {0}")]
+    NotADirectory(String),
+    #[error("directory is not empty: {0}")]
+    NotEmpty(String),
+    #[error("path is already a mountpoint: {0}")]
+    AlreadyMounted(String),
+    #[error("failed to inspect {0}: {1}")]
+    Io(String, std::io::Error),
+}
+
+/// Reject anything that would either lose user data or shadow an existing
+/// mount. Conservative on purpose — we never auto-unmount stale mounts
+/// (would mask daemon-restart bugs that Layer B is supposed to fix).
+fn validate_mountpoint(path: &str) -> Result<(), MountpointError> {
+    let p = Path::new(path);
+    let meta = std::fs::metadata(p)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => MountpointError::Missing(path.to_owned()),
+            _ => MountpointError::Io(path.to_owned(), e),
+        })?;
+    if !meta.is_dir() {
+        return Err(MountpointError::NotADirectory(path.to_owned()));
+    }
+    let mut entries = std::fs::read_dir(p).map_err(|e| MountpointError::Io(path.to_owned(), e))?;
+    if entries.next().is_some() {
+        return Err(MountpointError::NotEmpty(path.to_owned()));
+    }
+    if is_mountpoint(p).map_err(|e| MountpointError::Io(path.to_owned(), e))? {
+        return Err(MountpointError::AlreadyMounted(path.to_owned()));
+    }
+    Ok(())
+}
+
+/// Mountpoint detection without parsing /proc/mounts or getmntinfo:
+/// compare the device id of the path with that of its parent. A different
+/// device id means the path is the root of some other filesystem — i.e.
+/// already mounted.
+///
+/// Edge case: if `path` is a filesystem root (no parent), treat it as
+/// already mounted. We don't expect anyone to `jj yak init /` but the
+/// conservative answer keeps the validator from accepting it.
+fn is_mountpoint(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let path_meta = std::fs::metadata(path)?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Ok(true),
+    };
+    let parent_meta = std::fs::metadata(parent)?;
+    Ok(path_meta.dev() != parent_meta.dev())
+}
+
+fn mountpoint_status(e: MountpointError) -> Status {
+    Status::failed_precondition(e.to_string())
+}
+
+fn bind_status(e: BindError) -> Status {
+    Status::internal(format!("VFS bind failed: {e}"))
+}
+
+/// Convert an internal `TransportInfo` into the proto oneof.
+fn transport_to_proto(info: TransportInfo) -> initialize_reply::Transport {
+    match info {
+        TransportInfo::Fuse => initialize_reply::Transport::Fuse(FuseTransport {}),
+        TransportInfo::Nfs { port } => {
+            initialize_reply::Transport::Nfs(NfsTransport {
+                port: port as u32,
+            })
+        }
+    }
+}
+
+/// Look up a mount by `working_copy_path` and clone its store handle so
+/// the lock can be released before doing real work. All store RPCs use
+/// this — the lock is short, the RPC body is long.
+async fn store_for(
+    mounts: &Arc<Mutex<HashMap<String, Mount>>>,
+    path: &str,
+) -> Result<Arc<Store>, Status> {
+    let guard = mounts.lock().await;
+    guard
+        .get(path)
+        .map(|m| m.store.clone())
+        .ok_or_else(|| Status::not_found(format!("no mount at {path}")))
 }
 
 #[tonic::async_trait]
@@ -93,12 +213,41 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             "Initializing a new repo at {} for {}",
             &req.path, &req.remote
         );
+
+        // Cheap pre-check: surface the duplicate before doing any I/O.
+        // Re-checked after validation/bind under the same lock to close
+        // the obvious race window.
+        {
+            let mounts = self.mounts.lock().await;
+            if mounts.contains_key(&req.path) {
+                return Err(Status::already_exists(format!(
+                    "mount already initialized at {}",
+                    req.path
+                )));
+            }
+        }
+
+        let store = Arc::new(Store::new());
+        let root_tree_id = store.get_empty_tree_id();
+
+        // Production path validates and binds; test path skips both so
+        // unit tests can use arbitrary string paths.
+        let (transport, attachment) = if let Some(vfs) = &self.vfs_handle {
+            validate_mountpoint(&req.path).map_err(mountpoint_status)?;
+            let fs: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store.clone(), root_tree_id));
+            let (transport, attachment) =
+                vfs.bind(req.path.clone(), fs).await.map_err(bind_status)?;
+            (Some(transport), Some(attachment))
+        } else {
+            (None, None)
+        };
+
         let mut mounts = self.mounts.lock().await;
-        // Reject re-init of the same path: if a Mount already exists we'd
-        // silently clobber `op_id`/`workspace_id`/`root_tree_id` and the
-        // CLI's view of the world would diverge from the daemon's. Better
-        // to surface the collision.
         if mounts.contains_key(&req.path) {
+            // Race: someone else inserted while we were validating/binding.
+            // The mount we just attached will be torn down when
+            // `attachment` drops at the end of this scope.
+            warn!(path = %req.path, "race during Initialize — discarding our bind");
             return Err(Status::already_exists(format!(
                 "mount already initialized at {}",
                 req.path
@@ -111,58 +260,71 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 remote: req.remote,
                 op_id: Vec::new(),
                 workspace_id: Vec::new(),
-                root_tree_id: self.store.get_empty_tree_id().0.to_vec(),
+                root_tree_id: root_tree_id.0.to_vec(),
+                store,
+                attachment,
             },
         );
-        Ok(Response::new(InitializeReply {}))
+
+        let reply = InitializeReply {
+            transport: transport.map(transport_to_proto),
+        };
+        Ok(Response::new(reply))
     }
 
     #[tracing::instrument(skip(self))]
     async fn daemon_status(
         &self,
-        request: Request<DaemonStatusReq>,
+        _request: Request<DaemonStatusReq>,
     ) -> Result<Response<DaemonStatusReply>, Status> {
-        let _req = request.into_inner();
         let mounts = self.mounts.lock().await;
         // Sort by path so output is deterministic — `yak status` is
         // user-facing and `HashMap` iteration order is not.
-        let mut entries: Vec<_> = mounts.values().cloned().collect();
-        entries.sort_by(|a, b| a.working_copy_path.cmp(&b.working_copy_path));
-        let data = entries
-            .into_iter()
-            .map(|mnt| proto::jj_interface::daemon_status_reply::Data {
-                path: mnt.working_copy_path,
-                remote: mnt.remote,
+        let mut data: Vec<_> = mounts
+            .values()
+            .map(|m| proto::jj_interface::daemon_status_reply::Data {
+                path: m.working_copy_path.clone(),
+                remote: m.remote.clone(),
             })
             .collect();
+        data.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Response::new(DaemonStatusReply { data }))
     }
 
     #[tracing::instrument(skip(self))]
     async fn get_empty_tree_id(
         &self,
-        _request: Request<GetEmptyTreeIdReq>,
+        request: Request<GetEmptyTreeIdReq>,
     ) -> Result<Response<TreeId>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
         Ok(Response::new(TreeId {
-            tree_id: self.store.get_empty_tree_id().into(),
+            tree_id: store.get_empty_tree_id().into(),
         }))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn write_file(&self, request: Request<File>) -> Result<Response<FileId>, Status> {
-        let file = request.into_inner();
-        let file_id = self.store.write_file(file.into()).await.into();
+    async fn write_file(
+        &self,
+        request: Request<WriteFileReq>,
+    ) -> Result<Response<FileId>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let file_id = store.write_file(ty::File { content: req.data }).await.into();
         Ok(Response::new(FileId { file_id }))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_file(&self, request: Request<FileId>) -> Result<Response<File>, Status> {
-        let file_id: ty::Id = request
-            .into_inner()
+    async fn read_file(
+        &self,
+        request: Request<ReadFileReq>,
+    ) -> Result<Response<File>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let file_id: ty::Id = FileId { file_id: req.file_id }
             .try_into()
             .map_err(decode_status("file id"))?;
-        let file = self
-            .store
+        let file = store
             .get_file(file_id)
             .ok_or_else(|| Status::not_found(format!("file {} not found", hex(&file_id))))?;
         Ok(Response::new(file.as_proto()))
@@ -171,67 +333,91 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     #[tracing::instrument(skip(self))]
     async fn write_symlink(
         &self,
-        request: Request<Symlink>,
+        request: Request<WriteSymlinkReq>,
     ) -> Result<Response<SymlinkId>, Status> {
-        let symlink = request.into_inner();
-        let symlink_id = self.store.write_symlink(symlink.into()).await.into();
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let symlink = ty::Symlink { target: req.target };
+        let symlink_id = store.write_symlink(symlink).await.into();
         Ok(Response::new(SymlinkId { symlink_id }))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_symlink(&self, request: Request<SymlinkId>) -> Result<Response<Symlink>, Status> {
-        let symlink_id: ty::Id = request
-            .into_inner()
+    async fn read_symlink(
+        &self,
+        request: Request<ReadSymlinkReq>,
+    ) -> Result<Response<Symlink>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let symlink_id: ty::Id = SymlinkId { symlink_id: req.symlink_id }
             .try_into()
             .map_err(decode_status("symlink id"))?;
-        let symlink = self
-            .store
+        let symlink = store
             .get_symlink(symlink_id)
             .ok_or_else(|| Status::not_found(format!("symlink {} not found", hex(&symlink_id))))?;
         Ok(Response::new(symlink.as_proto()))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn write_tree(&self, request: Request<Tree>) -> Result<Response<TreeId>, Status> {
-        let tree: ty::Tree = request
-            .into_inner()
-            .try_into()
-            .map_err(decode_status("tree"))?;
-        let tree_id = self.store.write_tree(tree).await.into();
+    async fn write_tree(
+        &self,
+        request: Request<WriteTreeReq>,
+    ) -> Result<Response<TreeId>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let tree_proto = req
+            .tree
+            .ok_or_else(|| Status::invalid_argument("WriteTreeReq.tree is required"))?;
+        let tree: ty::Tree = tree_proto.try_into().map_err(decode_status("tree"))?;
+        let tree_id = store.write_tree(tree).await.into();
         Ok(Response::new(TreeId { tree_id }))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_tree(&self, request: Request<TreeId>) -> Result<Response<Tree>, Status> {
-        let tree_id: ty::Id = request
-            .into_inner()
+    async fn read_tree(
+        &self,
+        request: Request<ReadTreeReq>,
+    ) -> Result<Response<Tree>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let tree_id: ty::Id = TreeId { tree_id: req.tree_id }
             .try_into()
             .map_err(decode_status("tree id"))?;
-        let tree = self
-            .store
+        let tree = store
             .get_tree(tree_id)
             .ok_or_else(|| Status::not_found(format!("tree {} not found", hex(&tree_id))))?;
         Ok(Response::new(tree.as_proto()))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn write_commit(&self, request: Request<Commit>) -> Result<Response<CommitId>, Status> {
-        let commit_proto = request.into_inner();
+    async fn write_commit(
+        &self,
+        request: Request<WriteCommitReq>,
+    ) -> Result<Response<CommitId>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let commit_proto = req
+            .commit
+            .ok_or_else(|| Status::invalid_argument("WriteCommitReq.commit is required"))?;
         if commit_proto.parents.is_empty() {
             return Err(Status::internal("Cannot write a commit with no parents"));
         }
         let commit: ty::Commit = commit_proto.try_into().map_err(decode_status("commit"))?;
-        let commit_id = self.store.write_commit(commit).await.into();
+        let commit_id = store.write_commit(commit).await.into();
         Ok(Response::new(CommitId { commit_id }))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_commit(&self, request: Request<CommitId>) -> Result<Response<Commit>, Status> {
-        let commit_id: ty::Id = request
-            .into_inner()
+    async fn read_commit(
+        &self,
+        request: Request<ReadCommitReq>,
+    ) -> Result<Response<Commit>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let commit_id: ty::Id = CommitId { commit_id: req.commit_id }
             .try_into()
             .map_err(decode_status("commit id"))?;
-        let commits = self.store.commits.lock();
+        let commits = store.commits.lock();
         let commit = commits
             .get(&commit_id)
             .ok_or_else(|| Status::not_found(format!("commit {} not found", hex(&commit_id))))?;
@@ -332,9 +518,23 @@ mod tests {
 
     use super::*;
 
+    /// Initialize a mount via the test path (no VFS bind). Returns the
+    /// path used so the caller can pass it back into store/WC RPCs.
+    async fn init_mount(svc: &JujutsuService, path: &str) {
+        svc.initialize(Request::new(InitializeReq {
+            path: path.to_owned(),
+            remote: "localhost".into(),
+        }))
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn write_commit_parents() {
         let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount(&svc, &path).await;
+
         // No parents
         let mut commit = Commit {
             parents: vec![],
@@ -342,47 +542,69 @@ mod tests {
         };
 
         assert_matches!(
-            svc.write_commit(Request::new(commit.clone())).await,
+            svc.write_commit(Request::new(WriteCommitReq {
+                working_copy_path: path.clone(),
+                commit: Some(commit.clone()),
+            }))
+            .await,
             Err(status) if status.message().contains("no parents")
         );
 
         // Only root commit as parent
         commit.parents = vec![vec![0; CHANGE_ID_LENGTH]];
         let first_id = svc
-            .write_commit(Request::new(commit.clone()))
+            .write_commit(Request::new(WriteCommitReq {
+                working_copy_path: path.clone(),
+                commit: Some(commit.clone()),
+            }))
             .await
             .unwrap()
             .into_inner();
         let first_commit = svc
-            .read_commit(Request::new(first_id.clone()))
+            .read_commit(Request::new(ReadCommitReq {
+                working_copy_path: path.clone(),
+                commit_id: first_id.commit_id.clone(),
+            }))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(first_commit, commit);
 
         // Only non-root commit as parent
-        commit.parents = vec![first_id.clone().commit_id];
+        commit.parents = vec![first_id.commit_id.clone()];
         let second_id = svc
-            .write_commit(Request::new(commit.clone()))
+            .write_commit(Request::new(WriteCommitReq {
+                working_copy_path: path.clone(),
+                commit: Some(commit.clone()),
+            }))
             .await
             .unwrap()
             .into_inner();
         let second_commit = svc
-            .read_commit(Request::new(second_id.clone()))
+            .read_commit(Request::new(ReadCommitReq {
+                working_copy_path: path.clone(),
+                commit_id: second_id.commit_id.clone(),
+            }))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(second_commit, commit);
 
         // Merge commit
-        commit.parents = vec![first_id.clone().commit_id, second_id.commit_id];
+        commit.parents = vec![first_id.commit_id.clone(), second_id.commit_id.clone()];
         let merge_id = svc
-            .write_commit(Request::new(commit.clone()))
+            .write_commit(Request::new(WriteCommitReq {
+                working_copy_path: path.clone(),
+                commit: Some(commit.clone()),
+            }))
             .await
             .unwrap()
             .into_inner();
         let merge_commit = svc
-            .read_commit(Request::new(merge_id.clone()))
+            .read_commit(Request::new(ReadCommitReq {
+                working_copy_path: path.clone(),
+                commit_id: merge_id.commit_id.clone(),
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -390,12 +612,18 @@ mod tests {
 
         commit.parents = vec![first_id.commit_id, vec![0; COMMIT_ID_LENGTH]];
         let root_merge_id = svc
-            .write_commit(Request::new(commit.clone()))
+            .write_commit(Request::new(WriteCommitReq {
+                working_copy_path: path.clone(),
+                commit: Some(commit.clone()),
+            }))
             .await
             .unwrap()
             .into_inner();
         let root_merge_commit = svc
-            .read_commit(Request::new(root_merge_id.clone()))
+            .read_commit(Request::new(ReadCommitReq {
+                working_copy_path: path,
+                commit_id: root_merge_id.commit_id,
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -410,13 +638,7 @@ mod tests {
     async fn checkout_state_round_trip() {
         let svc = JujutsuService::bare();
         let path = "/tmp/repo".to_string();
-
-        svc.initialize(Request::new(InitializeReq {
-            path: path.clone(),
-            remote: "localhost".into(),
-        }))
-        .await
-        .unwrap();
+        init_mount(&svc, &path).await;
 
         // Before SetCheckoutState, the checkout state is unset and the RPC
         // surfaces that as failed_precondition.
@@ -432,7 +654,9 @@ mod tests {
         // this is what lets `YakWorkingCopy::tree()` succeed on a fresh
         // mount.
         let empty = svc
-            .get_empty_tree_id(Request::new(GetEmptyTreeIdReq {}))
+            .get_empty_tree_id(Request::new(GetEmptyTreeIdReq {
+                working_copy_path: path.clone(),
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -472,7 +696,7 @@ mod tests {
         // empty tree until M5/M6 change it).
         let snap = svc
             .snapshot(Request::new(SnapshotReq {
-                working_copy_path: path.clone(),
+                working_copy_path: path,
             }))
             .await
             .unwrap()
@@ -482,7 +706,8 @@ mod tests {
 
     /// Mounts must be isolated by `working_copy_path`; mutating one must
     /// not bleed into another. Mirrors `test_repos_are_independent` at the
-    /// CLI level.
+    /// CLI level. Per-mount Stores (M4) make this stricter: a blob written
+    /// to `/tmp/a` cannot even be read back from `/tmp/b`.
     #[tokio::test]
     async fn mounts_are_isolated_by_path() {
         let svc = JujutsuService::bare();
@@ -522,6 +747,34 @@ mod tests {
             .await
             .expect_err("expected failed_precondition");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        // Per-mount Stores: write a file to /tmp/a, read it back; confirm
+        // /tmp/b's store cannot see it.
+        let written = svc
+            .write_file(Request::new(WriteFileReq {
+                working_copy_path: "/tmp/a".into(),
+                data: b"hello-from-a".to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let from_a = svc
+            .read_file(Request::new(ReadFileReq {
+                working_copy_path: "/tmp/a".into(),
+                file_id: written.file_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(from_a.data, b"hello-from-a");
+        let cross_read = svc
+            .read_file(Request::new(ReadFileReq {
+                working_copy_path: "/tmp/b".into(),
+                file_id: written.file_id,
+            }))
+            .await
+            .expect_err("expected per-mount-store isolation");
+        assert_eq!(cross_read.code(), tonic::Code::NotFound);
 
         // DaemonStatus surfaces both mounts in a deterministic order.
         let status = svc
@@ -564,5 +817,57 @@ mod tests {
             .await
             .expect_err("expected not_found");
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// Store RPCs require an initialized mount.
+    #[tokio::test]
+    async fn store_rpc_without_mount_is_not_found() {
+        let svc = JujutsuService::bare();
+        let err = svc
+            .write_file(Request::new(WriteFileReq {
+                working_copy_path: "/never/initialized".into(),
+                data: b"hi".to_vec(),
+            }))
+            .await
+            .expect_err("expected not_found");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// Mountpoint validation is exercised on its own (the full
+    /// `Initialize` path skips it under `bare`); these cases test the
+    /// helper directly so we don't have to spin up a real `VfsManager`.
+    mod validate_mountpoint {
+        use super::super::{validate_mountpoint, MountpointError};
+
+        #[test]
+        fn rejects_missing() {
+            let err =
+                validate_mountpoint("/definitely/does/not/exist/jjyak").expect_err("missing");
+            assert_matches::assert_matches!(err, MountpointError::Missing(_));
+        }
+
+        #[test]
+        fn rejects_file() {
+            let f = tempfile::NamedTempFile::new().unwrap();
+            let path = f.path().to_str().unwrap().to_owned();
+            let err = validate_mountpoint(&path).expect_err("not a dir");
+            assert_matches::assert_matches!(err, MountpointError::NotADirectory(_));
+        }
+
+        #[test]
+        fn rejects_non_empty_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("squatter"), b"data").unwrap();
+            let path = dir.path().to_str().unwrap().to_owned();
+            let err = validate_mountpoint(&path).expect_err("not empty");
+            assert_matches::assert_matches!(err, MountpointError::NotEmpty(_));
+        }
+
+        #[test]
+        fn accepts_empty_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap().to_owned();
+            validate_mountpoint(&path).expect("empty dir on same fs");
+        }
     }
 }

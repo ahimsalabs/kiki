@@ -91,9 +91,13 @@ impl BlockingJujutsuInterfaceClient {
         rt.block_on(client.snapshot(request))
     }
 
+    // Store RPCs all carry `working_copy_path` on the request side now (see
+    // proto/jj_interface.proto). YakBackend stamps it from its own
+    // `working_copy_path` field on every call.
+
     pub fn write_commit(
         &self,
-        request: impl tonic::IntoRequest<Commit>,
+        request: impl tonic::IntoRequest<WriteCommitReq>,
     ) -> Result<tonic::Response<CommitId>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
@@ -102,7 +106,7 @@ impl BlockingJujutsuInterfaceClient {
 
     pub fn read_commit(
         &self,
-        request: impl tonic::IntoRequest<CommitId>,
+        request: impl tonic::IntoRequest<ReadCommitReq>,
     ) -> Result<tonic::Response<Commit>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
@@ -111,7 +115,7 @@ impl BlockingJujutsuInterfaceClient {
 
     pub fn write_file(
         &self,
-        request: impl tonic::IntoRequest<File>,
+        request: impl tonic::IntoRequest<WriteFileReq>,
     ) -> Result<tonic::Response<FileId>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
@@ -120,7 +124,7 @@ impl BlockingJujutsuInterfaceClient {
 
     pub fn read_file(
         &self,
-        request: impl tonic::IntoRequest<FileId>,
+        request: impl tonic::IntoRequest<ReadFileReq>,
     ) -> Result<tonic::Response<File>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
@@ -129,7 +133,7 @@ impl BlockingJujutsuInterfaceClient {
 
     pub fn write_tree(
         &self,
-        request: impl tonic::IntoRequest<Tree>,
+        request: impl tonic::IntoRequest<WriteTreeReq>,
     ) -> Result<tonic::Response<TreeId>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
@@ -138,7 +142,7 @@ impl BlockingJujutsuInterfaceClient {
 
     pub fn read_tree(
         &self,
-        request: impl tonic::IntoRequest<TreeId>,
+        request: impl tonic::IntoRequest<ReadTreeReq>,
     ) -> Result<tonic::Response<Tree>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
@@ -147,7 +151,7 @@ impl BlockingJujutsuInterfaceClient {
 
     pub fn write_symlink(
         &self,
-        request: impl tonic::IntoRequest<Symlink>,
+        request: impl tonic::IntoRequest<WriteSymlinkReq>,
     ) -> Result<tonic::Response<SymlinkId>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
@@ -156,16 +160,19 @@ impl BlockingJujutsuInterfaceClient {
 
     pub fn read_symlink(
         &self,
-        request: impl tonic::IntoRequest<SymlinkId>,
+        request: impl tonic::IntoRequest<ReadSymlinkReq>,
     ) -> Result<tonic::Response<Symlink>, tonic::Status> {
         let mut client = self.client.lock().unwrap();
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.read_symlink(request))
     }
 
-    pub fn get_empty_tree_id(&self) -> Result<tonic::Response<TreeId>, tonic::Status> {
+    pub fn get_empty_tree_id(
+        &self,
+        working_copy_path: String,
+    ) -> Result<tonic::Response<TreeId>, tonic::Status> {
         let rt = self.rt.lock().unwrap();
         let mut client = self.client.lock().unwrap();
-        rt.block_on(client.get_empty_tree_id(GetEmptyTreeIdReq::default()))
+        rt.block_on(client.get_empty_tree_id(GetEmptyTreeIdReq { working_copy_path }))
     }
 }

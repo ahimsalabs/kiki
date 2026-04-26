@@ -26,6 +26,10 @@ const CHANGE_ID_LENGTH: usize = 16;
 #[derive(Debug)]
 pub struct YakBackend {
     client: BlockingJujutsuInterfaceClient,
+    /// Stamped on every store RPC so the daemon can route to the right
+    /// per-mount Store. Derived from `store_path` per the jj convention
+    /// (`<wc>/.jj/repo/store`); see `derive_working_copy_path`.
+    working_copy_path: String,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -36,12 +40,15 @@ impl YakBackend {
         "yak"
     }
 
-    pub fn new(settings: &UserSettings, _store_path: &Path) -> Result<Self, BackendInitError> {
+    pub fn new(settings: &UserSettings, store_path: &Path) -> Result<Self, BackendInitError> {
         let root_commit_id = CommitId::from_bytes(&[0; COMMIT_ID_LENGTH]);
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let grpc_port = settings
             .get::<usize>("grpc_port")
             .map_err(|e| BackendInitError(e.into()))?;
+
+        let working_copy_path = derive_working_copy_path(store_path)
+            .map_err(BackendInitError)?;
 
         let client = crate::blocking_client::BlockingJujutsuInterfaceClient::connect(format!(
             "http://[::1]:{grpc_port}"
@@ -49,7 +56,7 @@ impl YakBackend {
         .map_err(|e| BackendInitError(e.into()))?;
         let empty_tree_id = TreeId::from_bytes(
             &client
-                .get_empty_tree_id()
+                .get_empty_tree_id(working_copy_path.clone())
                 .map_err(|e| BackendInitError(e.into()))?
                 .into_inner()
                 .tree_id,
@@ -57,11 +64,55 @@ impl YakBackend {
 
         Ok(YakBackend {
             client,
+            working_copy_path,
             root_commit_id,
             root_change_id,
             empty_tree_id,
         })
     }
+
+    fn working_copy_path(&self) -> String {
+        self.working_copy_path.clone()
+    }
+}
+
+/// Reverse the jj convention `store_path == <wc>/.jj/repo/store` to recover
+/// the workspace root. Brittle by design — if jj-lib ever reorganizes the
+/// store layout this needs to be revisited (and ideally replaced with a
+/// stamp file the backend writes at init time, similar to what
+/// `GitBackend::init_colocated` does).
+///
+/// Always canonicalizes the result. The CLI canonicalizes `wc_path` before
+/// sending `Initialize`, so the daemon's per-mount key is canonical. If
+/// jj-lib ever hands us a non-canonical `store_path` (relative, symlinked,
+/// or containing `..`) the un-canonicalized stamp would miss every Mount
+/// and surface as a confusing `NotFound` on every store RPC. Canonicalizing
+/// here costs one extra `realpath(2)` per backend init and removes that
+/// failure mode.
+fn derive_working_copy_path(
+    store_path: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // store_path is `<wc>/.jj/repo/store`; nth(3) climbs four ancestors
+    // (store, repo, .jj, wc) — `Path::ancestors` includes `self`.
+    let wc = store_path.ancestors().nth(3).ok_or_else(|| {
+        format!(
+            "store_path {:?} is too shallow to derive workspace root",
+            store_path
+        )
+    })?;
+    let canonical = wc.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize workspace path {}: {e}",
+            wc.display()
+        )
+    })?;
+    let s = canonical.to_str().ok_or_else(|| {
+        format!(
+            "workspace path is not valid UTF-8: {}",
+            canonical.display()
+        )
+    })?;
+    Ok(s.to_owned())
 }
 
 #[async_trait]
@@ -101,7 +152,10 @@ impl Backend for YakBackend {
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
         let proto = self
             .client
-            .read_file(file_id_to_proto(id))
+            .read_file(proto::jj_interface::ReadFileReq {
+                working_copy_path: self.working_copy_path(),
+                file_id: id.to_bytes(),
+            })
             .map_err(|e| read_file_err(path, id, e))?
             .into_inner();
         let mut decoded = Vec::new();
@@ -123,10 +177,12 @@ impl Backend for YakBackend {
         let mut encoded = Vec::new();
         zstd::stream::copy_encode(buf.as_slice(), &mut encoded, 0)
             .map_err(|e| write_err("file", e))?;
-        let proto = proto::jj_interface::File { data: encoded };
         let id = self
             .client
-            .write_file(proto)
+            .write_file(proto::jj_interface::WriteFileReq {
+                working_copy_path: self.working_copy_path(),
+                data: encoded,
+            })
             .map_err(|e| write_err("file", e))?
             .into_inner();
         Ok(FileId::new(id.file_id))
@@ -135,19 +191,22 @@ impl Backend for YakBackend {
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
         let proto = self
             .client
-            .read_symlink(symlink_id_to_proto(id))
+            .read_symlink(proto::jj_interface::ReadSymlinkReq {
+                working_copy_path: self.working_copy_path(),
+                symlink_id: id.to_bytes(),
+            })
             .map_err(|e| read_object_err("symlink", id, e))?
             .into_inner();
         Ok(proto.target)
     }
 
     async fn write_symlink(&self, _path: &RepoPath, target: &str) -> BackendResult<SymlinkId> {
-        let proto = proto::jj_interface::Symlink {
-            target: target.to_string(),
-        };
         let id = self
             .client
-            .write_symlink(proto)
+            .write_symlink(proto::jj_interface::WriteSymlinkReq {
+                working_copy_path: self.working_copy_path(),
+                target: target.to_string(),
+            })
             .map_err(|e| write_err("symlink", e))?
             .into_inner();
         Ok(SymlinkId::new(id.symlink_id))
@@ -176,7 +235,10 @@ impl Backend for YakBackend {
     async fn read_tree(&self, _path: &RepoPath, id: &TreeId) -> BackendResult<Tree> {
         let proto = self
             .client
-            .read_tree(tree_id_to_proto(id))
+            .read_tree(proto::jj_interface::ReadTreeReq {
+                working_copy_path: self.working_copy_path(),
+                tree_id: id.to_bytes(),
+            })
             .map_err(|e| read_object_err("tree", id, e))?
             .into_inner();
         tree_from_proto(proto)
@@ -187,7 +249,10 @@ impl Backend for YakBackend {
         let proto = tree_to_proto(tree)?;
         let id = self
             .client
-            .write_tree(proto)
+            .write_tree(proto::jj_interface::WriteTreeReq {
+                working_copy_path: self.working_copy_path(),
+                tree: Some(proto),
+            })
             .map_err(|e| write_err("tree", e))?
             .into_inner();
         Ok(TreeId::new(id.tree_id))
@@ -203,7 +268,10 @@ impl Backend for YakBackend {
         }
         let proto = self
             .client
-            .read_commit(commit_id_to_proto(id))
+            .read_commit(proto::jj_interface::ReadCommitReq {
+                working_copy_path: self.working_copy_path(),
+                commit_id: id.to_bytes(),
+            })
             .map_err(|e| read_object_err("commit", id, e))?
             .into_inner();
         Ok(commit_from_proto(proto))
@@ -228,7 +296,10 @@ impl Backend for YakBackend {
         let proto = commit_to_proto(&commit);
         let id = self
             .client
-            .write_commit(proto)
+            .write_commit(proto::jj_interface::WriteCommitReq {
+                working_copy_path: self.working_copy_path(),
+                commit: Some(proto),
+            })
             .map_err(|e| write_err("commit", e))?
             .into_inner();
         Ok((CommitId::new(id.commit_id), commit))
@@ -287,30 +358,10 @@ fn write_err(
 }
 
 // ---------- proto conversions ----------
-
-pub fn file_id_to_proto(file_id: &FileId) -> proto::jj_interface::FileId {
-    proto::jj_interface::FileId {
-        file_id: file_id.to_bytes(),
-    }
-}
-
-pub fn commit_id_to_proto(commit_id: &CommitId) -> proto::jj_interface::CommitId {
-    proto::jj_interface::CommitId {
-        commit_id: commit_id.to_bytes(),
-    }
-}
-
-pub fn tree_id_to_proto(tree_id: &TreeId) -> proto::jj_interface::TreeId {
-    proto::jj_interface::TreeId {
-        tree_id: tree_id.to_bytes(),
-    }
-}
-
-pub fn symlink_id_to_proto(symlink_id: &SymlinkId) -> proto::jj_interface::SymlinkId {
-    proto::jj_interface::SymlinkId {
-        symlink_id: symlink_id.to_bytes(),
-    }
-}
+//
+// The pre-M4 wrapper helpers (`file_id_to_proto` etc.) are gone — IDs are
+// passed inline as `bytes` on the new `Read*Req`/`Write*Req` types, so
+// `id.to_bytes()` at the call site is enough.
 
 pub fn commit_to_proto(commit: &Commit) -> proto::jj_interface::Commit {
     let mut proto = proto::jj_interface::Commit::default();
@@ -558,6 +609,50 @@ mod tests {
         };
         let err = tree_value_from_proto(proto).expect_err("expected decode error");
         assert!(matches!(err, BackendError::Unsupported(_)), "got {err:?}");
+    }
+
+    /// derive_working_copy_path must return a canonical path so the stamp
+    /// matches the daemon's `Initialize`-keyed Mount even when jj-lib hands
+    /// us a symlinked store_path. Without canonicalization here, every
+    /// store RPC would hit `NotFound`.
+    #[test]
+    fn derive_working_copy_path_canonicalizes_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let wc = dir.path().join("wc");
+        let store = wc.join(".jj").join("repo").join("store");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&wc, &link).unwrap();
+        let symlinked_store = link.join(".jj").join("repo").join("store");
+
+        let derived = derive_working_copy_path(&symlinked_store).expect("derive");
+        let canonical_wc = wc.canonicalize().unwrap();
+        assert_eq!(derived, canonical_wc.to_str().unwrap());
+    }
+
+    #[test]
+    fn derive_working_copy_path_rejects_too_shallow() {
+        // Two segments — not enough ancestors to reach the wc root.
+        let store_path = Path::new(".jj/store");
+        let err = derive_working_copy_path(store_path).expect_err("too shallow");
+        assert!(
+            err.to_string().contains("too shallow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn derive_working_copy_path_rejects_missing_wc() {
+        // Well-formed shape but the parent dirs don't exist on disk;
+        // canonicalize() surfaces the missing path instead of silently
+        // returning a relative or stale stamp.
+        let store_path = Path::new("/definitely/does/not/exist/wc/.jj/repo/store");
+        let err = derive_working_copy_path(store_path).expect_err("nonexistent wc");
+        assert!(
+            err.to_string().contains("canonicalize"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

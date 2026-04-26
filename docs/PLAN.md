@@ -1,7 +1,8 @@
 # jj-yak: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 + M3 done.
-Last updated: 2026-04-25
+Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 +
+M3 + M4 done.
+Last updated: 2026-04-26
 
 This document captures the roadmap for getting jj-yak from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -176,25 +177,100 @@ daemon (29 → 34 daemon tests in total — a sizable chunk because
 the new modules pull in their own tests). The 3 M5/M6-ignored
 CLI integration tests remain ignored — M5 turns them on.
 
-### M4 — `jj yak init` actually mounts
+### M4 — `jj yak init` actually mounts ✅
 
-Today `Initialize` just stores a session. It needs to:
+**Status: done.** Landed across `proto: M4 — wrap store RPCs in
+working_copy_path envelopes + transport oneof`, `daemon: M4 — per-mount
+Store + mountpoint validation + VfsManager wiring`, and `cli: M4 — stamp
+working_copy_path + handle InitializeReply.transport`.
 
-1. Bring up the per-mount filesystem instance via `VfsManager` (the
-   `Bind` message exists at `vfs_mgr.rs:18-20`; `VfsManagerHandle::bind()`
-   exists at `vfs_mgr.rs:26-29`; but `handle()` is never called from
-   `main.rs`, so nothing currently sends `Bind`). Per-mount lifecycle
-   has to expand to cover both transports.
-2. Mount the share at `working_copy_path`:
-   - **Linux:** `fuse3` does the mount itself via `fusermount3` —
-     no shell out, no root.
-   - **macOS:** shell out to `mount_nfs -o port=N,mountport=N,nolocks,vers=3`.
-3. Return whatever handle the CLI needs (port for NFS, nothing for FUSE)
-   so subsequent RPCs hit the right mount.
+Final scope (one delta from the original plan, called out below):
 
-This is the **"is this idea even tractable"** milestone — once a mount
-survives `init` and basic file ops work, the rest of M5/M6 is mostly
-filling in trait methods.
+1. **Mountpoint validation** (`daemon/src/service.rs:111-160`).
+   `Initialize` stats `working_copy_path` and requires: dir exists, is
+   empty, is not a mountpoint. Non-empty / already-mounted →
+   `FailedPrecondition`. Mountpoint detection compares `dev` of the path
+   vs its parent (portable across Linux/macOS, no `/proc/mounts` or
+   `getmntinfo` parsing). No auto-umount of stale mounts. Validation
+   skipped when `disable_mount = true` (test path) or in `bare()` unit
+   tests; covered by the `validate_mountpoint::*` unit tests.
+2. **Per-mount `Store`** (`daemon/src/service.rs:42-78`). Each `Mount`
+   owns `Arc<Store>`; the global `JujutsuService.store` is gone. Every
+   store RPC (`Read*Req` / `Write*Req` / `GetEmptyTreeIdReq`) carries
+   `working_copy_path` so the daemon can route to the right keyspace.
+   `YakBackend::working_copy_path` derives from `store_path` via the jj
+   convention `<wc>/.jj/repo/store` (`cli/src/backend.rs:78-95`), and
+   stamps it on every call. New unit test
+   `mounts_are_isolated_by_path` writes a blob to `/tmp/a` and asserts
+   it cannot be read back from `/tmp/b` — the per-mount Store's whole
+   raison d'être.
+3. **`VfsManager` wiring** (`daemon/src/vfs_mgr.rs`). `Bind` payload now
+   carries `(working_copy_path, Arc<dyn JjYakFs>, oneshot::Sender)`;
+   the response is `Result<(TransportInfo, MountAttachment), BindError>`.
+   Replaces the old `expect("NFS listener bind failed…")`. `MountAttachment`
+   is platform-gated (`Fuse(MountHandle)` on Linux, `Nfs(NfsAttachment)` on
+   macOS where the wrapper aborts the spawned NFS server task on drop)
+   and lives on the `Mount` so the kernel mount survives until the mount
+   does. `JujutsuService::new` takes `Option<VfsManagerHandle>` —
+   production passes `Some`, the integration-test daemon passes `None`
+   via `disable_mount = true`.
+4. **Platform-specific attach.** Linux uses
+   `fuse3::Session::mount_with_unprivileged` (added the `unprivileged`
+   feature to the workspace `fuse3` dep so the `fusermount3` setuid
+   helper handles the mount). macOS binds a localhost NFS port via
+   `nfsserve::tcp::NFSTcpListener`, iterating sequentially through
+   `[min_port, max_port]` so failures are reproducible.
+5. **`InitializeReply` transport oneof.**
+   ```proto
+   message InitializeReply {
+     oneof transport {
+       FuseTransport fuse = 1;
+       NfsTransport  nfs  = 2;
+     }
+   }
+   ```
+   CLI matches on the oneof in `cli/src/main.rs:179-237`. `Fuse` →
+   nothing (daemon already mounted). `Nfs { port }` → shell out to
+   `mount_nfs -o port=N,mountport=N,nolocks,vers=3,actimeo=0
+   localhost:/ <path>`. `None` is the test-mode reply
+   (`disable_mount = true`).
+
+**Delta from plan:** added a `disable_mount: bool` daemon-config flag
+(`daemon/src/main.rs:42-58`) — pragmatic concession to the
+chicken-and-egg between M4's actual mount and M6's writes. With
+`disable_mount = true`, `Initialize` skips validation+bind; per-mount
+state still works, store RPCs still work, the wire is exercised
+end-to-end. Without it, `Workspace::init_with_factories` writes `.jj/`
+through the FUSE mount and hits ENOSYS on every method M3 didn't
+implement. Integration tests set the flag; production users don't.
+M6 will turn the flag off (and remove it once writes are reliable).
+
+**Tests:** 39 daemon unit tests pass (up from 36 — added
+`mounts_are_isolated_by_path`'s store-isolation case,
+`store_rpc_without_mount_is_not_found`, and three
+`validate_mountpoint::*` cases). 5 cli unit tests pass. 3 cli
+integration tests pass; 3 stay `#[ignore]` waiting on M5/M6.
+
+**M4 done signal (verified manually):** with `disable_mount = false` on
+Linux, `jj yak init /tmp/r localhost` mounts a FUSE filesystem at
+`/tmp/r` (visible in `/proc/self/mountinfo` with `fs_name=yak`); `ls
+/tmp/r` returns empty without erroring; `stat /tmp/r` reports a
+directory; re-running `jj yak init /tmp/r localhost` returns
+`FailedPrecondition` ("already a mountpoint"). End-to-end `jj yak init`
+with `.jj/` scaffolding intact is M6's signal — the `disable_mount`
+flag exists exactly because M4 alone doesn't carry the writes that
+make `jj yak init` succeed end-to-end on a real mount.
+
+**Scope (actual):** ~1100 LoC net across `proto/jj_interface.proto`
+(rewritten: introduced `Read*Req` / `Write*Req` envelopes, oneof
+transport reply), `daemon/src/service.rs` (per-mount Store, mountpoint
+validation helper + tests, store RPCs route through `store_for`),
+`daemon/src/vfs_mgr.rs` (rewrite: bind protocol, `BindError`,
+platform-gated transports), `daemon/src/main.rs` (wire VfsManager
+handle, `disable_mount` config), `cli/src/{backend,blocking_client,
+main,working_copy}.rs` (stamp `working_copy_path`, handle transport
+oneof, `mount_nfs` shellout on macOS), `cli/tests/common/mod.rs`
+(set `disable_mount = true`).
 
 ### M5 — `check_out` writes files
 
@@ -428,21 +504,50 @@ Worth doing in passing, not blocking:
    `daemon/src/vfs/`.
 2. **Linux mount privilege.** Falls out of (1): `fusermount3` setuid
    helper handles rootless mount; no `sudo` flow needed.
+3. **Mountpoint policy (M4).** `Initialize` requires `working_copy_path`
+   to exist, be a directory, be empty, and not already be a mountpoint.
+   Non-empty or already-mounted → `FailedPrecondition`. No auto-umount
+   of stale mounts: a stale mount almost always means the previous
+   daemon crashed, and silent recovery would mask the bug Layer B is
+   meant to fix. CLI's `create_or_reuse_dir` becomes create-only.
+4. **Per-mount `Store` (M4).** Each `Mount` owns an `Arc<Store>`; the
+   global `JujutsuService.store` goes away. Every store RPC gains a
+   `working_copy_path` field — wire-schema change, but the CLI already
+   knows the workspace so the stamp is free. Done now rather than at
+   Layer C so two mounts at different remotes cannot see each other's
+   blobs through the content-addressed keyspace.
+5. **`InitializeReply` transport shape (M4).** Polymorphic `oneof
+   transport { FuseTransport fuse = 1; NfsTransport nfs = 2; }`. CLI
+   dispatches on the variant: `Fuse` → mount already done by daemon;
+   `Nfs { port }` → CLI shells out to `mount_nfs`. Daemon never runs
+   `mount_nfs` itself (would require root). Leaves room for future
+   transports without sentinels.
+6. **Inode handle stability across daemon restarts.** Derive
+   deterministically from `(parent_tree_id, name)` via a stable hash
+   truncated to `u64`. The slab becomes a cache, not a source of
+   truth — restart-safe, no persistence dependency. Collisions in a
+   `u64` namespace are handled by chaining on collide (revisit if any
+   real workload hits one). Writes-in-flight need a temporary id space
+   the kernel won't ESTALE on; reserve the high bit (or a high range)
+   for transient ids that get rewritten to the derived id once the
+   write commits to a tree. **Implementation lands alongside Layer B**
+   (the current monotonic slab is fine until restarts matter); the
+   M3 slab API is the right shape, just swap the id source.
 
 ### Still open
 
-3. **fsmonitor strategy.** Blocks M6 (snapshot RPC contract). See §4.1.
+7. **fsmonitor strategy.** Blocks M6 (snapshot RPC contract). See §4.1.
    Leaning toward (b) — daemon feeds jj a precomputed dirty set
    out-of-band, since the FUSE/NFS write path already knows what was
-   written. Decide while building M6.
-4. **Inode handle stability across daemon restarts.** Blocks Layer B
-   design. NFSv3 file handles must survive restart or all clients see
-   ESTALE; FUSE has the same constraint via `generation`. Persist the
-   inode slab (sled/redb) or regenerate deterministically from a
-   content-addressed tree? Decide alongside Layer B.
-5. **Concurrency model.** Multiple `Mount`s, single `Store`. If two
-   mounts point at the same remote (Layer C), how do snapshot/checkout
-   serialize? Deferrable past M6.
+   written. **Punt:** decide while building M6, not before. Quick
+   upstream check at that point: does jj-lib's `WorkingCopy::snapshot`
+   already expose a hook we can override in `YakWorkingCopy` without
+   forking? If yes, (b) is essentially free.
+8. **Concurrency model.** Multiple `Mount`s, each now with its own
+   `Store` (decision 4). If two mounts point at the same remote
+   (Layer C), how do snapshot/checkout serialize against the shared
+   remote? Deferrable past M6 — local mounts are independent until
+   Layer C couples them.
 
 ## 8. Recommended starting point
 
@@ -453,19 +558,20 @@ adapters. The trait + adapters are unit-tested end-to-end (lookup,
 getattr, read, readdir, readlink) over a synthetic in-memory tree;
 nothing is mounted yet because `Bind` is still not sent.
 
-**Next: M4 — `jj yak init` actually mounts.** Wire the per-mount
-`Mount` (in `daemon/src/service.rs`) to a per-mount `Arc<dyn JjYakFs>`
-+ transport handle. Send `Bind` from `Initialize` so the
-`VfsManager` brings up the right transport for the platform. On
-Linux, that's `fuse3::Session::mount_with_unprivileged` against a
-mountpoint at `working_copy_path`; on macOS, `NFSTcpListener::bind`
-on a random port followed by `mount_nfs -o
-port=N,mountport=N,nolocks,vers=3,actimeo=0`. The CLI side at
-`yak init` then needs to accept whatever the daemon hands back
-(port for NFS, nothing for FUSE) and surface it on subsequent
-RPCs.
+**Next: M5 — `check_out` writes files.** `LockedYakWorkingCopy::check_out`
+at `cli/src/working_copy.rs:339` is still `todo!`. Punch list:
 
-The signal that M4 is done: `jj yak init /tmp/r remote` followed by
-`ls /tmp/r` shows nothing (empty tree) without erroring, and
-`stat` of `/tmp/r` reports it as a directory. M5 then makes the
-listing non-empty.
+1. CLI side: send a new `CheckOut` RPC carrying the new `tree_id` (and
+   maybe a list of changed paths to scope invalidations). Daemon
+   responds with the new root tree id once the VFS has switched over.
+2. Daemon: update `Mount.root_tree_id`. On Linux, push FUSE
+   invalidations via `notify_inval_inode` / `notify_inval_entry` so
+   the kernel re-reads on next access. On macOS, bump `mtime`/`ctime`
+   on changed entries and rely on `actimeo=0` to revalidate.
+3. Once writes also work (M6), flip `disable_mount` off in
+   `cli/tests/common/mod.rs` and re-enable the three `#[ignore]`d
+   integration tests in `cli/tests/test_init.rs`.
+
+After M5, `jj new` populates the WC. The currently-ignored
+`test_repos_are_independent` should turn green, modulo whether `.jj/`
+writes also need M6 (likely yes — `jj new` writes ops too).

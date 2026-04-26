@@ -69,10 +69,14 @@ impl Default for TestEnvironment {
         // Initialize a isolated daemon for this env
         let daemon_config = config_dir.join("daemon.toml");
         let daemon_port: usize = thread_rng().gen_range(11000..21000);
+        // disable_mount=true keeps integration tests off the real FUSE/NFS
+        // path (see Config.disable_mount in daemon/src/main.rs). The VFS
+        // write path doesn't land until M6; without this, jj-lib's `.jj/`
+        // scaffolding would hit the empty mount and fail with ENOSYS.
         std::fs::write(
             &daemon_config,
             format!(
-                "grpc_addr = \"[::1]:{daemon_port}\"\ncache = \"{daemon_dir_str}\"\n[nfs]\nmin_port = 1100\nmax_port = 1200\n"
+                "grpc_addr = \"[::1]:{daemon_port}\"\ncache = \"{daemon_dir_str}\"\ndisable_mount = true\n[nfs]\nmin_port = 1100\nmax_port = 1200\n"
             ),
         )
         .expect("Failed to write daemon config toml for testing setup");

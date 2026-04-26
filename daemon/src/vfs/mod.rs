@@ -15,14 +15,26 @@
 
 pub mod fuse_adapter;
 mod inode;
+// nfs_adapter is the macOS transport. Compile it on macOS, and on every
+// platform under `cfg(test)` so the read-side tests run on Linux CI too.
+// Without this, Linux lib builds emit dead-code warnings for every
+// helper inside, since nothing uses them outside of tests.
+#[cfg(any(target_os = "macos", test))]
 pub mod nfs_adapter;
 mod yak_fs;
 
-// Re-exports kept tight: only the symbols `vfs_mgr.rs` and (eventually)
-// `service.rs` need at the crate root. The full per-module surface is
-// reachable as `crate::vfs::yak_fs::*` for tests and the FUSE adapter.
-#[allow(unused_imports)] // FuseAdapter isn't wired up to a mount until M4.
+// Re-exports kept tight: only the symbols `vfs_mgr.rs` and `service.rs`
+// need at the crate root. The full per-module surface is reachable via
+// `crate::vfs::nfs_adapter::*` / `crate::vfs::fuse_adapter::*` for the
+// platform-agnostic unit tests.
+//
+// The transport adapters are platform-gated to mirror `vfs_mgr`: Linux
+// uses FUSE, macOS uses NFS. The unused module is still compiled (so
+// the cross-platform read-side tests run on either OS) but the
+// crate-root re-export is gated to keep `unused_imports` quiet.
+#[cfg(target_os = "linux")]
 pub use fuse_adapter::FuseAdapter;
 pub use inode::ROOT_INODE;
+#[cfg(target_os = "macos")]
 pub use nfs_adapter::NfsAdapter;
 pub use yak_fs::{JjYakFs, YakFs};

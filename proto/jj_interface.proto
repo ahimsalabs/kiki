@@ -16,20 +16,25 @@ service JujutsuInterface {
 
   rpc Snapshot(SnapshotReq) returns (SnapshotReply) {}
 
-  // Store related calls
+  // Store related calls.
+  //
+  // Each Mount owns its own keyspace (per-mount Store, decided at M4 per
+  // docs/PLAN.md §7), so every store RPC carries `working_copy_path` on the
+  // request side. The daemon looks up the Mount and dispatches to its Store.
+  // Replies stay slim — the caller already knows which mount it spoke to.
   rpc GetEmptyTreeId(GetEmptyTreeIdReq) returns (TreeId) {}
 
-  rpc WriteTree(Tree) returns (TreeId) {}
-  rpc ReadTree(TreeId) returns (Tree) {}
+  rpc WriteTree(WriteTreeReq) returns (TreeId) {}
+  rpc ReadTree(ReadTreeReq) returns (Tree) {}
 
-  rpc WriteFile(File) returns (FileId) {}
-  rpc ReadFile(FileId) returns (File) {}
+  rpc WriteFile(WriteFileReq) returns (FileId) {}
+  rpc ReadFile(ReadFileReq) returns (File) {}
 
-  rpc WriteSymlink(Symlink) returns (SymlinkId) {}
-  rpc ReadSymlink(SymlinkId) returns (Symlink) {}
+  rpc WriteSymlink(WriteSymlinkReq) returns (SymlinkId) {}
+  rpc ReadSymlink(ReadSymlinkReq) returns (Symlink) {}
 
-  rpc WriteCommit(Commit) returns (CommitId) {}
-  rpc ReadCommit(CommitId) returns (Commit) {}
+  rpc WriteCommit(WriteCommitReq) returns (CommitId) {}
+  rpc ReadCommit(ReadCommitReq) returns (Commit) {}
 }
 
 
@@ -49,7 +54,28 @@ message InitializeReq {
   string remote = 2;
 }
 
-message InitializeReply {}
+// Polymorphic reply so the daemon can tell the CLI which transport it
+// negotiated without leaking sentinel values into the wire format. Linux
+// uses Fuse (mount happens daemon-side via the fusermount3 setuid helper);
+// macOS uses Nfs and hands back the bound port for the CLI to feed into
+// `mount_nfs`. New transports (virtio-fs, projected fs, etc.) get added as
+// oneof variants — never as a magic field on a flat reply.
+message InitializeReply {
+  oneof transport {
+    FuseTransport fuse = 1;
+    NfsTransport nfs = 2;
+  }
+}
+
+// FUSE: mount already happened daemon-side; CLI has nothing to do.
+message FuseTransport {}
+
+// NFS: daemon bound a port; CLI shells out to mount_nfs.
+message NfsTransport {
+  // Localhost port the daemon's NFS server listens on. Same value is used
+  // for both `port` and `mountport` mount_nfs options.
+  uint32 port = 1;
+}
 
 message SnapshotReq {
   string working_copy_path = 1;
@@ -66,8 +92,54 @@ message GetTreeStateReply {
   bytes tree_id = 1;
 }
 
-message GetEmptyTreeIdReq {}
-// File
+// Store request envelopes. Each carries `working_copy_path` so the daemon
+// can route to the correct per-mount Store. The body fields mirror the
+// data-only message types below (File/Tree/Commit/etc.) which are also
+// used as RPC reply payloads.
+
+message GetEmptyTreeIdReq {
+  string working_copy_path = 1;
+}
+
+message WriteFileReq {
+  string working_copy_path = 1;
+  bytes data = 2;
+}
+
+message ReadFileReq {
+  string working_copy_path = 1;
+  bytes file_id = 2;
+}
+
+message WriteSymlinkReq {
+  string working_copy_path = 1;
+  string target = 2;
+}
+
+message ReadSymlinkReq {
+  string working_copy_path = 1;
+  bytes symlink_id = 2;
+}
+
+message WriteTreeReq {
+  string working_copy_path = 1;
+  Tree tree = 2;
+}
+
+message ReadTreeReq {
+  string working_copy_path = 1;
+  bytes tree_id = 2;
+}
+
+message WriteCommitReq {
+  string working_copy_path = 1;
+  Commit commit = 2;
+}
+
+message ReadCommitReq {
+  string working_copy_path = 1;
+  bytes commit_id = 2;
+}
 
 message CheckoutState {
   bytes op_id = 1;

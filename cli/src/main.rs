@@ -126,12 +126,19 @@ async fn run_yak_command(
             // NOTE: We need to tell the daemon to mount the filesystem BEFORE we
             // initalize the core jj internals or we'll have writes on-disk and on
             // vfs.
-            client
+            let init_reply = client
                 .initialize(proto::jj_interface::InitializeReq {
                     remote: args.remote,
                     path: wc_path_str.to_string(),
                 })
-                .map_err(|e| internal_error_with_message("daemon Initialize RPC failed", e))?;
+                .map_err(|e| internal_error_with_message("daemon Initialize RPC failed", e))?
+                .into_inner();
+            // The daemon picks the transport per platform (FUSE on Linux,
+            // NFS on macOS) and reports it back here. On Linux the mount
+            // already happened daemon-side; on macOS we shell out to
+            // `mount_nfs`. With `disable_mount = true` (integration tests),
+            // the daemon returns `transport = None`.
+            attach_transport(init_reply.transport, &wc_path)?;
 
             Workspace::init_with_factories(
                 command_helper.settings(),
@@ -167,6 +174,62 @@ async fn run_yak_command(
             Ok(())
         }
     }
+}
+
+/// Finalize whatever transport the daemon chose. On Linux (Fuse) the
+/// daemon already attached the mount; on macOS (Nfs) we shell out to
+/// `mount_nfs`. `None` is the test-mode reply (`disable_mount = true`):
+/// nothing to do.
+fn attach_transport(
+    transport: Option<proto::jj_interface::initialize_reply::Transport>,
+    wc_path: &std::path::Path,
+) -> Result<(), CommandError> {
+    use proto::jj_interface::initialize_reply::Transport;
+    match transport {
+        None => Ok(()),
+        Some(Transport::Fuse(_)) => Ok(()),
+        Some(Transport::Nfs(nfs)) => mount_nfs_localhost(wc_path, nfs.port),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mount_nfs_localhost(wc_path: &std::path::Path, port: u32) -> Result<(), CommandError> {
+    let port_arg = format!(
+        "port={port},mountport={port},nolocks,vers=3,actimeo=0"
+    );
+    let status = std::process::Command::new("mount_nfs")
+        .arg("-o")
+        .arg(&port_arg)
+        .arg("localhost:/")
+        .arg(wc_path)
+        .status()
+        .map_err(|e| {
+            internal_error_with_message("failed to spawn mount_nfs", e)
+        })?;
+    if !status.success() {
+        return Err(internal_error_with_message(
+            format!(
+                "mount_nfs exited with status {status} (port={port}, path={})",
+                wc_path.display()
+            ),
+            std::io::Error::new(std::io::ErrorKind::Other, "mount_nfs failed"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_nfs_localhost(_wc_path: &std::path::Path, _port: u32) -> Result<(), CommandError> {
+    // The daemon should never return Nfs on a non-macOS host (vfs_mgr
+    // gates `bind_nfs` behind `cfg(target_os = "macos")`), but if it
+    // somehow does, surface it cleanly rather than silently no-op'ing.
+    Err(internal_error_with_message(
+        "daemon returned NFS transport on non-macOS host",
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "NFS transport on non-macOS",
+        ),
+    ))
 }
 
 fn main() -> std::process::ExitCode {
