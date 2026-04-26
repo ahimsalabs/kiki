@@ -300,7 +300,7 @@ End-to-end shape:
 
 **Conflicted trees rejected.** `Commit::tree().tree_ids()` returns
 `Merge<TreeId>`. Yak only handles the resolved single-id case today;
-multi-term merges return `CheckoutError::Other` ("checking out a
+multi-term merges return `CheckoutError::Other` ("yak: checking out a
 conflicted tree is not yet supported"). Conflict materialization
 pairs with the conflict UI work — punted, not a blocker for the next
 milestones.
