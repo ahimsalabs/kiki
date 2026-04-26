@@ -494,6 +494,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<SetCheckoutStateReq>,
     ) -> Result<Response<SetCheckoutStateReply>, Status> {
         let req = request.into_inner();
+        info!(path = %req.working_copy_path, "SetCheckoutState");
         let checkout = req.checkout_state.ok_or_else(|| {
             Status::invalid_argument("SetCheckoutStateReq.checkout_state is required")
         })?;
@@ -536,6 +537,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 req.working_copy_path
             ))
         })?;
+        info!(path = %req.working_copy_path, tree_id = %hex(&new_root), "Snapshot");
 
         // Stamp the new root tree id back on the Mount so subsequent
         // `GetTreeState`/`Snapshot` reads agree with what the VFS just
@@ -571,6 +573,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         }
         .try_into()
         .map_err(decode_status("tree id"))?;
+        info!(path = %req.working_copy_path, tree_id = %hex(&new_tree_id), "CheckOut");
 
         // Clone the per-mount fs handle out from under the lock so the
         // (potentially I/O-heavy) `JjYakFs::check_out` call doesn't hold

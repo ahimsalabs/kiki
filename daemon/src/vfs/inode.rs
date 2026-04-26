@@ -164,18 +164,23 @@ impl InodeSlab {
 
     /// Re-root the slab at `new_root_tree`.
     ///
-    /// Updates the root inode's `NodeRef::Tree` and clears the
-    /// `(parent, name)` reverse cache so subsequent `lookup` calls see
-    /// the new tree's children. Existing non-root inode entries are
-    /// retained so the kernel doesn't immediately ESTALE on cached ids;
-    /// they're orphaned in the `inodes` map but harmless (`next_id`
-    /// keeps moving forward, so nothing reuses their numbers).
+    /// Updates the root inode's `NodeRef::Tree` and clears only the
+    /// `(ROOT_INODE, name)` entries from the reverse cache so subsequent
+    /// `lookup` calls under the root see the new tree's children. Sub-tree
+    /// entries `(non-root-inode, name)` survive: they're either reachable
+    /// through the pinned `.jj/` subtree (M7) — in which case we *want*
+    /// stable inode ids so daemon-managed state survives `check_out` —
+    /// or they're orphaned, which is harmless because nothing reaches
+    /// them from the new root.
     ///
-    /// This is the M5 contract: swap the visible root, keep ids
-    /// monotonic. Pushing kernel-side invalidation (so the kernel
-    /// re-`lookup`s rather than reusing its own cached entries) needs
-    /// fuse3 to expose `Session::get_notify` publicly — tracked in
-    /// docs/PLAN.md M5 §"Deferred".
+    /// Existing non-root inode entries in `inodes` are retained so the
+    /// kernel doesn't immediately ESTALE on cached ids; they're orphaned
+    /// but `next_id` keeps moving forward so nothing reuses their numbers.
+    ///
+    /// This is the M5 contract refined by M7. Pushing kernel-side
+    /// invalidation (so the kernel re-`lookup`s rather than reusing its
+    /// own cached entries) needs fuse3 to expose `Session::get_notify`
+    /// publicly — tracked in `docs/PLAN.md` §7 #9.
     pub fn swap_root(&self, new_root_tree: Id) {
         let mut inner = self.inner.lock();
         // Replace the root inode's NodeRef in place; keep parent/name as the
@@ -188,12 +193,15 @@ impl InodeSlab {
                 node: NodeRef::Tree(new_root_tree),
             },
         );
-        // Drop every (parent, name) → id mapping. This is necessary even
-        // for unchanged paths: the cached id might point at a node that
-        // doesn't exist in the new tree, so we err on the side of letting
-        // each path re-allocate. Tradeoff is more inode churn; the slab
-        // is small per workspace, so we eat the cost.
-        inner.by_parent.clear();
+        // Drop only (ROOT_INODE, *) mappings. Pre-M7 behaviour was to
+        // clear the whole cache, which inadvertently severed the chain
+        // through `.jj/`'s pinned subtree: a subsequent lookup of
+        // `.jj/repo` would re-walk the (now-stale) snapshotted user tree
+        // and miss writes that happened between the last snapshot and
+        // this swap. Surgical clearing keeps the user-tree story right
+        // (root re-resolves freshly) while leaving daemon-managed state
+        // reachable.
+        inner.by_parent.retain(|(parent, _), _| *parent != ROOT_INODE);
     }
 
     /// Resolve a child by name under `parent`, allocating an inode id if
@@ -417,12 +425,12 @@ mod tests {
         assert!(a > ROOT_INODE);
     }
 
-    /// `swap_root` rewrites the root inode and clears the (parent, name)
-    /// reverse cache so subsequent intern_child calls allocate fresh
-    /// ids. Older non-root ids stay live in `inodes` (orphaned but
-    /// safe).
+    /// `swap_root` rewrites the root inode and clears `(ROOT, *)`
+    /// reverse-cache entries so subsequent `intern_child` calls under
+    /// the root allocate fresh ids. Sub-tree entries are retained.
+    /// Older non-root ids stay live in `inodes` (orphaned but safe).
     #[test]
-    fn swap_root_updates_root_and_clears_reverse_cache() {
+    fn swap_root_updates_root_and_clears_root_level_cache() {
         let slab = InodeSlab::new(id(1));
         let old_a = slab.intern_child(ROOT_INODE, "a", || NodeRef::File {
             id: id(2),
@@ -435,13 +443,43 @@ mod tests {
         let root = slab.get(ROOT_INODE).expect("root present");
         assert!(matches!(root.node, NodeRef::Tree(t) if t == id(99)));
 
-        // Re-interning "a" allocates a fresh id (the reverse cache was
-        // cleared); monotonic ordering still holds.
+        // Re-interning "a" allocates a fresh id (the (ROOT, "a") entry
+        // was cleared); monotonic ordering still holds.
         let new_a = slab.intern_child(ROOT_INODE, "a", || NodeRef::File {
             id: id(3),
             executable: false,
         });
         assert!(new_a > old_a, "expected monotonic id");
+    }
+
+    /// `swap_root` preserves sub-tree `(non-root, name)` cache entries.
+    /// The pinned `.jj/` subtree (M7) relies on this to keep its
+    /// descendants reachable across `check_out`: the kernel-cached
+    /// children of any directory inside `.jj/` must continue to resolve
+    /// to the same inode ids after the user tree changes.
+    #[test]
+    fn swap_root_preserves_subtree_cache() {
+        let slab = InodeSlab::new(id(1));
+        // Set up: root → "dir" → "file". The "dir" inode lives outside
+        // the cleared cache.
+        let dir = slab.intern_child(ROOT_INODE, "dir", || NodeRef::Tree(id(2)));
+        let file_under_dir = slab.intern_child(dir, "file", || NodeRef::File {
+            id: id(3),
+            executable: false,
+        });
+
+        slab.swap_root(id(99));
+
+        // (ROOT, "dir") is gone — re-allocates.
+        let new_dir = slab.intern_child(ROOT_INODE, "dir", || NodeRef::Tree(id(4)));
+        assert!(new_dir > dir, "(ROOT, dir) entry was dropped");
+
+        // (dir, "file") survived — re-interning returns the original id
+        // and the loader closure must NOT be observed.
+        let same_file = slab.intern_child(dir, "file", || {
+            panic!("subtree cache should have hit, not allocated")
+        });
+        assert_eq!(same_file, file_under_dir);
     }
 
     /// Materializing a clean `Tree` inode swaps it to `DirtyTree` and

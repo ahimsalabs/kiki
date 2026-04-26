@@ -69,14 +69,12 @@ impl Default for TestEnvironment {
         // Initialize a isolated daemon for this env
         let daemon_config = config_dir.join("daemon.toml");
         let daemon_port: usize = thread_rng().gen_range(11000..21000);
-        // disable_mount=true keeps integration tests off the real FUSE/NFS
-        // path. TTL=ZERO in the FUSE adapter is now in place, so the
-        // kernel-invalidation gate (§7 #9) is no longer the blocker —
-        // but flipping this to `false` surfaces two semantic issues
-        // that need their own milestone: `.jj/` leaks into the
-        // snapshot tree (no split between user content and jj metadata)
-        // and `@-`'s tree id appears stale after `jj new`. See
-        // docs/PLAN.md §7 #9 / §10 for the punch list.
+        // disable_mount=true keeps integration tests off the real FUSE
+        // path. Flipping to `false` is the M7 capstone now that
+        // `.jj/` separation (M7.1) and op_id propagation (M7.2) are in
+        // place — but the flip belongs to its own change so it can be
+        // reverted in isolation if it surfaces flakes on CI runners
+        // that lack `fusermount3`.
         std::fs::write(
             &daemon_config,
             format!(

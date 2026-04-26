@@ -401,10 +401,32 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
     }
 
     async fn finish(
-        self: Box<Self>,
+        mut self: Box<Self>,
         operation_id: OperationId,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         info!("Finished: {operation_id:?}");
+        // Persist the new operation id to the daemon so the next CLI
+        // invocation's `GetCheckoutState` returns it. The local-disk
+        // working copy writes a `.jj/working_copy/checkout` file at
+        // this point; the daemon-backed equivalent is SetCheckoutState.
+        // Without this, `WorkingCopy::operation_id()` keeps reporting
+        // the pre-mutation op id and `jj log`'s `@` marker stays
+        // pinned to the previous WC commit (PLAN §10.2).
+        let workspace_name = self.wc.get_checkout_state()?.workspace_name.clone();
+        let path_str = path_to_str(&self.wc.working_copy_path)?.to_string();
+        self.wc
+            .client
+            .set_checkout_state(proto::jj_interface::SetCheckoutStateReq {
+                working_copy_path: path_str,
+                checkout_state: Some(proto::jj_interface::CheckoutState {
+                    op_id: operation_id.as_bytes().into(),
+                    workspace_id: workspace_name.as_str().as_bytes().to_vec(),
+                }),
+            })
+            .map_err(|e| wc_state_err("daemon SetCheckoutState failed", e))?;
+        // Invalidate the cached checkout_state so subsequent reads via
+        // `operation_id()` don't keep returning the stale value.
+        self.wc.checkout_state = OnceCell::new();
         Ok(Box::new(self.wc))
     }
 }
