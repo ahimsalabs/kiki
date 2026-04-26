@@ -91,6 +91,15 @@ impl BlockingJujutsuInterfaceClient {
         rt.block_on(client.snapshot(request))
     }
 
+    pub fn check_out(
+        &self,
+        request: impl tonic::IntoRequest<CheckOutReq>,
+    ) -> Result<tonic::Response<CheckOutReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.check_out(request))
+    }
+
     // Store RPCs all carry `working_copy_path` on the request side now (see
     // proto/jj_interface.proto). YakBackend stamps it from its own
     // `working_copy_path` field on every call.

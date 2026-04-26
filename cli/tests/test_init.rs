@@ -84,12 +84,12 @@ fn test_multiple_init() {
     ");
 }
 
-// `jj new` calls into `LockedYakWorkingCopy::check_out`, which is `todo!`
-// until M5 (`cli/src/working_copy.rs`). Was green pre-M2 only because
-// `LocalWorkingCopyFactory` was masking the gap. §6 of docs/PLAN.md will
-// re-home this kind of coverage in `test_workingcopy.rs` once the WC path
-// is real.
-#[ignore = "needs M5: LockedYakWorkingCopy::check_out"]
+// End-to-end smoke test for M5's `LockedYakWorkingCopy::check_out`:
+// `jj new` triggers a CheckOut RPC against each repo's daemon-side
+// Mount, and the per-mount Stores (M4) keep the trees from bleeding
+// between repos. §6 of docs/PLAN.md will move this kind of coverage
+// into `test_workingcopy.rs` once we have more than two write-path
+// tests.
 #[test]
 fn test_repos_are_independent() {
     let test_env = TestEnvironment::default();

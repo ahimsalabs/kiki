@@ -16,7 +16,7 @@ use jj_lib::working_copy::{
     CheckoutError, CheckoutStats, LockedWorkingCopy, ResetError, SnapshotError, SnapshotOptions,
     SnapshotStats, WorkingCopy, WorkingCopyFactory, WorkingCopyStateError,
 };
-use proto::jj_interface::{GetCheckoutStateReq, GetTreeStateReq, SnapshotReq};
+use proto::jj_interface::{CheckOutReq, GetCheckoutStateReq, GetTreeStateReq, SnapshotReq};
 use tracing::{info, warn};
 
 use crate::blocking_client::BlockingJujutsuInterfaceClient;
@@ -337,8 +337,48 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
     }
 
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError> {
-        let _new_tree = commit.tree();
-        todo!()
+        // Yak only supports unconflicted checkouts today: the daemon's
+        // VFS roots at a single tree id, so a Merge<TreeId> with
+        // multiple terms has no obvious materialization. Conflict
+        // rendering pairs with the conflict UI work — punt for now and
+        // surface a clean error rather than picking a side silently.
+        let new_tree = commit.tree();
+        let resolved_tree_id = new_tree.tree_ids().as_resolved().ok_or_else(|| {
+            CheckoutError::Other {
+                message: "yak: checking out a conflicted tree is not yet supported".into(),
+                err: std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "conflicted MergedTree",
+                )
+                .into(),
+            }
+        })?;
+
+        // Stamp the new root tree on the daemon. The daemon validates
+        // the tree exists in its per-mount Store (it must — jj-lib
+        // wrote it via `Backend::write_tree` before reaching here) and
+        // re-roots the VFS so subsequent reads through the mount see
+        // the new tree. CheckoutStats stays default until the VFS
+        // write path (M6) gives us a real tree-diff to count.
+        let path_str = path_to_str(&self.wc.working_copy_path)?.to_string();
+        self.wc
+            .client
+            .check_out(CheckOutReq {
+                working_copy_path: path_str,
+                new_tree_id: resolved_tree_id.to_bytes(),
+            })
+            .map_err(|e| CheckoutError::Other {
+                message: "daemon CheckOut RPC failed".into(),
+                err: e.into(),
+            })?;
+
+        // Invalidate the cached MergedTree so subsequent `tree()` calls
+        // refetch via GetTreeState. Without this, the OnceCell would
+        // still hand back the pre-checkout tree until the next
+        // `start_mutation`.
+        self.wc.tree_state = OnceCell::new();
+
+        Ok(CheckoutStats::default())
     }
 
     fn rename_workspace(&mut self, _new_workspace_name: WorkspaceNameBuf) {
