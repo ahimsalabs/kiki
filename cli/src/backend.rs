@@ -274,7 +274,10 @@ impl Backend for YakBackend {
             })
             .map_err(|e| read_object_err("commit", id, e))?
             .into_inner();
-        Ok(commit_from_proto(proto))
+        // Decode errors from the proto are themselves a "read commit"
+        // failure — wrap them with the commit id so the user sees which
+        // commit was malformed.
+        commit_from_proto(proto).map_err(|e| read_object_err("commit", id, e))
     }
 
     #[tracing::instrument(skip(sign_with))]
@@ -386,7 +389,7 @@ pub fn commit_to_proto(commit: &Commit) -> proto::jj_interface::Commit {
     proto
 }
 
-fn commit_from_proto(mut proto: proto::jj_interface::Commit) -> Commit {
+fn commit_from_proto(mut proto: proto::jj_interface::Commit) -> BackendResult<Commit> {
     // Note: .take() sets secure_sig to None before encoding, mirroring the
     // approach in jj's GitBackend.
     let secure_sig = proto.secure_sig.take().map(|sig| SecureSig {
@@ -401,17 +404,25 @@ fn commit_from_proto(mut proto: proto::jj_interface::Commit) -> Commit {
     let root_tree = merge_builder.build();
     let conflict_labels = ConflictLabels::from_vec(proto.conflict_labels);
     let change_id = ChangeId::new(proto.change_id);
-    Commit {
+    let author = proto
+        .author
+        .ok_or_else(|| commit_decode_err("missing author"))
+        .and_then(signature_from_proto)?;
+    let committer = proto
+        .committer
+        .ok_or_else(|| commit_decode_err("missing committer"))
+        .and_then(signature_from_proto)?;
+    Ok(Commit {
         parents,
         predecessors,
         root_tree,
         conflict_labels: conflict_labels.into_merge(),
         change_id,
         description: proto.description,
-        author: signature_from_proto(proto.author.unwrap_or_default()),
-        committer: signature_from_proto(proto.committer.unwrap_or_default()),
+        author,
+        committer,
         secure_sig,
-    }
+    })
 }
 
 fn signature_to_proto(signature: &Signature) -> proto::jj_interface::commit::Signature {
@@ -425,16 +436,32 @@ fn signature_to_proto(signature: &Signature) -> proto::jj_interface::commit::Sig
     }
 }
 
-fn signature_from_proto(proto: proto::jj_interface::commit::Signature) -> Signature {
-    let timestamp = proto.timestamp.unwrap_or_default();
-    Signature {
+fn signature_from_proto(
+    proto: proto::jj_interface::commit::Signature,
+) -> BackendResult<Signature> {
+    // Mirror the daemon-side `TryFrom` in `daemon/src/ty.rs`: a missing
+    // timestamp is a malformed wire message, not an epoch-zero default.
+    // Silently substituting `Default::default()` here would round-trip
+    // commits as if they were authored on 1970-01-01.
+    let timestamp = proto
+        .timestamp
+        .ok_or_else(|| commit_decode_err("missing signature timestamp"))?;
+    Ok(Signature {
         name: proto.name,
         email: proto.email,
         timestamp: Timestamp {
             timestamp: MillisSinceEpoch(timestamp.millis_since_epoch),
             tz_offset: timestamp.tz_offset,
         },
-    }
+    })
+}
+
+/// Build a `BackendError::Other` for malformed commit-proto fields.
+/// We don't know the commit id at this layer (decode happens before
+/// `read_commit` can wrap the error with `read_object_err`), so the
+/// message has to stand on its own.
+fn commit_decode_err(what: &'static str) -> BackendError {
+    BackendError::Other(format!("commit proto: {what}").into())
 }
 
 fn tree_to_proto(tree: &Tree) -> BackendResult<proto::jj_interface::Tree> {
@@ -571,7 +598,7 @@ mod tests {
             proto.conflict_labels,
             vec!["left".to_string(), "base".to_string(), "right".to_string()]
         );
-        let round_tripped = commit_from_proto(proto);
+        let round_tripped = commit_from_proto(proto).expect("round-trip decode");
         assert_eq!(round_tripped.root_tree, root_tree);
         assert_eq!(round_tripped.conflict_labels, conflict_labels);
     }

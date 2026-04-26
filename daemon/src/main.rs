@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use serde::Deserialize;
 use tonic::transport::Server as GrpcServer;
-use tracing::info;
+use tracing::{error, info};
 
 mod hash;
 mod service;
@@ -96,12 +96,25 @@ async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
             // dropped — i.e. the gRPC service is gone too. Treat as a
             // clean shutdown trigger rather than a panic.
             info!("VFS manager exited; shutting down");
+            Ok(())
         }
         ret = grpc_fut => {
-            panic!("GRPC: {:?}", ret );
+            // The gRPC server normally runs forever. Returning means
+            // the listener died (bind failure, runtime drop, etc.) —
+            // surface it as an error with context rather than panicking
+            // with the Debug repr of `Result<(), tonic::transport::Error>`.
+            match ret {
+                Ok(()) => {
+                    error!("gRPC server exited unexpectedly without error");
+                    Err(anyhow!("gRPC server exited unexpectedly"))
+                }
+                Err(e) => {
+                    error!(error = %e, "gRPC server failed");
+                    Err(e).context("gRPC server failed")
+                }
+            }
         }
     }
-    Ok(())
 }
 
 #[tokio::main]

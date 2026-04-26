@@ -6,6 +6,9 @@ below for the M7 outcome. **Integration tests now run with
 `disable_mount = false`**: `jj yak init` + `jj new` round-trip
 through a real Linux FUSE mount, `.jj/` is excluded from snapshots,
 and the working-copy `@` advances correctly across mutations.
+A post-M7 code audit (§10.3) closed four real bugs and two clippy
+warnings; `cargo clippy --workspace --all-targets -- -D warnings`
+is clean and 88/88 tests pass.
 The next milestone is **Layer B — durable storage** (§8). Until that
 lands the daemon's per-mount `HashMap` `Store` loses everything on
 restart.
@@ -260,7 +263,10 @@ Worth doing in passing, not blocking:
 - **`unwrap()` everywhere** — acceptable now (failures are programmer
   errors during dev) but should map to `BackendError::Other` /
   `WorkingCopyStateError::Other` before any user touches it. Track so we
-  don't forget.
+  don't forget. Partial pass landed in §10.3 (`signature_from_proto`,
+  `commit_from_proto`, daemon's `panic!("GRPC: …")` shutdown path); the
+  remaining 33 `Mutex::lock().unwrap()` in `cli/src/blocking_client.rs`
+  are CLI-process-lifetime safe and not in scope.
 - **Delete `server/` crate** — 30 seconds, do it next time in `Cargo.toml`.
 
 ## 7. Decisions
@@ -369,7 +375,9 @@ necessary so kernel handles survive restart.
 - **`unwrap()` audit.** Acceptable while the daemon is single-developer,
   but tighter error-mapping should land before any user touches the
   daemon (`BackendError::Other` / `WorkingCopyStateError::Other`
-  passthrough at every boundary).
+  passthrough at every boundary). Partially done in §10.3; the
+  Layer B work will pick up the remaining boundaries when the
+  `redb`/`sled` swap forces a fresh look at the Store API.
 - **Delete `server/` crate.** Three lines of "Hello, world!"; just
   remove from `Cargo.toml`.
 - **Tracing for the CLI.** Daemon already has it; CLI gets `RUST_LOG`
@@ -496,6 +504,69 @@ temporarily during the investigation. The smoking gun was
 comparing FUSE write traces (jj-lib *did* create the new op file)
 against a `readdir` of the same path post-CheckOut (different
 inode id, stale tree).
+
+### 10.3 Post-M7 code audit (landed)
+
+Surface metrics first: ~3,940 lines of production Rust across 21
+files (5,903 code lines total minus 1,962 inside `#[cfg(test)]`).
+Zero `unsafe`. 88 tests passing, 0 ignored. `cargo clippy
+--workspace --all-targets -- -D warnings` is clean.
+
+A targeted audit pass after M7 landed picked up four real bugs and
+two trailing clippy warnings:
+
+- **Lock-order inversion in `cli/src/blocking_client.rs:182`.**
+  Every method acquired `client` before `rt` — except
+  `get_empty_tree_id`, which inverted the order. Latent two-mutex
+  deadlock if `BlockingJujutsuInterfaceClient` (`Clone + Send`) is
+  ever called concurrently. Fixed: restored the canonical order.
+- **`Store` API encapsulation hole.** `daemon/src/store.rs` exposed
+  every map (`commits`, `files`, `trees`, `symlinks`) as `pub
+  Arc<Mutex<HashMap<…>>>`, and `service.rs:read_commit` reached
+  past the API to call `store.commits.lock()` directly. Privatized
+  the fields, added `Store::get_commit` mirroring the other
+  getters, switched `read_commit` over. Layer B's `redb`/`sled`
+  swap will be a one-file change instead of a grep.
+- **Silent epoch-zero timestamp in `cli/src/backend.rs`.**
+  `signature_from_proto` was `proto.timestamp.unwrap_or_default()`
+  — a missing wire timestamp round-tripped as 1970-01-01 instead
+  of erroring. The daemon-side `TryFrom` in `daemon/src/ty.rs`
+  already returned `Err` for the same case. Fixed: both
+  `signature_from_proto` and `commit_from_proto` now return
+  `BackendResult` and propagate `BackendError::Other("commit
+  proto: …")`; the two `proto.author.unwrap_or_default()` /
+  `proto.committer.unwrap_or_default()` substitutions in the same
+  function were quietly papering over the same bug class and got
+  the same treatment.
+- **`panic!("GRPC: {:?}", ret)` in `daemon/src/main.rs:101`.**
+  Fired on real server-listener death (bind failure, runtime
+  drop) with no operator context. Replaced with `tracing::error!`
+  + `anyhow::Error` propagation; `main()` already returns
+  `Result`, so the process exits non-zero with a real chain
+  instead of a `Debug`-formatted `Result<(), tonic::transport::Error>`.
+- **Two clippy warnings** (`field_reassign_with_default` in
+  `fuse_adapter.rs:824`, `redundant_pattern_matching` in
+  `vfs_mgr.rs:180`). One-line fixes each.
+
+What was checked and intentionally **not** changed:
+
+- The 33 `Mutex::lock().unwrap()` calls in
+  `cli/src/blocking_client.rs`. They are CLI-process-lifetime safe
+  (`std::sync::Mutex` only poisons on panic, and the CLI dies on
+  panic), and there are no fallible operations inside the locked
+  regions to poison them in the first place. Document if the
+  client is ever embedded in a longer-lived process.
+- The 6 `todo!()`s in `cli/src/working_copy.rs` (`recover`,
+  `rename_workspace`, `reset`, `sparse_patterns`,
+  `set_sparse_patterns`). All cold paths requiring explicit
+  uncommon user actions; none on the `jj yak init` / `jj log` /
+  `jj diff` hot paths. Tracked in §5.
+- `async_trait` on `JjYakFs`. Native `async fn` in traits is
+  Rust-1.75+; the indirection is fine until we bump MSRV.
+- `YakBackend::working_copy_path()` clones a `String` per RPC.
+  Method sugar over `self.working_copy_path.clone()`; the clone
+  itself is unavoidable because the value goes into a proto by
+  value. Not worth churning every call site.
 
 ## 11. fuser migration (deferred until perf matters)
 

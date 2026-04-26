@@ -180,8 +180,12 @@ impl BlockingJujutsuInterfaceClient {
         &self,
         working_copy_path: String,
     ) -> Result<tonic::Response<TreeId>, tonic::Status> {
-        let rt = self.rt.lock().unwrap();
+        // Acquire `client` before `rt` to match every other RPC method —
+        // single ordering avoids the latent two-mutex deadlock that
+        // would surface if the client is ever called concurrently
+        // (`BlockingJujutsuInterfaceClient` is `Clone + Send`).
         let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
         rt.block_on(client.get_empty_tree_id(GetEmptyTreeIdReq { working_copy_path }))
     }
 }

@@ -821,8 +821,10 @@ mod tests {
             .lookup(req(), ROOT_INODE, OsStr::new("hello.txt"))
             .await
             .unwrap();
-        let mut sa = SetAttr::default();
-        sa.size = Some(0);
+        let sa = SetAttr {
+            size: Some(0),
+            ..SetAttr::default()
+        };
         let after = fuse
             .setattr(req(), entry.attr.ino, None, sa)
             .await

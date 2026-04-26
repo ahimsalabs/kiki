@@ -5,22 +5,17 @@ use parking_lot::Mutex;
 use crate::ty::*;
 
 /// Stores mount-agnostic information like Trees or Commits. Unaware of filesystem information.
+///
+/// Fields are private; access goes through `get_*`/`write_*` methods
+/// so the in-memory `HashMap` backing can be swapped for `redb` / `sled`
+/// in Layer B without rewriting every call site.
 #[derive(Clone, Debug)]
 pub struct Store {
-    // Commits
-    pub commits: Arc<Mutex<HashMap<Id, Commit>>>,
-
-    /// File contents                                             
-    pub files: Arc<Mutex<HashMap<Id, File>>>,
-
-    /// Symlinks                                                  
-    pub symlinks: Arc<Mutex<HashMap<Id, Symlink>>>,
-
-    /// Trees
-    pub trees: Arc<Mutex<HashMap<Id, Tree>>>,
-
-    /// Empty sha identity                                        
-    pub empty_tree_id: Id,
+    commits: Arc<Mutex<HashMap<Id, Commit>>>,
+    files: Arc<Mutex<HashMap<Id, File>>>,
+    symlinks: Arc<Mutex<HashMap<Id, Symlink>>>,
+    trees: Arc<Mutex<HashMap<Id, Tree>>>,
+    empty_tree_id: Id,
 }
 
 impl Store {
@@ -73,6 +68,11 @@ impl Store {
     pub fn get_file(&self, id: Id) -> Option<File> {
         let file_store = self.files.lock();
         file_store.get(&id).cloned()
+    }
+
+    pub fn get_commit(&self, id: Id) -> Option<Commit> {
+        let commit_store = self.commits.lock();
+        commit_store.get(&id).cloned()
     }
 
     #[tracing::instrument]

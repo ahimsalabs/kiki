@@ -440,9 +440,8 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let commit_id: ty::Id = CommitId { commit_id: req.commit_id }
             .try_into()
             .map_err(decode_status("commit id"))?;
-        let commits = store.commits.lock();
-        let commit = commits
-            .get(&commit_id)
+        let commit = store
+            .get_commit(commit_id)
             .ok_or_else(|| Status::not_found(format!("commit {} not found", hex(&commit_id))))?;
         Ok(Response::new(commit.as_proto()))
     }

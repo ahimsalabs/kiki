@@ -177,7 +177,7 @@ impl VfsManager {
             // Receiver may have been dropped if `Initialize` was cancelled
             // mid-flight; that's harmless, but log so we don't leak a
             // mounted FS we have no way to refer to.
-            if let Err(_) = response.send(result) {
+            if response.send(result).is_err() {
                 warn!(path = %working_copy_path, "VfsManager bind result discarded — receiver dropped");
             }
         }
