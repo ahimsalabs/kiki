@@ -1,7 +1,7 @@
 # jj-yak: Implementation Plan
 
 Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 +
-M3 + M4 done.
+M3 + M4 + M5 done.
 Last updated: 2026-04-26
 
 This document captures the roadmap for getting jj-yak from "scaffold with
@@ -272,26 +272,76 @@ main,working_copy}.rs` (stamp `working_copy_path`, handle transport
 oneof, `mount_nfs` shellout on macOS), `cli/tests/common/mod.rs`
 (set `disable_mount = true`).
 
-### M5 — `check_out` writes files
+### M5 — `check_out` writes files ✅
 
-`LockedYakWorkingCopy::check_out` is `todo!` at `cli/src/working_copy.rs:262`.
-Flow:
+**Status: done.** Landed as `daemon: M5 — CheckOut RPC + JjYakFs::check_out`
+and `cli: M5 — call CheckOut from LockedYakWorkingCopy::check_out`.
 
-1. Get the new tree from `commit.tree()`.
-2. Send the tree id (and a list of changed paths) to the daemon via a new
+End-to-end shape:
+
+1. CLI: `LockedYakWorkingCopy::check_out` (`cli/src/working_copy.rs:339`)
+   pulls the resolved root `TreeId` out of `commit.tree()` and sends a
    `CheckOut` RPC.
-3. Daemon updates `Mount.root_tree_id` and notifies the VFS that the tree
-   changed.
-4. Clients see new files:
-   - **FUSE:** push invalidations via `notify_inval_inode` /
-     `notify_inval_entry` for the changed paths. Kernel re-reads on next
-     access.
-   - **NFS:** rely on attr-cache TTL (`actimeo=0` mount option) plus
-     bumped `mtime`/`ctime` on changed entries. Kernel re-stats on
-     access.
+2. Proto: new `CheckOut(CheckOutReq) returns (CheckOutReply)`. Req carries
+   `working_copy_path` + `new_tree_id`; reply is empty (reserved for
+   added/updated/removed counts once M6 gives us a real tree-diff).
+3. Daemon: `JujutsuService::check_out` clones the per-mount
+   `Arc<dyn JjYakFs>` out from under the lock, then calls
+   `JjYakFs::check_out(new_tree_id)`. `Mount.root_tree_id` is updated
+   only on success so the field never lies about what the kernel sees.
+4. `JjYakFs::check_out` (on `YakFs`): validates the tree exists in the
+   per-mount `Store` (miss → `failed_precondition` "call WriteTree
+   first") and re-roots the inode slab via `InodeSlab::swap_root`.
+5. `InodeSlab::swap_root` rewrites `ROOT_INODE`'s `NodeRef::Tree` and
+   clears the `(parent, name)` reverse cache. Non-root inode entries
+   stay live in `inodes` (orphaned but safe — `next_id` is monotonic so
+   the kernel never sees a recycled id). Tradeoff is more inode churn
+   per checkout; the slab is small per workspace, so we eat the cost.
 
-After M5, `jj new` populates the WC and `test_init` becomes a real
-end-to-end VFS round trip.
+**Conflicted trees rejected.** `Commit::tree().tree_ids()` returns
+`Merge<TreeId>`. Yak only handles the resolved single-id case today;
+multi-term merges return `CheckoutError::Other` ("checking out a
+conflicted tree is not yet supported"). Conflict materialization
+pairs with the conflict UI work — punted, not a blocker for the next
+milestones.
+
+**FUSE invalidation deferred.** The original M5 plan said "push
+invalidations via `notify_inval_inode` / `notify_inval_entry` for the
+changed paths". `fuse3::raw::Session::get_notify` is `fn` (not `pub
+fn`) in fuse3 0.8.1, and `MountHandle` doesn't re-expose it — there's
+no public API to push invalidations from outside the crate. Options:
+
+- (a) PR upstream to make `Session::get_notify` `pub`. Easiest fix,
+  blocks on review.
+- (b) Fork or vendor fuse3.
+- (c) Switch to `fuser` (sync) and rebuild the trait surface.
+
+Punt: integration tests use `disable_mount = true`, so the kernel
+never sees the mount and stale-attr windows don't matter for testing.
+Real users today would see up to 60s (the `TTL` in `fuse_adapter.rs`)
+of stale `getattr`/`lookup` after a `check_out`. Decide before turning
+`disable_mount = false` (which is M6's job).
+
+**Tests:** +5 daemon unit tests (39 → 44):
+`vfs::yak_fs::check_out_swaps_visible_tree`,
+`vfs::yak_fs::check_out_unknown_tree_is_store_miss`,
+`vfs::inode::swap_root_updates_root_and_clears_reverse_cache`,
+`service::check_out_updates_root_tree_and_validates_input`,
+`service::check_out_without_mount_is_not_found`. CLI integration
+suite goes 3 passed + 3 ignored → 4 passed + 2 ignored:
+`test_repos_are_independent` is unblocked (`jj new` round-trips
+through `CheckOut` against per-mount Stores).
+`test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
+stay ignored on M6 (need the VFS write path to capture on-disk writes
+into a tree).
+
+**Scope (actual):** ~430 LoC net across `proto/jj_interface.proto`
+(new `CheckOut` rpc + `CheckOutReq`/`Reply`),
+`daemon/src/vfs/{inode,yak_fs,mod}.rs` (trait method, `swap_root`,
+`FsError` re-export), `daemon/src/service.rs` (per-mount `fs:
+Arc<dyn JjYakFs>`, `check_out` handler, +2 unit tests),
+`cli/src/{blocking_client,working_copy}.rs` (RPC shim + the actual
+implementation), `cli/tests/test_init.rs` (un-ignore one test).
 
 ### M6 — VFS write path + snapshot
 
@@ -548,30 +598,50 @@ Worth doing in passing, not blocking:
    (Layer C), how do snapshot/checkout serialize against the shared
    remote? Deferrable past M6 — local mounts are independent until
    Layer C couples them.
+9. **FUSE invalidation API.** Surfaced by M5: `fuse3 0.8.1`'s
+   `Session::get_notify` is private, so the daemon has no way to push
+   `notify_inval_*` to the kernel after `check_out`. Three options
+   (see M5 §"FUSE invalidation deferred"): upstream PR to make it
+   `pub`, fork/vendor fuse3, or switch transport library. **Decide
+   before flipping `disable_mount = false`** — without it, real
+   users see up to 60s of stale `getattr`/`lookup` after a checkout.
 
 ## 8. Recommended starting point
 
-**M1, M2, and M3 are done.** Per-mount state lives in the daemon, a
-fresh `jj yak init` routes through `YakWorkingCopyFactory`, and the
-VFS read path is implemented behind `JjYakFs` with both NFS and FUSE
-adapters. The trait + adapters are unit-tested end-to-end (lookup,
-getattr, read, readdir, readlink) over a synthetic in-memory tree;
-nothing is mounted yet because `Bind` is still not sent.
+**M1–M5 are done.** Per-mount state lives in the daemon, `jj yak init`
+routes through `YakWorkingCopyFactory`, the VFS read path is
+implemented behind `JjYakFs` with both NFS and FUSE adapters,
+`Initialize` mounts a real FUSE filesystem on Linux (NFS port on
+macOS), and `LockedYakWorkingCopy::check_out` swaps the mount's root
+tree via the new `CheckOut` RPC. The currently-ignored
+`test_repos_are_independent` is now green; `jj new` exercises the
+checkout path end-to-end against per-mount Stores.
 
-**Next: M5 — `check_out` writes files.** `LockedYakWorkingCopy::check_out`
-at `cli/src/working_copy.rs:339` is still `todo!`. Punch list:
+**Next: M6 — VFS write path + `Snapshot`.** Implement `write` /
+`create` / `remove` / `mkdir` / `setattr` on the `JjYakFs` trait so
+both adapters (FUSE / NFS) can serve mutations. Each op mutates an
+in-memory tree under the `Mount`; `Snapshot` collapses the
+accumulated writes into a fresh `root_tree_id` and writes any new
+file/symlink/tree blobs to the per-mount `Store` so the next
+`CheckOut` can see them. Punch list:
 
-1. CLI side: send a new `CheckOut` RPC carrying the new `tree_id` (and
-   maybe a list of changed paths to scope invalidations). Daemon
-   responds with the new root tree id once the VFS has switched over.
-2. Daemon: update `Mount.root_tree_id`. On Linux, push FUSE
-   invalidations via `notify_inval_inode` / `notify_inval_entry` so
-   the kernel re-reads on next access. On macOS, bump `mtime`/`ctime`
-   on changed entries and rely on `actimeo=0` to revalidate.
-3. Once writes also work (M6), flip `disable_mount` off in
-   `cli/tests/common/mod.rs` and re-enable the three `#[ignore]`d
-   integration tests in `cli/tests/test_init.rs`.
+1. **VFS write ops.** Add the mutating methods to `JjYakFs`, mirror
+   in both adapters. Each adapter's existing `Filesystem` /
+   `NFSFileSystem` impl currently returns ROFS / ENOSYS for these —
+   replace with real dispatch.
+2. **Mount-side write log.** Each write updates an in-memory overlay
+   on top of the checked-out tree (or directly mutates a per-mount
+   working tree representation). Decide between (a) a per-Mount
+   pending tree object that `Snapshot` walks, or (b) eager tree
+   writes to the Store with a "dirty" id stamp on the Mount.
+3. **`Snapshot` RPC.** Currently returns `Mount.root_tree_id`
+   verbatim — make it return the rolled-up post-write tree id.
+   Coordinate with §7 decision 7 (fsmonitor strategy) before
+   freezing the contract.
+4. **Flip `disable_mount` off** in `cli/tests/common/mod.rs` once
+   FUSE invalidation is decided (§7 decision 9). That re-enables
+   `test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
+   end-to-end.
 
-After M5, `jj new` populates the WC. The currently-ignored
-`test_repos_are_independent` should turn green, modulo whether `.jj/`
-writes also need M6 (likely yes — `jj new` writes ops too).
+After M6, `jj describe` / `jj st` work end-to-end. **First point at
+which jj-yak is a usable VCS** (per §2 M6).
