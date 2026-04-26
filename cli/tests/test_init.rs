@@ -136,11 +136,11 @@ fn test_repos_are_independent() {
     ");
 }
 
-// Round-trips through a real FUSE mount: needs `disable_mount = false`
-// in `cli/tests/common/mod.rs`, which is gated on (a) `.jj/`-vs-user
-// tree separation at snapshot time, and (b) the `@-` stale-tree bug
-// surfaced in the `jj new` flow. Tracked as PLAN §10 punch list.
-#[ignore = "needs M7: split .jj/ from user tree + investigate stale @-"]
+// Round-trips through a real FUSE mount: M7.1 splits `.jj/` from the
+// user tree at snapshot time and M7.2 keeps the operation-id chain
+// alive across `check_out`, so the daemon-backed working copy now
+// reproduces the same `jj file list -r @-` results as the local
+// backend.
 #[test]
 fn test_nested_tree_round_trips() {
     let test_env = TestEnvironment::default();
@@ -157,8 +157,7 @@ fn test_nested_tree_round_trips() {
     ");
 }
 
-// Same dependency as `test_nested_tree_round_trips` — needs M7.
-#[ignore = "needs M7: split .jj/ from user tree + investigate stale @-"]
+// Symlink round-trip companion to `test_nested_tree_round_trips`.
 #[cfg(unix)]
 #[test]
 fn test_symlink_tree_round_trips() {

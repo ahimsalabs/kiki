@@ -69,16 +69,17 @@ impl Default for TestEnvironment {
         // Initialize a isolated daemon for this env
         let daemon_config = config_dir.join("daemon.toml");
         let daemon_port: usize = thread_rng().gen_range(11000..21000);
-        // disable_mount=true keeps integration tests off the real FUSE
-        // path. Flipping to `false` is the M7 capstone now that
-        // `.jj/` separation (M7.1) and op_id propagation (M7.2) are in
-        // place — but the flip belongs to its own change so it can be
-        // reverted in isolation if it surfaces flakes on CI runners
-        // that lack `fusermount3`.
+        // disable_mount=false routes `.jj/` and user content through the
+        // daemon's FUSE adapter — the production-equivalent path that
+        // exercises M7.1 (split `.jj/` from the user tree) and M7.2
+        // (preserve subtree by_parent across `check_out` + propagate
+        // op_id from `finish`). Local CI runners need `fusermount3`
+        // available; on Linux distros that ship it as setuid (the
+        // common case) no extra setup is required.
         std::fs::write(
             &daemon_config,
             format!(
-                "grpc_addr = \"[::1]:{daemon_port}\"\ncache = \"{daemon_dir_str}\"\ndisable_mount = true\n[nfs]\nmin_port = 1100\nmax_port = 1200\n"
+                "grpc_addr = \"[::1]:{daemon_port}\"\ncache = \"{daemon_dir_str}\"\ndisable_mount = false\n[nfs]\nmin_port = 1100\nmax_port = 1200\n"
             ),
         )
         .expect("Failed to write daemon config toml for testing setup");
