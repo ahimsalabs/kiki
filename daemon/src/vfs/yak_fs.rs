@@ -32,10 +32,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 
 use crate::store::Store;
 use crate::ty::{File, Id, Symlink, Tree, TreeEntry, TreeEntryMapping};
 use crate::vfs::inode::{Inode, InodeId, InodeSlab, NodeRef, ROOT_INODE};
+
+/// Reserved name for jj's metadata directory at the root of the working
+/// copy. Pinned by `YakFs` outside the content-addressed user tree:
+/// created on first access, preserved across `check_out`, and excluded
+/// from `snapshot`'s rollup. See `YakFs::jj_subtree`.
+const JJ_DIR: &str = ".jj";
 
 /// Kind of filesystem object. Smaller than the NFS `ftype3` and FUSE
 /// `FileType` enums; we never serve block/char/socket/fifo nodes.
@@ -241,10 +248,31 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
 }
 
 /// Concrete `JjYakFs` backed by a [`Store`] and the inode slab.
+///
+/// ## Pinned `.jj/` subtree (M7)
+///
+/// `.jj/` lives outside the content-addressed user tree managed by the
+/// slab's root. The first `mkdir(root, ".jj")` allocates an inode and
+/// stashes it in [`jj_subtree`](Self::jj_subtree); subsequent
+/// `lookup`/`readdir`/etc. at the root short-circuit through that
+/// pointer rather than going through the slab's regular root-children
+/// map. `snapshot` walks root's children excluding `.jj`, so the tree
+/// id returned to jj-lib never contains daemon-managed metadata.
+/// `check_out` runs `swap_root` to re-root the user tree but leaves
+/// `jj_subtree` untouched, so daemon-managed state survives a check-out.
+///
+/// This trades one special-case branch in each per-root op for not
+/// having to thread a separate keyspace through the whole adapter
+/// stack — the right shape until Layer C makes the storage location of
+/// `.jj/` matter (PLAN §10.1 option (a) → (b) migration).
 #[derive(Debug)]
 pub struct YakFs {
     store: Arc<Store>,
     slab: InodeSlab,
+    /// Inode id of the pinned `.jj/` subtree, if jj-lib has created one.
+    /// `None` until the first `mkdir(root, ".jj")`. See type-level docs
+    /// for why this is separate from the slab's root children.
+    jj_subtree: Mutex<Option<InodeId>>,
 }
 
 impl YakFs {
@@ -258,7 +286,19 @@ impl YakFs {
         YakFs {
             store,
             slab: InodeSlab::new(root_tree),
+            jj_subtree: Mutex::new(None),
         }
+    }
+
+    /// Returns the pinned `.jj/` inode if it exists.
+    fn jj_subtree(&self) -> Option<InodeId> {
+        *self.jj_subtree.lock()
+    }
+
+    /// True when `(parent, name)` addresses the pinned `.jj/` slot —
+    /// either currently populated or about to be by a `mkdir`.
+    fn is_jj_root(&self, parent: InodeId, name: &str) -> bool {
+        parent == self.root() && name == JJ_DIR
     }
 
     fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
@@ -352,9 +392,59 @@ impl YakFs {
         }
     }
 
+    /// Detach a slab-attached child of `parent` by `name`, enforcing
+    /// the rmdir-empty rule. Sync because every backing op is sync —
+    /// shared between the trait's async `remove` and the pinned-`.jj/`
+    /// fall-through.
+    fn remove_from_slab(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
+        // Materialize the parent so we can detach by name. If the named
+        // child is itself a directory, refuse on a non-empty body —
+        // mirrors POSIX `rmdir`.
+        self.ensure_dirty_tree(parent)?;
+
+        // Peek at the child to enforce the "directory must be empty" rule
+        // before we detach. Look up via the just-materialized
+        // `DirtyTree.children` instead of `lookup` — `lookup` is async
+        // and we'd still need the same data.
+        let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
+        let child_id = match parent_inode.node {
+            NodeRef::DirtyTree { ref children } => children
+                .get(name)
+                .copied()
+                .ok_or(FsError::NotFound)?,
+            // Parent was just materialized; anything else is a bug.
+            _ => return Err(FsError::NotADirectory),
+        };
+        let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
+        match &child.node {
+            NodeRef::DirtyTree { children } if !children.is_empty() => {
+                return Err(FsError::NotEmpty);
+            }
+            NodeRef::Tree(id) => {
+                // Empty check on a still-clean child directory: peek the
+                // tree without materializing.
+                let tree = self.read_tree(*id)?;
+                if !tree.entries.is_empty() {
+                    return Err(FsError::NotEmpty);
+                }
+            }
+            _ => {}
+        }
+
+        self.slab
+            .detach_child(parent, name)
+            .ok_or(FsError::NotFound)?;
+        Ok(())
+    }
+
     /// Look up a child by name in a (possibly clean) directory inode.
     /// Used by the write path's "does this name already exist?" check.
     fn child_exists(&self, parent: InodeId, name: &str) -> Result<bool, FsError> {
+        // Pinned `.jj/` shadows the user tree at the same name — and is
+        // visible whether or not the underlying root is dirty.
+        if self.is_jj_root(parent, name) && self.jj_subtree().is_some() {
+            return Ok(true);
+        }
         let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
         match parent_inode.node {
             NodeRef::DirtyTree { children } => Ok(children.contains_key(name)),
@@ -421,6 +511,11 @@ impl YakFs {
     ///
     /// Sync (no `.await`) so it can recurse without `Box::pin` /
     /// `async-recursion`. Store ops are sync since M6.
+    ///
+    /// At the root inode, an entry named `.jj` is excluded from the
+    /// emitted tree — daemon-managed metadata never appears in the
+    /// content-addressed user tree (PLAN §10.1). The pinned subtree
+    /// itself is cleaned separately by [`Self::snapshot`].
     fn snapshot_node(&self, ino: InodeId) -> Result<Id, FsError> {
         let inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
         match inode.node {
@@ -448,8 +543,16 @@ impl YakFs {
                 // also the order we hash entries in (see Tree::ContentHash
                 // derivation in ty.rs) — so two equivalent dirty trees
                 // produce identical tree ids.
+                let is_root = ino == self.root();
                 let mut entries = Vec::with_capacity(children.len());
                 for (name, child_id) in children {
+                    // Defensive: with M7's `mkdir` short-circuit, `.jj`
+                    // never lands in root.children — but legacy slabs
+                    // (e.g. a tree checked out from a pre-M7 snapshot
+                    // that contained `.jj/`) might have one anyway.
+                    if is_root && name == JJ_DIR {
+                        continue;
+                    }
                     let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
                     let entry = match child.node {
                         NodeRef::Tree(id) => TreeEntry::TreeId(id),
@@ -487,6 +590,15 @@ impl YakFs {
 #[async_trait]
 impl JjYakFs for YakFs {
     async fn lookup(&self, parent: InodeId, name: &str) -> Result<InodeId, FsError> {
+        // Pinned `.jj/` shadows whatever the user tree has at the same
+        // name. If unpinned we fall through; legacy trees that contain
+        // a real `.jj` entry (snapshots taken before M7) still resolve
+        // until something writes through the daemon and pins it.
+        if self.is_jj_root(parent, name) {
+            if let Some(jj_ino) = self.jj_subtree() {
+                return Ok(jj_ino);
+            }
+        }
         let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
         match parent_inode.node {
             NodeRef::DirtyTree { children } => {
@@ -543,12 +655,23 @@ impl JjYakFs for YakFs {
 
     async fn readdir(&self, dir: InodeId) -> Result<Vec<DirEntry>, FsError> {
         let inode = self.slab.get(dir).ok_or(FsError::NotFound)?;
+        // Splice the pinned `.jj/` into the root listing. Any same-named
+        // entry in the user tree is shadowed (matches `lookup`).
+        let pinned_jj = if dir == self.root() {
+            self.jj_subtree()
+        } else {
+            None
+        };
         match inode.node {
             NodeRef::DirtyTree { children } => {
                 // For a dirty tree we already have authoritative
                 // (name -> inode) entries; just classify each one.
-                let mut out = Vec::with_capacity(children.len());
+                let mut out = Vec::with_capacity(children.len() + pinned_jj.is_some() as usize);
                 for (name, child_id) in children {
+                    if pinned_jj.is_some() && name == JJ_DIR {
+                        // pinned shadows; emit once below
+                        continue;
+                    }
                     let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
                     let kind = match child.node {
                         NodeRef::Tree(_) | NodeRef::DirtyTree { .. } => FileKind::Directory,
@@ -561,12 +684,22 @@ impl JjYakFs for YakFs {
                         kind,
                     });
                 }
+                if let Some(jj_ino) = pinned_jj {
+                    out.push(DirEntry {
+                        inode: jj_ino,
+                        name: JJ_DIR.to_owned(),
+                        kind: FileKind::Directory,
+                    });
+                }
                 Ok(out)
             }
             NodeRef::Tree(_) => {
                 let tree = self.dir_tree(&inode)?;
-                let mut out = Vec::with_capacity(tree.entries.len());
+                let mut out = Vec::with_capacity(tree.entries.len() + pinned_jj.is_some() as usize);
                 for mapping in &tree.entries {
+                    if pinned_jj.is_some() && mapping.name == JJ_DIR {
+                        continue;
+                    }
                     let kind = Self::entry_kind(&mapping.entry);
                     let node = Self::entry_to_node(&mapping.entry);
                     let id = self.slab.intern_child(dir, &mapping.name, || node);
@@ -574,6 +707,13 @@ impl JjYakFs for YakFs {
                         inode: id,
                         name: mapping.name.clone(),
                         kind,
+                    });
+                }
+                if let Some(jj_ino) = pinned_jj {
+                    out.push(DirEntry {
+                        inode: jj_ino,
+                        name: JJ_DIR.to_owned(),
+                        kind: FileKind::Directory,
                     });
                 }
                 Ok(out)
@@ -633,6 +773,32 @@ impl JjYakFs for YakFs {
     }
 
     async fn mkdir(&self, parent: InodeId, name: &str) -> Result<(InodeId, Attr), FsError> {
+        // Pinned `.jj/` slot — bypass the regular slab attachment so the
+        // directory survives `swap_root` and stays out of `snapshot`.
+        if self.is_jj_root(parent, name) {
+            let mut pinned = self.jj_subtree.lock();
+            if pinned.is_some() {
+                return Err(FsError::AlreadyExists);
+            }
+            // Validate the parent is a directory we *could* attach into,
+            // even though we don't actually attach. This matches the
+            // error contract callers see for non-pinned mkdirs.
+            let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
+            match parent_inode.node {
+                NodeRef::Tree(_) | NodeRef::DirtyTree { .. } => {}
+                _ => return Err(FsError::NotADirectory),
+            }
+            let child = self.slab.alloc(
+                parent,
+                name.to_owned(),
+                NodeRef::DirtyTree {
+                    children: std::collections::BTreeMap::new(),
+                },
+            );
+            *pinned = Some(child);
+            let attr = self.attr_for(child)?;
+            return Ok((child, attr));
+        }
         if self.child_exists(parent, name)? {
             return Err(FsError::AlreadyExists);
         }
@@ -741,44 +907,38 @@ impl JjYakFs for YakFs {
     }
 
     async fn remove(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
-        // Materialize the parent so we can detach by name. If the named
-        // child is itself a directory, refuse on a non-empty body —
-        // mirrors POSIX `rmdir`.
-        self.ensure_dirty_tree(parent)?;
-
-        // Peek at the child to enforce the "directory must be empty" rule
-        // before we detach. Look up via the just-materialized
-        // `DirtyTree.children` instead of `lookup` — `lookup` is async
-        // and we'd still need the same data.
-        let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
-        let child_id = match parent_inode.node {
-            NodeRef::DirtyTree { ref children } => children
-                .get(name)
-                .copied()
-                .ok_or(FsError::NotFound)?,
-            // Parent was just materialized; anything else is a bug.
-            _ => return Err(FsError::NotADirectory),
-        };
-        let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
-        match &child.node {
-            NodeRef::DirtyTree { children } if !children.is_empty() => {
-                return Err(FsError::NotEmpty)
-            }
-            NodeRef::Tree(id) => {
-                // Empty check on a still-clean child directory: peek the
-                // tree without materializing.
-                let tree = self.read_tree(*id)?;
-                if !tree.entries.is_empty() {
+        // Pinned `.jj/` removal: rmdir-empty guard, then clear the pin.
+        // The slab still owns the inode (orphaned, same as `detach_child`)
+        // so any cached kernel handle stays resolvable.
+        if self.is_jj_root(parent, name) {
+            let mut pinned = self.jj_subtree.lock();
+            let Some(jj_ino) = *pinned else {
+                // Fall through: maybe a legacy `.jj` lives in the user tree.
+                drop(pinned);
+                return self.remove_from_slab(parent, name);
+            };
+            let inode = self.slab.get(jj_ino).ok_or(FsError::NotFound)?;
+            match &inode.node {
+                NodeRef::DirtyTree { children } if !children.is_empty() => {
                     return Err(FsError::NotEmpty);
                 }
+                NodeRef::Tree(id) => {
+                    let tree = self.read_tree(*id)?;
+                    if !tree.entries.is_empty() {
+                        return Err(FsError::NotEmpty);
+                    }
+                }
+                NodeRef::DirtyTree { .. } => {}
+                _ => {
+                    // Pinned slot held a non-directory? Shouldn't happen
+                    // — `mkdir` is the only path that populates it.
+                    return Err(FsError::NotADirectory);
+                }
             }
-            _ => {}
+            *pinned = None;
+            return Ok(());
         }
-
-        self.slab
-            .detach_child(parent, name)
-            .ok_or(FsError::NotFound)?;
-        Ok(())
+        self.remove_from_slab(parent, name)
     }
 
     async fn rename(
@@ -788,6 +948,14 @@ impl JjYakFs for YakFs {
         new_parent: InodeId,
         new_name: &str,
     ) -> Result<(), FsError> {
+        // Refuse renames that would touch the pinned `.jj/` slot. The
+        // pin lives outside the slab's child maps so it can't simply be
+        // detached and reattached the way regular entries are. jj-lib
+        // never renames `.jj` itself, so blocking this is correct in
+        // practice and keeps the slab/pin invariants simple.
+        if self.is_jj_root(parent, name) || self.is_jj_root(new_parent, new_name) {
+            return Err(FsError::AlreadyExists);
+        }
         // Both parents need to be DirtyTree so we can mutate their
         // children maps. They might be the same inode (same-directory
         // rename — the common case for jj-lib's tmpfile→final swap).
@@ -883,7 +1051,16 @@ impl JjYakFs for YakFs {
     }
 
     async fn snapshot(&self) -> Result<Id, FsError> {
-        self.snapshot_node(self.root())
+        let user_root = self.snapshot_node(self.root())?;
+        // Clean the pinned `.jj/` subtree's dirty buffers too so memory
+        // doesn't accumulate across snapshots. The result tree id is
+        // discarded — `.jj/` lives outside the user-tree rollup. Any
+        // failure here is surfaced to the caller; we'd rather refuse a
+        // snapshot than leave the slab in a half-clean state.
+        if let Some(jj_ino) = self.jj_subtree() {
+            let _ = self.snapshot_node(jj_ino)?;
+        }
+        Ok(user_root)
     }
 }
 
@@ -1379,5 +1556,193 @@ mod tests {
         // Same inode id still resolves and reads.
         let (data, _) = fs.read(ino, 0, 1024).await.unwrap();
         assert_eq!(data, b"x");
+    }
+
+    // ----- M7.1 pinned `.jj/` tests ------------------------------------
+
+    /// `.jj/` created via `mkdir(root, ".jj")` is visible through
+    /// lookup/readdir but does NOT appear in the rolled-up snapshot tree.
+    #[tokio::test]
+    async fn jj_dir_excluded_from_snapshot() {
+        let store = Arc::new(Store::new());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+
+        // Create `.jj/` and a file inside it (matches what jj-lib does
+        // during `init_with_factories`).
+        let (jj_ino, attr) = fs.mkdir(fs.root(), ".jj").await.expect("mkdir .jj");
+        assert_eq!(attr.kind, FileKind::Directory);
+        let (jj_file, _) = fs
+            .create_file(jj_ino, "config.toml", false)
+            .await
+            .expect("create_file");
+        fs.write(jj_file, 0, b"[ui]\n").await.unwrap();
+
+        // Also create a real user file at the root.
+        let (user_file, _) = fs
+            .create_file(fs.root(), "README", false)
+            .await
+            .expect("create_file");
+        fs.write(user_file, 0, b"hi").await.unwrap();
+
+        // `.jj/` and `README` are both visible through readdir.
+        let mut listing = fs.readdir(fs.root()).await.unwrap();
+        listing.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<_> = listing.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec![".jj", "README"]);
+
+        // Lookup of `.jj` returns the pinned inode.
+        assert_eq!(fs.lookup(fs.root(), ".jj").await.unwrap(), jj_ino);
+
+        // Snapshot rolls up the user tree and excludes `.jj/`.
+        let new_root = fs.snapshot().await.expect("snapshot");
+        let tree = store.get_tree(new_root).expect("tree in store");
+        let names: Vec<_> = tree.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["README"], "snapshot must not contain .jj");
+
+        // Post-snapshot: `.jj/` is still visible and its file still reads.
+        assert_eq!(fs.lookup(fs.root(), ".jj").await.unwrap(), jj_ino);
+        let (data, _) = fs.read(jj_file, 0, 1024).await.unwrap();
+        assert_eq!(data, b"[ui]\n");
+    }
+
+    /// Pinned `.jj/` must survive a `check_out` to a different user
+    /// tree. The user tree changes; the daemon-managed metadata stays.
+    #[tokio::test]
+    async fn jj_dir_survives_check_out() {
+        let store = Arc::new(Store::new());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+
+        // Set up a `.jj/` with some content.
+        let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
+        let (jj_file, _) = fs.create_file(jj_ino, "marker", false).await.unwrap();
+        fs.write(jj_file, 0, b"present").await.unwrap();
+
+        // Build a user tree separately and check it out.
+        let only_a = store.write_file(File {
+            content: b"a".to_vec(),
+        });
+        let tree_a = store.write_tree(Tree {
+            entries: vec![TreeEntryMapping {
+                name: "only-a.txt".into(),
+                entry: TreeEntry::File {
+                    id: only_a,
+                    executable: false,
+                    copy_id: Vec::new(),
+                },
+            }],
+        });
+        fs.check_out(tree_a).await.expect("check_out");
+
+        // After check_out: user content reflects tree_a; `.jj/` still
+        // resolves to the same pinned inode and its content is intact.
+        fs.lookup(fs.root(), "only-a.txt")
+            .await
+            .expect("user content visible");
+        assert_eq!(fs.lookup(fs.root(), ".jj").await.unwrap(), jj_ino);
+        let (data, _) = fs.read(jj_file, 0, 1024).await.unwrap();
+        assert_eq!(data, b"present");
+
+        // readdir at root mixes the user tree with the pin.
+        let mut listing = fs.readdir(fs.root()).await.unwrap();
+        listing.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<_> = listing.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec![".jj", "only-a.txt"]);
+    }
+
+    /// `mkdir(root, ".jj")` twice fails AlreadyExists. Same goes for
+    /// `create_file` / `symlink` against the pinned name.
+    #[tokio::test]
+    async fn jj_dir_pin_is_unique() {
+        let store = Arc::new(Store::new());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        fs.mkdir(fs.root(), ".jj").await.expect("mkdir .jj");
+        let err = fs.mkdir(fs.root(), ".jj").await.expect_err("dup mkdir");
+        assert_eq!(err, FsError::AlreadyExists);
+        let err = fs
+            .create_file(fs.root(), ".jj", false)
+            .await
+            .expect_err("file collides with pin");
+        assert_eq!(err, FsError::AlreadyExists);
+    }
+
+    /// Pre-existing `.jj` in a checked-out tree (legacy snapshot) is
+    /// visible until something pins our own — at which point the pin
+    /// shadows it. Drives the migration story for snapshots taken
+    /// before M7.
+    #[tokio::test]
+    async fn pre_existing_jj_is_shadowed_by_pin() {
+        let store = Arc::new(Store::new());
+        // Build a synthetic legacy tree containing `.jj` as a file.
+        let legacy_id = store.write_file(File {
+            content: b"legacy".to_vec(),
+        });
+        let legacy_tree = store.write_tree(Tree {
+            entries: vec![TreeEntryMapping {
+                name: ".jj".into(),
+                entry: TreeEntry::File {
+                    id: legacy_id,
+                    executable: false,
+                    copy_id: Vec::new(),
+                },
+            }],
+        });
+        let fs = YakFs::new(store.clone(), legacy_tree);
+
+        // Without a pin, lookup of `.jj` falls through to the user tree
+        // and returns the legacy file.
+        let legacy_ino = fs.lookup(fs.root(), ".jj").await.expect("legacy lookup");
+        let attr = fs.getattr(legacy_ino).await.unwrap();
+        assert_eq!(attr.kind, FileKind::Regular);
+
+        // Pinning a new `.jj/` shadows the legacy entry.
+        let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.expect("mkdir pin");
+        assert_eq!(fs.lookup(fs.root(), ".jj").await.unwrap(), jj_ino);
+    }
+
+    /// `remove(root, ".jj")` clears the pin when the directory is empty
+    /// and refuses with NotEmpty when it isn't.
+    #[tokio::test]
+    async fn jj_dir_remove_respects_rmdir_empty() {
+        let store = Arc::new(Store::new());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
+        fs.create_file(jj_ino, "f", false).await.unwrap();
+        let err = fs.remove(fs.root(), ".jj").await.unwrap_err();
+        assert_eq!(err, FsError::NotEmpty);
+
+        fs.remove(jj_ino, "f").await.expect("remove inner");
+        fs.remove(fs.root(), ".jj").await.expect("remove pin");
+        // Pin cleared: lookup is NotFound (no legacy fall-through here).
+        let err = fs.lookup(fs.root(), ".jj").await.unwrap_err();
+        assert_eq!(err, FsError::NotFound);
+    }
+
+    /// Snapshot cleans dirty buffers inside the pinned subtree even
+    /// though the resulting tree id is discarded — keeps memory bounded
+    /// across many `.jj/` writes.
+    #[tokio::test]
+    async fn jj_dir_dirty_buffers_cleaned_on_snapshot() {
+        let store = Arc::new(Store::new());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
+        let (file_ino, _) = fs.create_file(jj_ino, "config", false).await.unwrap();
+        fs.write(file_ino, 0, b"settings").await.unwrap();
+
+        // Snapshot returns the empty user tree (no `.jj/` rolled up).
+        let new_root = fs.snapshot().await.unwrap();
+        assert_eq!(new_root, store.get_empty_tree_id());
+
+        // The pinned subtree's slab entry is now clean (NodeRef::Tree
+        // resp. NodeRef::File). We assert this indirectly by checking
+        // the file is reachable through the store after snapshot —
+        // possible only if the dirty buffer was persisted.
+        let inode = fs.slab.get(file_ino).expect("inode survives");
+        match inode.node {
+            NodeRef::File { id, .. } => {
+                let f = store.get_file(id).expect("file persisted");
+                assert_eq!(f.content, b"settings");
+            }
+            other => panic!("expected clean File after snapshot, got {other:?}"),
+        }
     }
 }
