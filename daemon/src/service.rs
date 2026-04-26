@@ -110,6 +110,16 @@ impl JujutsuService {
             vfs_handle: None,
         }
     }
+
+    /// Test-only access to a mount's per-mount `JjYakFs`. Used to drive
+    /// VFS write ops directly from service-level tests without going
+    /// through a real FUSE/NFS adapter — e.g. to seed a dirty file, then
+    /// confirm the `Snapshot` RPC turns it into a real tree id.
+    #[cfg(test)]
+    async fn fs_for_test(&self, path: &str) -> Option<Arc<dyn JjYakFs>> {
+        let mounts = self.mounts.lock().await;
+        mounts.get(path).map(|m| m.fs.clone())
+    }
 }
 
 /// Mountpoint validation errors. Mapped onto `FailedPrecondition` so the
@@ -508,15 +518,45 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<SnapshotReq>,
     ) -> Result<Response<SnapshotReply>, Status> {
         let req = request.into_inner();
-        // M1 stub: there is no VFS write path yet, so a "snapshot" is just
-        // the currently-checked-out tree id. M6 will replace this with a
-        // real snapshot computed from the VFS write log.
-        let mounts = self.mounts.lock().await;
-        let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
-            Status::not_found(format!("no mount at {}", req.working_copy_path))
+
+        // Clone the per-mount FS handle out from under the lock so the
+        // (potentially I/O-heavy) snapshot walk doesn't hold it. Same
+        // pattern as `check_out`.
+        let fs = {
+            let mounts = self.mounts.lock().await;
+            let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
+                Status::not_found(format!("no mount at {}", req.working_copy_path))
+            })?;
+            mount.fs.clone()
+        };
+
+        let new_root = fs.snapshot().await.map_err(|e| {
+            Status::internal(format!(
+                "snapshot failed for {}: {e}",
+                req.working_copy_path
+            ))
         })?;
+
+        // Stamp the new root tree id back on the Mount so subsequent
+        // `GetTreeState`/`Snapshot` reads agree with what the VFS just
+        // produced. We do this *after* the snapshot succeeds — a
+        // half-snapshotted Mount.root_tree_id would lie about what the
+        // kernel sees through `fs`.
+        let mut mounts = self.mounts.lock().await;
+        if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
+            mount.root_tree_id = new_root.0.to_vec();
+        } else {
+            // Mount disappeared between the two locks; surface as
+            // not_found rather than internal-error so a transient race
+            // (no explicit Unmount today, but future-proof) is debuggable.
+            return Err(Status::not_found(format!(
+                "mount at {} disappeared during snapshot",
+                req.working_copy_path
+            )));
+        }
+
         Ok(Response::new(SnapshotReply {
-            tree_id: mount.root_tree_id.clone(),
+            tree_id: new_root.0.to_vec(),
         }))
     }
 
@@ -759,8 +799,10 @@ mod tests {
         assert_eq!(state.op_id, op_id);
         assert_eq!(state.workspace_id, workspace_id);
 
-        // Snapshot returns whatever the current root tree is (still the
-        // empty tree until M5/M6 change it).
+        // Snapshot of an unmodified mount returns the existing root
+        // (empty here since nothing has been written through the VFS).
+        // M6 made Snapshot drive `JjYakFs::snapshot`, but that walk is a
+        // no-op on a clean mount.
         let snap = svc
             .snapshot(Request::new(SnapshotReq {
                 working_copy_path: path,
@@ -998,6 +1040,71 @@ mod tests {
             .write_file(Request::new(WriteFileReq {
                 working_copy_path: "/never/initialized".into(),
                 data: b"hi".to_vec(),
+            }))
+            .await
+            .expect_err("expected not_found");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// End-to-end M6 Snapshot RPC: drive a write through the per-mount
+    /// `JjYakFs`, then call `Snapshot` and confirm the daemon both
+    /// returns the new root tree id and stamps it on `Mount.root_tree_id`
+    /// (so subsequent `GetTreeState` agrees).
+    #[tokio::test]
+    async fn snapshot_rpc_returns_new_tree_id_after_vfs_write() {
+        let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount(&svc, &path).await;
+
+        // Initial root tree is the empty tree.
+        let empty = svc
+            .get_empty_tree_id(Request::new(GetEmptyTreeIdReq {
+                working_copy_path: path.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Drive a write through the per-mount fs.
+        let fs = svc
+            .fs_for_test(&path)
+            .await
+            .expect("mount initialised above");
+        let (file_ino, _) = fs
+            .create_file(fs.root(), "hello.txt", false)
+            .await
+            .expect("create_file");
+        fs.write(file_ino, 0, b"hello").await.unwrap();
+
+        // Snapshot picks up the write and produces a fresh tree id.
+        let snap = svc
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: path.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_ne!(snap.tree_id, empty.tree_id);
+
+        // GetTreeState reflects the same id (Mount.root_tree_id was
+        // stamped on the success path).
+        let after = svc
+            .get_tree_state(Request::new(GetTreeStateReq {
+                working_copy_path: path,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(after.tree_id, snap.tree_id);
+    }
+
+    /// Snapshot against a missing mount must NotFound, mirroring CheckOut.
+    #[tokio::test]
+    async fn snapshot_without_mount_is_not_found() {
+        let svc = JujutsuService::bare();
+        let err = svc
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: "/never/initialized".into(),
             }))
             .await
             .expect_err("expected not_found");
