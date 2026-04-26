@@ -1,15 +1,27 @@
 //! `nfsserve::vfs::NFSFileSystem` adapter over [`JjYakFs`].
 //!
-//! Read ops dispatch into the trait; write ops still return ROFS until
-//! M5/M6 wires the VFS write path. This is the macOS primary path —
-//! Linux uses `vfs::fuse_adapter` once mount lands at M4 (see
-//! `docs/PLAN.md` §4.3).
+//! Read ops dispatch into the trait; write ops dispatch into the M6
+//! mutating surface (`create` / `mkdir` / `symlink` / `write` / `setattr`
+//! / `remove`). This is the macOS primary path — Linux uses
+//! `vfs::fuse_adapter` once mount lands at M4 (see `docs/PLAN.md` §4.3).
+//!
+//! NFS-specific quirks worth flagging:
+//!
+//! - `sattr3` carries each field inside a small "set or not" enum
+//!   (`set_mode3`, `set_size3`, …). The helpers at the bottom of this
+//!   module collapse those to `Option<T>` so the trait surface stays
+//!   protocol-agnostic.
+//! - `rename` is intentionally *not* implemented; jj's snapshot code
+//!   doesn't drive renames through the working copy, and editor temp-
+//!   file dances on macOS NFS are rare enough that "EROFS" is the right
+//!   answer until we hit a real consumer.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, mode3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
+    fattr3, fileid3, filename3, ftype3, mode3, nfspath3, nfsstat3, nfstime3, sattr3, set_gid3,
+    set_mode3, set_size3, set_uid3, specdata3,
 };
 use nfsserve::vfs::{
     DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities,
@@ -175,38 +187,88 @@ impl NFSFileSystem for NfsAdapter {
     }
 
     // ------------------------------------------------------------------
-    // Write side — all ROFS until M5/M6 wire the VFS write path.
+    // Write side (M6) — dispatches into JjYakFs.
     // ------------------------------------------------------------------
 
-    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        self.inner
+            .write(id, offset, data)
+            .await
+            .map_err(fs_err_to_nfs)?;
+        // NFS expects the post-write attrs back so the client doesn't
+        // need to round-trip a separate getattr.
+        let attr = self.inner.getattr(id).await.map_err(fs_err_to_nfs)?;
+        Ok(to_fattr3(attr))
     }
 
     async fn create(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
-        _attr: sattr3,
+        dirid: fileid3,
+        filename: &filename3,
+        attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let name = name_to_string(filename)?;
+        let executable = mode_executable(&attr);
+        let (id, a) = self
+            .inner
+            .create_file(dirid, &name, executable)
+            .await
+            .map_err(fs_err_to_nfs)?;
+        // NFS create can also carry a size — usually used for truncation
+        // of an O_TRUNC create. Apply it inline so the client doesn't
+        // need a separate setattr.
+        let a = if let Some(size) = size_value(&attr) {
+            self.inner
+                .setattr(id, Some(size), None)
+                .await
+                .map_err(fs_err_to_nfs)?
+        } else {
+            a
+        };
+        Ok((id, to_fattr3(a)))
     }
 
+    /// Exclusive create succeeds iff the name doesn't exist. Our
+    /// `create_file` is already exclusive (returns `AlreadyExists` on
+    /// collision), so this is a thin wrapper.
     async fn create_exclusive(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let name = name_to_string(filename)?;
+        let (id, _) = self
+            .inner
+            .create_file(dirid, &name, false)
+            .await
+            .map_err(fs_err_to_nfs)?;
+        Ok(id)
     }
 
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let executable = mode_value(&setattr).map(|m| (m & 0o111) != 0);
+        let size = size_value(&setattr);
+        // uid/gid/atime/mtime are silently ignored — see module doc
+        // (no on-tree representation for them).
+        let attr = self
+            .inner
+            .setattr(id, size, executable)
+            .await
+            .map_err(fs_err_to_nfs)?;
+        Ok(to_fattr3(attr))
     }
 
-    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let name = name_to_string(filename)?;
+        self.inner
+            .remove(dirid, &name)
+            .await
+            .map_err(fs_err_to_nfs)
     }
 
+    /// Rename isn't implemented yet — see module doc. Returning `ROFS`
+    /// rather than `NOTSUPP` because the latter trips macOS Finder into
+    /// a busy-wait retry loop.
     async fn rename(
         &self,
         _from_dirid: fileid3,
@@ -219,22 +281,68 @@ impl NFSFileSystem for NfsAdapter {
 
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let name = name_to_string(dirname)?;
+        let (id, attr) = self
+            .inner
+            .mkdir(dirid, &name)
+            .await
+            .map_err(fs_err_to_nfs)?;
+        Ok((id, to_fattr3(attr)))
     }
 
     async fn symlink(
         &self,
-        _dirid: fileid3,
-        _linkname: &filename3,
-        _symlink: &nfspath3,
+        dirid: fileid3,
+        linkname: &filename3,
+        symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let name = name_to_string(linkname)?;
+        let target = std::str::from_utf8(symlink.as_ref())
+            .map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        let (id, attr) = self
+            .inner
+            .symlink(dirid, &name, target)
+            .await
+            .map_err(fs_err_to_nfs)?;
+        Ok((id, to_fattr3(attr)))
     }
 }
+
+// ---- sattr3 helpers ----------------------------------------------------
+
+/// Pull a numeric mode out of an sattr3, if the caller set one.
+fn mode_value(attr: &sattr3) -> Option<mode3> {
+    match attr.mode {
+        set_mode3::mode(m) => Some(m),
+        set_mode3::Void => None,
+    }
+}
+
+/// Pull a target file size out of an sattr3, if the caller set one.
+fn size_value(attr: &sattr3) -> Option<u64> {
+    match attr.size {
+        set_size3::size(s) => Some(s),
+        set_size3::Void => None,
+    }
+}
+
+/// Whether the (optionally-set) mode bits make this an executable file.
+/// "No mode set" means "not executable" for create — matches the FUSE
+/// adapter's interpretation.
+fn mode_executable(attr: &sattr3) -> bool {
+    mode_value(attr).map(|m| (m & 0o111) != 0).unwrap_or(false)
+}
+
+// uid/gid setters are accepted on the wire but ignored end-to-end.
+// Keep the imports referenced so dead-code detection doesn't strip them.
+const _: fn() = || {
+    let _ = std::mem::size_of::<set_uid3>();
+    let _ = std::mem::size_of::<set_gid3>();
+};
 
 #[cfg(test)]
 mod tests {
@@ -301,13 +409,74 @@ mod tests {
         assert!(matches!(result.entries[0].attr.ftype, ftype3::NF3REG));
     }
 
+    /// `write` against a directory inode surfaces NFS3ERR_ISDIR (mapped
+    /// from `FsError::NotAFile`). Smoke-test that the M6 dispatch
+    /// reaches `JjYakFs::write` rather than short-circuiting at the
+    /// adapter level.
     #[tokio::test]
-    async fn write_side_is_rofs() {
+    async fn write_on_directory_is_isdir() {
         let nfs = build_adapter();
         let err = nfs
             .write(nfs.root_dir(), 0, b"x")
             .await
-            .expect_err("write must be ROFS until M5/M6");
-        assert!(matches!(err, nfsstat3::NFS3ERR_ROFS));
+            .expect_err("write to a directory must fail");
+        assert!(matches!(err, nfsstat3::NFS3ERR_ISDIR), "got {err:?}");
+    }
+
+    /// `create` + `write` round-trip via the NFS adapter: the new file is
+    /// addressable, its content is readable, and `getattr` reports the
+    /// post-write size.
+    #[tokio::test]
+    async fn create_then_write_then_read_round_trips() {
+        let nfs = build_adapter();
+        let attr = nfs
+            .create(
+                nfs.root_dir(),
+                &b"new.txt"[..].into(),
+                sattr3::default(),
+            )
+            .await
+            .expect("create");
+        let id = attr.0;
+        let post_attr = nfs.write(id, 0, b"hello").await.expect("write");
+        assert_eq!(post_attr.size, 5);
+        let (data, eof) = nfs.read(id, 0, 1024).await.expect("read");
+        assert_eq!(data, b"hello");
+        assert!(eof);
+    }
+
+    /// `mkdir` + `lookup` round-trip via the NFS adapter.
+    #[tokio::test]
+    async fn mkdir_then_lookup_round_trips() {
+        let nfs = build_adapter();
+        let (id, attr) = nfs
+            .mkdir(nfs.root_dir(), &b"sub"[..].into())
+            .await
+            .expect("mkdir");
+        assert!(matches!(attr.ftype, ftype3::NF3DIR));
+        let looked = nfs
+            .lookup(nfs.root_dir(), &b"sub"[..].into())
+            .await
+            .expect("lookup");
+        assert_eq!(looked, id);
+    }
+
+    /// `symlink` reports `NF3LNK` on getattr and the target survives a
+    /// readlink round-trip.
+    #[tokio::test]
+    async fn symlink_then_readlink_round_trips() {
+        let nfs = build_adapter();
+        let (id, attr) = nfs
+            .symlink(
+                nfs.root_dir(),
+                &b"link"[..].into(),
+                &b"target"[..].into(),
+                &sattr3::default(),
+            )
+            .await
+            .expect("symlink");
+        assert!(matches!(attr.ftype, ftype3::NF3LNK));
+        let target = nfs.readlink(id).await.expect("readlink");
+        assert_eq!(target.as_ref(), b"target");
     }
 }

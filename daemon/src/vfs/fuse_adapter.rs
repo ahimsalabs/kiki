@@ -1,20 +1,10 @@
 //! `fuse3::raw::Filesystem` adapter over [`JjYakFs`].
 //!
-//! Linux primary path. The mount itself is wired up at M4 (via
-//! `fuser`-equivalent of `Session::mount_with_unprivileged` from the
-//! `fuse3` crate); this module just provides the trait impl so that
-//! plumbing has something to feed.
-//!
-//! Until M4 hooks the adapter to a real `fuse3::Session`, nothing in the
-//! main binary instantiates `FuseAdapter`, which means the `dead_code`
-//! lint flags every helper in here. Suppress at module scope rather
-//! than littering each item — keeping the surface visible to grep
-//! beats chasing per-symbol allows.
-//!
-//! Read ops dispatch to `JjYakFs`. Mutations return ENOSYS until M5/M6
-//! land the VFS write path; opting out via the trait's defaults wouldn't
-//! work because we override `init`/`destroy` and want a single visible
-//! place for the whole adapter surface.
+//! Linux primary path. The kernel mount is wired up at M4
+//! (`Session::mount_with_unprivileged` from the `fuse3` crate). M5 added
+//! the check-out write path; M6 fills in the rest of the mutation
+//! surface (`create`, `mkdir`, `symlink`, `write`, `setattr`,
+//! `unlink`/`rmdir`).
 //!
 //! Notes on the fuse3 trait:
 //!
@@ -26,6 +16,9 @@
 //!   already returns the full listing.
 //! - The `.` and `..` entries are added by the adapter, not by `JjYakFs`,
 //!   because their inode numbers are protocol-specific.
+//! - `create` and `open` return a stateless `fh = 0`. The kernel echoes
+//!   it back on subsequent reads/writes; we don't track per-handle
+//!   state.
 
 #![allow(dead_code)]
 
@@ -36,11 +29,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fuse3::raw::reply::{
-    DirectoryEntry, FileAttr, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyInit,
-    ReplyOpen,
+    DirectoryEntry, FileAttr, ReplyAttr, ReplyCreated, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyInit, ReplyOpen, ReplyWrite,
 };
 use fuse3::raw::{Filesystem, Request};
-use fuse3::{Errno, FileType, Inode, Result as FuseResult, Timestamp};
+use fuse3::{Errno, FileType, Inode, Result as FuseResult, SetAttr, Timestamp};
 use futures::stream;
 
 use crate::vfs::yak_fs::{Attr, FileKind, FsError, JjYakFs};
@@ -299,6 +292,163 @@ impl Filesystem for FuseAdapter {
         })
     }
 
+    // ----- M6 write surface --------------------------------------------
+
+    /// Combined create-and-open. The kernel calls this for
+    /// `open(O_CREAT|O_WRONLY)` and similar. We synthesize the new file
+    /// honouring the executable bit from `mode`, then return a stateless
+    /// `fh = 0` so subsequent writes round-trip through `write`.
+    async fn create(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        _flags: u32,
+    ) -> FuseResult<ReplyCreated> {
+        let name = name_to_str(name)?;
+        // The full mode includes file-type bits we don't model. Mask down
+        // to the perm bits and treat any-execute as "executable".
+        let executable = (mode & 0o111) != 0;
+        // Inode id rides in the returned `attr` (`FileAttr.ino`); the
+        // `ReplyCreated` doesn't carry a separate inode field.
+        let (_ino, attr) = self
+            .inner
+            .create_file(parent, name, executable)
+            .await
+            .map_err(fs_err_to_errno)?;
+        Ok(ReplyCreated {
+            ttl: TTL,
+            attr: to_file_attr(attr),
+            generation: 0,
+            fh: 0,
+            flags: 0,
+        })
+    }
+
+    /// File-or-fifo create. The kernel falls back to `mknod` + `open` on
+    /// older kernels that don't support `create`. We only model regular
+    /// files; the device fields are ignored.
+    async fn mknod(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        _rdev: u32,
+    ) -> FuseResult<ReplyEntry> {
+        let name = name_to_str(name)?;
+        let executable = (mode & 0o111) != 0;
+        let (_ino, attr) = self
+            .inner
+            .create_file(parent, name, executable)
+            .await
+            .map_err(fs_err_to_errno)?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: to_file_attr(attr),
+            generation: 0,
+        })
+    }
+
+    async fn mkdir(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+    ) -> FuseResult<ReplyEntry> {
+        let name = name_to_str(name)?;
+        let (_ino, attr) = self
+            .inner
+            .mkdir(parent, name)
+            .await
+            .map_err(fs_err_to_errno)?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: to_file_attr(attr),
+            generation: 0,
+        })
+    }
+
+    async fn symlink(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        link: &OsStr,
+    ) -> FuseResult<ReplyEntry> {
+        let name = name_to_str(name)?;
+        let target = name_to_str(link)?;
+        let (_ino, attr) = self
+            .inner
+            .symlink(parent, name, target)
+            .await
+            .map_err(fs_err_to_errno)?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: to_file_attr(attr),
+            generation: 0,
+        })
+    }
+
+    async fn unlink(&self, _req: Request, parent: Inode, name: &OsStr) -> FuseResult<()> {
+        let name = name_to_str(name)?;
+        self.inner
+            .remove(parent, name)
+            .await
+            .map_err(fs_err_to_errno)
+    }
+
+    async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> FuseResult<()> {
+        let name = name_to_str(name)?;
+        self.inner
+            .remove(parent, name)
+            .await
+            .map_err(fs_err_to_errno)
+    }
+
+    async fn write(
+        &self,
+        _req: Request,
+        inode: Inode,
+        _fh: u64,
+        offset: u64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: u32,
+    ) -> FuseResult<ReplyWrite> {
+        let written = self
+            .inner
+            .write(inode, offset, data)
+            .await
+            .map_err(fs_err_to_errno)?;
+        Ok(ReplyWrite { written })
+    }
+
+    /// Maps `SetAttr.size` (truncate) and `SetAttr.mode` (chmod —
+    /// derived as "any execute bit"). Other fields (uid/gid/atime/mtime)
+    /// are silently no-ops because we don't model them.
+    async fn setattr(
+        &self,
+        _req: Request,
+        inode: Inode,
+        _fh: Option<u64>,
+        set_attr: SetAttr,
+    ) -> FuseResult<ReplyAttr> {
+        let executable = set_attr.mode.map(|m| (m & 0o111) != 0);
+        let attr = self
+            .inner
+            .setattr(inode, set_attr.size, executable)
+            .await
+            .map_err(fs_err_to_errno)?;
+        Ok(ReplyAttr {
+            ttl: TTL,
+            attr: to_file_attr(attr),
+        })
+    }
+
     type DirEntryPlusStream<'a>
         = stream::Empty<FuseResult<fuse3::raw::reply::DirectoryEntryPlus>>
     where
@@ -415,6 +565,88 @@ mod tests {
         // that's the value FUSE wants on the wire (kernel convention:
         // negative errno = error). The unsigned magnitude is what we
         // care about identifying.
+        let raw: i32 = err.into();
+        assert_eq!(raw.unsigned_abs() as i32, libc::ENOENT);
+    }
+
+    /// `create` + `write` + `read` round-trips through the FUSE
+    /// adapter's mode/flag plumbing. Smoke-tests that the M6 dispatch
+    /// reaches `JjYakFs` rather than short-circuiting at the adapter
+    /// surface.
+    #[tokio::test]
+    async fn create_then_write_then_read_round_trips() {
+        let fuse = build_adapter();
+        let created = fuse
+            .create(req(), ROOT_INODE, OsStr::new("new.txt"), 0o644, 0)
+            .await
+            .expect("create");
+        let written = fuse
+            .write(
+                req(),
+                created.attr.ino,
+                0,
+                0,
+                b"hello",
+                0,
+                0,
+            )
+            .await
+            .expect("write");
+        assert_eq!(written.written, 5);
+        let data = fuse
+            .read(req(), created.attr.ino, 0, 0, 1024)
+            .await
+            .expect("read");
+        assert_eq!(data.data.as_ref(), b"hello");
+    }
+
+    /// `mkdir` + `lookup` round-trip via the FUSE adapter, confirming
+    /// the new entry is addressable through the kernel-facing API.
+    #[tokio::test]
+    async fn mkdir_then_lookup_round_trips() {
+        let fuse = build_adapter();
+        let created = fuse
+            .mkdir(req(), ROOT_INODE, OsStr::new("sub"), 0o755, 0)
+            .await
+            .expect("mkdir");
+        assert_eq!(created.attr.kind, FileType::Directory);
+        let looked = fuse
+            .lookup(req(), ROOT_INODE, OsStr::new("sub"))
+            .await
+            .expect("lookup");
+        assert_eq!(looked.attr.ino, created.attr.ino);
+    }
+
+    /// `setattr(size=0)` truncates a file end-to-end through the FUSE
+    /// adapter. Editor `O_TRUNC` opens land here.
+    #[tokio::test]
+    async fn setattr_truncates_via_adapter() {
+        let fuse = build_adapter();
+        // `hello.txt` from build_adapter has 2 bytes of "hi". Truncate.
+        let entry = fuse
+            .lookup(req(), ROOT_INODE, OsStr::new("hello.txt"))
+            .await
+            .unwrap();
+        let mut sa = SetAttr::default();
+        sa.size = Some(0);
+        let after = fuse
+            .setattr(req(), entry.attr.ino, None, sa)
+            .await
+            .expect("setattr");
+        assert_eq!(after.attr.size, 0);
+    }
+
+    /// `unlink` removes a file; subsequent lookup returns ENOENT.
+    #[tokio::test]
+    async fn unlink_then_lookup_is_enoent() {
+        let fuse = build_adapter();
+        fuse.unlink(req(), ROOT_INODE, OsStr::new("hello.txt"))
+            .await
+            .expect("unlink");
+        let err = fuse
+            .lookup(req(), ROOT_INODE, OsStr::new("hello.txt"))
+            .await
+            .expect_err("ENOENT");
         let raw: i32 = err.into();
         assert_eq!(raw.unsigned_abs() as i32, libc::ENOENT);
     }
