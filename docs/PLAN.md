@@ -1,7 +1,9 @@
 # jj-yak: Implementation Plan
 
 Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 +
-M3 + M4 + M5 done.
+M3 + M4 + M5 + M6 done; the daemon-side VCS surface is feature-complete.
+Real-mount end-to-end (§7 decision 9 — FUSE invalidation) is the
+remaining gate before integration tests can run against a real mount.
 Last updated: 2026-04-26
 
 This document captures the roadmap for getting jj-yak from "scaffold with
@@ -343,16 +345,92 @@ Arc<dyn JjYakFs>`, `check_out` handler, +2 unit tests),
 `cli/src/{blocking_client,working_copy}.rs` (RPC shim + the actual
 implementation), `cli/tests/test_init.rs` (un-ignore one test).
 
-### M6 — VFS write path + snapshot
+### M6 — VFS write path + snapshot ✅
 
-Implement `write` / `create` / `remove` / `mkdir` / `setattr` on the
-`JjYakFs` trait. Each mutates an in-memory tree under the `Mount`. The
-ops land once on the trait and both adapters dispatch to them.
-`snapshot` RPC computes the current `root_tree_id` (or returns it cached
-if no writes since last snapshot).
+**Status: done.** Landed across `daemon: M6 — VFS write path on JjYakFs`,
+`daemon: M6 — wire adapters (FUSE + NFS) to JjYakFs write ops`, and
+`daemon: M6 — Snapshot RPC delegates to JjYakFs::snapshot`.
 
-After M6, `jj describe` / `jj st` work end-to-end. **First point at
-which jj-yak is a usable VCS.**
+End-to-end shape:
+
+1. **Trait surface** (`daemon/src/vfs/yak_fs.rs`). `JjYakFs` grew
+   `create_file` / `mkdir` / `symlink` / `write` / `setattr` / `remove`
+   / `snapshot`. Errors gained `AlreadyExists` and `NotEmpty` variants
+   for the create-collision and rmdir-non-empty paths. `setattr` only
+   honours `size` (truncate) and `executable` (chmod) — uid/gid/atime/
+   mtime are silently no-ops because we don't model them on the tree.
+   Rename intentionally not implemented (`NFS3ERR_ROFS` until a real
+   consumer cares — see `nfs_adapter.rs`).
+2. **Slab dirty variants** (`daemon/src/vfs/inode.rs`). `NodeRef`
+   gained `DirtyTree { children: BTreeMap }`, `DirtyFile { content,
+   executable }`, `DirtySymlink { target }` next to the existing clean
+   variants. New slab helpers: `replace_node`,
+   `materialize_dir_for_mutation` (clean→dirty promotion that allocates
+   child inodes and reuses already-cached ids), `attach_child` /
+   `detach_child` (parent's `(name → child)` map maintenance), and a
+   leaner `alloc` that no longer pre-registers `by_parent` (split from
+   `attach_child` so the caller can back out without leaving stale
+   entries).
+3. **Lazy promotion in `YakFs`.** First write touching a path promotes
+   that inode from clean to dirty by loading content from the per-mount
+   `Store`; subsequent writes mutate the in-memory buffer in place. The
+   `child_exists` pre-check on create/mkdir/symlink walks the
+   still-clean parent tree without forcing a materialize.
+4. **Snapshot is recursive sync** (`YakFs::snapshot_node`). Walks the
+   slab from `root`, persists every dirty blob into the per-mount
+   `Store`, and replaces dirty refs with their content-addressed
+   counterparts. **Inode ids are preserved across snapshot** so the
+   kernel never sees them change (no ESTALE). The walk is sync so it
+   can recurse without `Box::pin` / `async-recursion` — Store ops were
+   converted from spurious-async to plain sync in this milestone (none
+   of them ever awaited anything; see §5 below).
+5. **Adapter dispatch** (`daemon/src/vfs/{fuse,nfs}_adapter.rs`).
+   `fuse3::Filesystem` and `nfsserve::NFSFileSystem` mutating methods
+   that previously returned ENOSYS / NFS3ERR_ROFS now delegate into the
+   trait. The protocol-specific quirks live in the adapters: FUSE
+   `create` returns a stateless `fh = 0`; NFS pulls `mode`/`size` out of
+   the `set_*` enums on `sattr3` via small `mode_value`/`size_value`
+   helpers and applies any `O_TRUNC`-style size on the create path.
+6. **`Snapshot` RPC** (`daemon/src/service.rs`). No longer returns the
+   cached `Mount.root_tree_id`; clones the per-mount `Arc<dyn JjYakFs>`
+   out from under the lock, calls `JjYakFs::snapshot`, and stamps the
+   returned id back on `Mount.root_tree_id`. Mirrors the lock pattern
+   `CheckOut` set up at M5.
+
+**Determinism:** `DirtyTree.children` is a `BTreeMap`, so snapshot
+iterates entries in name-sorted order and `Tree::ContentHash` produces
+the same id regardless of write-insertion order. A unit test
+(`snapshot_is_deterministic_under_insertion_order`) pins this.
+
+**Tests:** 67 daemon unit tests pass (44 → 67 — added 6 inode-slab
+cases, 12 yak_fs write-path cases, 4 NFS adapter cases, 4 FUSE adapter
+cases, 2 service-level Snapshot RPC cases, plus a `fs_for_test` helper
+on `JujutsuService`). 8 cli unit tests pass. CLI integration tests
+unchanged: 2 still passed + 2 still ignored.
+
+**Why M6 didn't unblock the M5+M6-tagged integration tests:**
+`test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
+write through `std::fs::create_dir`/`std::fs::write` on the mount path.
+With `disable_mount = true` (the integration-test setting since M4),
+those calls go to the local disk — *not* through the daemon's VFS — so
+the daemon's snapshot has no view of them. Unblocking the tests
+requires flipping `disable_mount = false`, which depends on §7
+decision 9 (FUSE invalidation). See decision 9 below for the live
+options. Until then, the trait + RPC shape is exercised end-to-end via
+the `fs_for_test` helper in
+`service::tests::snapshot_rpc_returns_new_tree_id_after_vfs_write`.
+
+**Scope (actual):** ~1700 LoC net across `daemon/src/store.rs`
+(spurious-async removal), `daemon/src/vfs/inode.rs` (dirty NodeRef
+variants + materialize/attach/detach), `daemon/src/vfs/yak_fs.rs`
+(trait surface + YakFs impl + recursive snapshot + write-path tests),
+`daemon/src/vfs/{fuse,nfs}_adapter.rs` (write-method dispatch),
+`daemon/src/service.rs` (`Snapshot` RPC body + fs_for_test test
+helper).
+
+After M6 the daemon-side VCS surface is feature-complete; flipping
+`disable_mount = false` (§7 decision 9) is the last hop before
+`jj describe` / `jj st` round-trip end-to-end on a real mount.
 
 ## 3. What's deferred
 
@@ -520,6 +598,20 @@ here so reviewers can spot-check.
     upstream lore; verify against jj-lib's CHANGELOG before pre-emptively
     versioning the proto.
   - No `Taskfile.yml`. Adding one is on the hygiene list (§6).
+- **Spurious `async` on `Store` (folded in M6).** `Store::write_*` were
+  marked `async` but never awaited anything (their bodies are pure
+  `parking_lot::Mutex` locks). Kept misleading the trait-impl recursion
+  story in `JjYakFs::snapshot`; converted to plain sync at M6 so the
+  recursive `snapshot_node` walk doesn't need `Box::pin` /
+  `async-recursion`. Layer B (durable storage) may add real I/O to
+  these methods — switch back to async if/when that lands.
+- **NodeRef dirty variants (M6).** Original M6 sketch said "Each mutates
+  an in-memory tree under the `Mount`." The actual representation
+  layered the dirty side onto `NodeRef` itself (clean ⊎ dirty in the
+  same enum) rather than introducing a separate working-tree object.
+  Lazy promotion in `YakFs` (clean → dirty on first write touching a
+  path) means we only pay the buffer cost for paths the user is
+  actually editing.
 
 ## 6. Cross-cutting hygiene
 
@@ -586,62 +678,78 @@ Worth doing in passing, not blocking:
 
 ### Still open
 
-7. **fsmonitor strategy.** Blocks M6 (snapshot RPC contract). See §4.1.
-   Leaning toward (b) — daemon feeds jj a precomputed dirty set
-   out-of-band, since the FUSE/NFS write path already knows what was
-   written. **Punt:** decide while building M6, not before. Quick
-   upstream check at that point: does jj-lib's `WorkingCopy::snapshot`
-   already expose a hook we can override in `YakWorkingCopy` without
-   forking? If yes, (b) is essentially free.
+7. **fsmonitor strategy.** Resolved as a non-blocker by M6's actual
+   shape. The daemon's VFS owns every write, so snapshot doesn't need
+   fsmonitor at all — `JjYakFs::snapshot` walks the slab and produces
+   the rolled-up tree id directly. (Option (b) from §4.1 in spirit:
+   daemon already knows what's dirty; jj-lib never has to scan.) Real
+   integration with `WorkingCopy::snapshot` happens via the existing
+   `LockedYakWorkingCopy::snapshot` → `snapshot_via_daemon` path; no
+   jj-lib hook override required.
 8. **Concurrency model.** Multiple `Mount`s, each now with its own
    `Store` (decision 4). If two mounts point at the same remote
    (Layer C), how do snapshot/checkout serialize against the shared
    remote? Deferrable past M6 — local mounts are independent until
    Layer C couples them.
-9. **FUSE invalidation API.** Surfaced by M5: `fuse3 0.8.1`'s
-   `Session::get_notify` is private, so the daemon has no way to push
-   `notify_inval_*` to the kernel after `check_out`. Three options
-   (see M5 §"FUSE invalidation deferred"): upstream PR to make it
-   `pub`, fork/vendor fuse3, or switch transport library. **Decide
-   before flipping `disable_mount = false`** — without it, real
-   users see up to 60s of stale `getattr`/`lookup` after a checkout.
+9. **FUSE invalidation API. ← still the gating decision.** `fuse3
+   0.8.1`'s `Session::get_notify` is `pub(crate)`, so the daemon has no
+   public API to push `notify_inval_inode` / `notify_inval_entry` after
+   `check_out` or `snapshot`. Without it, real users see up to 60s
+   (the `TTL` in `fuse_adapter.rs`) of stale `getattr`/`lookup` after
+   a daemon-side mutation. Options:
+   - **(a) Upstream PR to make `Session::get_notify` `pub`.** Smallest
+     surface, depends on review velocity. Likely minutes of code, days
+     of latency.
+   - **(b) Fork/vendor `fuse3`.** Cuts the dependency chain but
+     introduces a fork to maintain. Ugly but unblocking.
+   - **(c) Switch to `fuser`.** Sync trait surface; would touch the
+     adapter shape but not the trait. Largest LoC delta.
+   This decision blocks flipping `disable_mount = false` in
+   `cli/tests/common/mod.rs`, which in turn blocks the M5+M6-tagged
+   `test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
+   from running end-to-end. **The trait-and-RPC layer is provably
+   correct without this** (covered by `service::tests::snapshot_rpc_*`
+   and the YakFs/adapter unit tests); the gap is purely about kernel
+   cache invalidation visible to a real `cat` / `ls` after a
+   daemon-side snapshot or checkout.
 
 ## 8. Recommended starting point
 
-**M1–M5 are done.** Per-mount state lives in the daemon, `jj yak init`
-routes through `YakWorkingCopyFactory`, the VFS read path is
-implemented behind `JjYakFs` with both NFS and FUSE adapters,
-`Initialize` mounts a real FUSE filesystem on Linux (NFS port on
-macOS), and `LockedYakWorkingCopy::check_out` swaps the mount's root
-tree via the new `CheckOut` RPC. The currently-ignored
-`test_repos_are_independent` is now green; `jj new` exercises the
-checkout path end-to-end against per-mount Stores.
+**M1–M6 are done.** The daemon-side VCS surface is feature-complete:
+per-mount state, `jj yak init` routing, both NFS and FUSE adapters
+implementing the full read+write surface, real FUSE mount on Linux
+(NFS on macOS), `CheckOut` swapping the visible root, and `Snapshot`
+walking the slab to produce a rolled-up root tree id from in-memory
+dirty buffers. The trait + RPC layer is exercised end-to-end by
+`service::tests::snapshot_rpc_returns_new_tree_id_after_vfs_write`.
 
-**Next: M6 — VFS write path + `Snapshot`.** Implement `write` /
-`create` / `remove` / `mkdir` / `setattr` on the `JjYakFs` trait so
-both adapters (FUSE / NFS) can serve mutations. Each op mutates an
-in-memory tree under the `Mount`; `Snapshot` collapses the
-accumulated writes into a fresh `root_tree_id` and writes any new
-file/symlink/tree blobs to the per-mount `Store` so the next
-`CheckOut` can see them. Punch list:
+**Next: decide §7 #9 (FUSE invalidation), then flip
+`disable_mount = false`.** Until that flip, `std::fs::write` /
+`std::fs::create_dir` from the integration tests go to the local
+disk instead of through our daemon's VFS, so
+`test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
+stay `#[ignore]`. Pick (a) upstream PR, (b) fork `fuse3`, or (c)
+switch to `fuser` — see §7 #9 for the trade-offs.
 
-1. **VFS write ops.** Add the mutating methods to `JjYakFs`, mirror
-   in both adapters. Each adapter's existing `Filesystem` /
-   `NFSFileSystem` impl currently returns ROFS / ENOSYS for these —
-   replace with real dispatch.
-2. **Mount-side write log.** Each write updates an in-memory overlay
-   on top of the checked-out tree (or directly mutates a per-mount
-   working tree representation). Decide between (a) a per-Mount
-   pending tree object that `Snapshot` walks, or (b) eager tree
-   writes to the Store with a "dirty" id stamp on the Mount.
-3. **`Snapshot` RPC.** Currently returns `Mount.root_tree_id`
-   verbatim — make it return the rolled-up post-write tree id.
-   Coordinate with §7 decision 7 (fsmonitor strategy) before
-   freezing the contract.
-4. **Flip `disable_mount` off** in `cli/tests/common/mod.rs` once
-   FUSE invalidation is decided (§7 decision 9). That re-enables
-   `test_nested_tree_round_trips` and `test_symlink_tree_round_trips`
-   end-to-end.
+**After that gate clears: Layer B — durable storage.** The per-mount
+`HashMap<Id, …>` `Store` loses everything on daemon restart (M6's
+snapshot-cleans-the-slab pattern means even an in-flight write is
+durable across `Snapshot` calls but not across daemon restarts).
+Pick `redb` or `sled`, swap the `HashMap` impls behind the same
+sync API, and the Mount-id derivation in §7 decision 6 becomes
+necessary so kernel handles survive restart.
 
-After M6, `jj describe` / `jj st` work end-to-end. **First point at
-which jj-yak is a usable VCS** (per §2 M6).
+**Hygiene to fold in around Layer B:**
+
+- **Inode handle stability across restarts** (§7 decision 6).
+  Implementation lands alongside Layer B; the slab API is already the
+  right shape, just swap the id source from monotonic `next_id` to a
+  derived `(parent_tree_id, name)` hash.
+- **`unwrap()` audit.** Acceptable while the daemon is single-developer,
+  but tighter error-mapping should land before any user touches the
+  daemon (`BackendError::Other` / `WorkingCopyStateError::Other`
+  passthrough at every boundary).
+- **Delete `server/` crate.** Three lines of "Hello, world!"; just
+  remove from `Cargo.toml`.
+- **Tracing for the CLI.** Daemon already has it; CLI gets `RUST_LOG`
+  setup that helps debug snapshot/checkout RPC traffic.
