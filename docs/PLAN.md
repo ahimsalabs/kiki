@@ -1,6 +1,6 @@
 # jj-yak: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 done.
+Status: active. Transport architecture decided (§4.3 Path C). M1 + M2 + M3 done.
 Last updated: 2026-04-25
 
 This document captures the roadmap for getting jj-yak from "scaffold with
@@ -117,28 +117,64 @@ only `yak status`. Corrected.
 missed — the breakages are exactly the M5/M6 surfaces the next milestones
 are scoped to fill. Fix is documentary, not code.
 
-### M3 — VFS read path
+### M3 — VFS read path ✅
 
-Refactor `daemon/src/vfs.rs` along §4.3:
+**Status: done.** Landed as `daemon: M3 — split vfs.rs into JjYakFs
+trait + NFS adapter` and `daemon: M3 — add fuse3 dep and FuseAdapter
+(Linux primary path)`.
 
-1. Extract a `JjYakFs` trait shaped like the current `NFSFileSystem` impl
-   (which is mostly already the right shape, just renamed).
-2. Move the inode/tree state into the trait's owning type. Add a slab of
-   `Inode` entries that lazily expands as paths are walked, keyed by
-   `fileid3`-equivalent u64. The slab is the canonical state; both
-   adapters read from it.
-3. Add two adapters:
-   - `impl nfsserve::NFSFileSystem` — keep current scaffolding.
-   - `impl fuse3::Filesystem` — new. Pulls in `fuse3` as a workspace dep.
-4. Implement the read ops on the trait:
-   - `lookup(dirid, name)` — walk into a tree by component
-   - `getattr(id)` — file/dir mode + size
-   - `read(id, offset, count)` — pull file from `Store`
-   - `readdir(dirid, ...)` — list tree entries
+`daemon/src/vfs.rs` is now a directory:
 
-Once M3 lands you can mount the export — Linux via FUSE, macOS via NFS —
-and `ls`/`cat` an empty repo. Won't show anything yet (no commit checked
-out), but the transport plumbing is real.
+```
+daemon/src/vfs/
+├── mod.rs            tight re-exports (NfsAdapter, FuseAdapter, JjYakFs, YakFs)
+├── inode.rs          monotonic u64 slab (188 LoC; 3 unit tests)
+├── yak_fs.rs         JjYakFs trait + concrete YakFs impl (483 LoC; 11 unit tests)
+├── nfs_adapter.rs    impl nfsserve::NFSFileSystem (313 LoC; 4 unit tests)
+└── fuse_adapter.rs   impl fuse3::raw::Filesystem (421 LoC; 5 unit tests)
+```
+
+`JjYakFs` is read-only for M3 (`lookup`, `getattr`, `read`, `readdir`,
+`readlink`); mutations live on the adapters as ROFS / ENOSYS until
+M5/M6. Adapters wrap `Arc<dyn JjYakFs>`, dispatch to the trait, and
+own only the wire-type conversions and protocol-specific quirks (NFS
+pagination cookies, FUSE `.`/`..` synthesis, errno-vs-nfsstat
+mapping).
+
+The slab keys inodes by monotonic `u64` — fits both
+`nfsserve::nfs::fileid3` and `fuse3::Inode`. A `(parent, name)`
+reverse cache makes repeated `lookup`s stable across calls. No reuse
+or eviction yet; that has to coordinate with FUSE `forget` first.
+
+**Workspace deps added:** `fuse3 = "0.8"` (with `tokio-runtime`),
+`bytes`, `futures`, `libc`. fuse3 0.8 compiles on Linux + macOS, so
+the FUSE adapter is built everywhere; only Linux will actually use
+it for a real mount (per §4.3). macOS keeps `nfsserve`.
+
+**Behaviour after M3:** in-memory only. The trait-level `YakFs` walks
+the in-memory `Store`, but no real mount is wired up yet — `Bind`
+still isn't sent from the gRPC service. Trait + adapters are ready
+to feed `fuse3::Session::mount_with_unprivileged` (Linux) or
+`NFSTcpListener::bind` (macOS) the moment M4 plumbs them. The
+`vfs_mgr` stub now constructs a `YakFs` over an empty store rather
+than the old `VirtualFileSystem::default()` placeholder.
+
+**Decisions deferred:** the inode slab grows unbounded — eviction
+strategy lives behind a hypothetical FUSE `forget` impl; skipped
+because the immediate cost (one inode per path the kernel walks)
+is small and getting eviction right without ESTALE is a real
+design problem. Conflict tree entries (`TreeEntry::ConflictId`)
+surface as opaque files for now; proper conflict rendering pairs
+with the conflict UI work on the CLI side. FUSE `..` resolution in
+`readdir` falls back to `parent_inode == self` rather than
+walking the slab — fix when something cares (currently nothing does).
+
+**Scope (actual):** +1029 / 0 LoC across the new vfs module
+(net of removing the 114-line `vfs.rs` stub), plus 91 lines of
+workspace + daemon Cargo updates. 23 new unit tests in the
+daemon (29 → 34 daemon tests in total — a sizable chunk because
+the new modules pull in their own tests). The 3 M5/M6-ignored
+CLI integration tests remain ignored — M5 turns them on.
 
 ### M4 — `jj yak init` actually mounts
 
@@ -374,8 +410,8 @@ Worth doing in passing, not blocking:
   upstream removes the field — track and bump to proto v2 when it
   happens.
 - **Tracing for the CLI.** Daemon has it; CLI doesn't. `RUST_LOG=cli=info,jj_lib=info`
-  would help during M3/M4. Note the comment about CliRunner initializing
-  late — any pre-CliRunner setup needs to use `eprintln!`.
+  would help during M4 mount debugging. Note the comment about CliRunner
+  initializing late — any pre-CliRunner setup needs to use `eprintln!`.
 - **`unwrap()` everywhere** — acceptable now (failures are programmer
   errors during dev) but should map to `BackendError::Other` /
   `WorkingCopyStateError::Other` before any user touches it. Track so we
@@ -387,9 +423,9 @@ Worth doing in passing, not blocking:
 ### Decided
 
 1. **Transport architecture (§4.3).** Thin internal `JjYakFs` trait,
-   `fuse3` adapter on Linux, `nfsserve` adapter on macOS. Existing
-   `daemon/src/vfs.rs` already approximates the trait. M3 does the
-   extraction.
+   `fuse3` adapter on Linux, `nfsserve` adapter on macOS. Done in M3:
+   trait + concrete `YakFs` + both adapters live in
+   `daemon/src/vfs/`.
 2. **Linux mount privilege.** Falls out of (1): `fusermount3` setuid
    helper handles rootless mount; no `sudo` flow needed.
 
@@ -410,16 +446,26 @@ Worth doing in passing, not blocking:
 
 ## 8. Recommended starting point
 
-**M1 and M2 are done.** Per-mount state lives in the daemon, and a fresh
-`jj yak init` now routes the workspace through `YakWorkingCopyFactory` —
-operation id and workspace id round-trip through the daemon's checkout
-cache. CLI integration tests (`test_init`, `test_multiple_init`,
-`test_op_id_round_trip`) exercise the path; three M5/M6-dependent tests
-are `#[ignore]`'d with milestone markers.
+**M1, M2, and M3 are done.** Per-mount state lives in the daemon, a
+fresh `jj yak init` routes through `YakWorkingCopyFactory`, and the
+VFS read path is implemented behind `JjYakFs` with both NFS and FUSE
+adapters. The trait + adapters are unit-tested end-to-end (lookup,
+getattr, read, readdir, readlink) over a synthetic in-memory tree;
+nothing is mounted yet because `Bind` is still not sent.
 
-**Next: M3 — VFS read path.** Refactor `daemon/src/vfs.rs` along §4.3:
-extract a `JjYakFs` trait, add a `fuse3::Filesystem` adapter alongside
-the existing `nfsserve::NFSFileSystem`, and implement the read ops
-(`lookup`, `getattr`, `read`, `readdir`). Add `fuse3` to `Cargo.toml` as
-part of M3; the existing `nfsserve` dep stays. Once M3 lands, an empty
-mounted repo can be `ls`'d and `cat`'d on Linux (FUSE) and macOS (NFS).
+**Next: M4 — `jj yak init` actually mounts.** Wire the per-mount
+`Mount` (in `daemon/src/service.rs`) to a per-mount `Arc<dyn JjYakFs>`
++ transport handle. Send `Bind` from `Initialize` so the
+`VfsManager` brings up the right transport for the platform. On
+Linux, that's `fuse3::Session::mount_with_unprivileged` against a
+mountpoint at `working_copy_path`; on macOS, `NFSTcpListener::bind`
+on a random port followed by `mount_nfs -o
+port=N,mountport=N,nolocks,vers=3,actimeo=0`. The CLI side at
+`yak init` then needs to accept whatever the daemon hands back
+(port for NFS, nothing for FUSE) and surface it on subsequent
+RPCs.
+
+The signal that M4 is done: `jj yak init /tmp/r remote` followed by
+`ls /tmp/r` shows nothing (empty tree) without erroring, and
+`stat` of `/tmp/r` reports it as a directory. M5 then makes the
+listing non-empty.
