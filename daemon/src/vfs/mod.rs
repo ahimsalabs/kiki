@@ -13,6 +13,7 @@
 //! The FUSE adapter (Linux primary) lands later in M3 — it reuses
 //! `JjYakFs` unchanged.
 
+pub mod fuse_adapter;
 mod inode;
 pub mod nfs_adapter;
 mod yak_fs;
@@ -20,5 +21,8 @@ mod yak_fs;
 // Re-exports kept tight: only the symbols `vfs_mgr.rs` and (eventually)
 // `service.rs` need at the crate root. The full per-module surface is
 // reachable as `crate::vfs::yak_fs::*` for tests and the FUSE adapter.
+#[allow(unused_imports)] // FuseAdapter isn't wired up to a mount until M4.
+pub use fuse_adapter::FuseAdapter;
+pub use inode::ROOT_INODE;
 pub use nfs_adapter::NfsAdapter;
 pub use yak_fs::{JjYakFs, YakFs};
