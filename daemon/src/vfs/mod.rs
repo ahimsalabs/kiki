@@ -37,4 +37,4 @@ pub use fuse_adapter::FuseAdapter;
 pub use inode::ROOT_INODE;
 #[cfg(target_os = "macos")]
 pub use nfs_adapter::NfsAdapter;
-pub use yak_fs::{JjYakFs, YakFs};
+pub use yak_fs::{FsError, JjYakFs, YakFs};

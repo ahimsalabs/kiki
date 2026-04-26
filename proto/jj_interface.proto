@@ -14,6 +14,17 @@ service JujutsuInterface {
 
   rpc GetTreeState(GetTreeStateReq) returns (GetTreeStateReply) {}
 
+  // Atomically swap the mount's currently-checked-out root tree.
+  // Called by `LockedYakWorkingCopy::check_out` after jj has decided what
+  // to materialize. The daemon updates `Mount.root_tree_id` and tells the
+  // per-mount VFS to re-root, so subsequent reads through the mount see
+  // the new tree. The new tree must already be in the per-mount store
+  // (the CLI writes it via `WriteTree` before calling this).
+  //
+  // Errors: `not_found` if no such mount; `failed_precondition` if the
+  // tree id isn't present in the store.
+  rpc CheckOut(CheckOutReq) returns (CheckOutReply) {}
+
   rpc Snapshot(SnapshotReq) returns (SnapshotReply) {}
 
   // Store related calls.
@@ -84,6 +95,18 @@ message SnapshotReq {
 message SnapshotReply {
   bytes tree_id = 1;
 }
+
+message CheckOutReq {
+  string working_copy_path = 1;
+  // The tree id to make the new root of the mount's working copy. Must
+  // already be present in the per-mount store (write it with `WriteTree`
+  // before issuing `CheckOut`).
+  bytes new_tree_id = 2;
+}
+
+// Empty for now. Reserved for stats (added/updated/removed counts) once
+// we synthesize them from the tree diff.
+message CheckOutReply {}
 
 message GetTreeStateReq {
   string working_copy_path = 1;

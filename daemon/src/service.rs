@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::store::Store;
 use crate::ty;
-use crate::vfs::{JjYakFs, YakFs};
+use crate::vfs::{FsError, JjYakFs, YakFs};
 use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle};
 
 /// Map a fallible proto-decode error onto an `invalid_argument` gRPC status.
@@ -62,6 +62,10 @@ struct Mount {
     root_tree_id: Vec<u8>,
     /// Per-mount keyspace.
     store: Arc<Store>,
+    /// Per-mount filesystem. The same `Arc` is handed to the VFS bind so
+    /// kernel I/O hits this object; we keep a clone here so RPCs that
+    /// mutate the mount (today: `CheckOut`) can drive it directly.
+    fs: Arc<dyn JjYakFs>,
     /// Holds the kernel mount alive. `None` only in the test path where
     /// `JujutsuService::bare` constructed a service without a
     /// `VfsManagerHandle`. Production `Initialize` always populates it.
@@ -230,13 +234,21 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let store = Arc::new(Store::new());
         let root_tree_id = store.get_empty_tree_id();
 
+        // Build the per-mount FS up front so we can hand the same `Arc`
+        // to both the VFS bind (for kernel I/O) and the `Mount` (for
+        // RPCs like `CheckOut` that mutate mount-side state). Even on
+        // the disable_mount test path the `Mount` keeps an `fs` so
+        // mutating RPCs work end-to-end without the kernel.
+        let fs: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store.clone(), root_tree_id));
+
         // Production path validates and binds; test path skips both so
         // unit tests can use arbitrary string paths.
         let (transport, attachment) = if let Some(vfs) = &self.vfs_handle {
             validate_mountpoint(&req.path).map_err(mountpoint_status)?;
-            let fs: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store.clone(), root_tree_id));
-            let (transport, attachment) =
-                vfs.bind(req.path.clone(), fs).await.map_err(bind_status)?;
+            let (transport, attachment) = vfs
+                .bind(req.path.clone(), fs.clone())
+                .await
+                .map_err(bind_status)?;
             (Some(transport), Some(attachment))
         } else {
             (None, None)
@@ -262,6 +274,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 workspace_id: Vec::new(),
                 root_tree_id: root_tree_id.0.to_vec(),
                 store,
+                fs,
                 attachment,
             },
         );
@@ -505,6 +518,60 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         Ok(Response::new(SnapshotReply {
             tree_id: mount.root_tree_id.clone(),
         }))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn check_out(
+        &self,
+        request: Request<CheckOutReq>,
+    ) -> Result<Response<CheckOutReply>, Status> {
+        let req = request.into_inner();
+        let new_tree_id: ty::Id = TreeId {
+            tree_id: req.new_tree_id.clone(),
+        }
+        .try_into()
+        .map_err(decode_status("tree id"))?;
+
+        // Clone the per-mount fs handle out from under the lock so the
+        // (potentially I/O-heavy) `JjYakFs::check_out` call doesn't hold
+        // it. Mirrors how `store_for` works.
+        let fs = {
+            let mounts = self.mounts.lock().await;
+            let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
+                Status::not_found(format!("no mount at {}", req.working_copy_path))
+            })?;
+            mount.fs.clone()
+        };
+
+        // The VFS swap validates the tree exists in the store; map the
+        // miss onto failed_precondition so the caller gets a crisp
+        // "write the tree first" signal rather than internal-error noise.
+        fs.check_out(new_tree_id).await.map_err(|e| match e {
+            FsError::StoreMiss => Status::failed_precondition(format!(
+                "tree {} not in store; call WriteTree first",
+                hex(&new_tree_id)
+            )),
+            other => Status::internal(format!("check_out failed: {other}")),
+        })?;
+
+        // Stamp the new root tree id on the Mount under the lock. We do
+        // this *after* the swap succeeds: if the swap fails the mount's
+        // declared `root_tree_id` should still match what the kernel
+        // sees through `fs`.
+        let mut mounts = self.mounts.lock().await;
+        if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
+            mount.root_tree_id = req.new_tree_id;
+        } else {
+            // Mount disappeared between the two locks. Extremely
+            // unlikely (no Unmount RPC exists yet) but we should not
+            // pretend success.
+            return Err(Status::not_found(format!(
+                "mount at {} disappeared during check_out",
+                req.working_copy_path
+            )));
+        }
+
+        Ok(Response::new(CheckOutReply {}))
     }
 }
 
@@ -813,6 +880,110 @@ mod tests {
                     op_id: vec![0; 32],
                     workspace_id: b"default".to_vec(),
                 }),
+            }))
+            .await
+            .expect_err("expected not_found");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// CheckOut updates `Mount.root_tree_id` and the per-mount FS so
+    /// subsequent `GetTreeState` / `Snapshot` reads see the new root,
+    /// and rejects unknown tree ids cleanly. This is the wire-side
+    /// contract `LockedYakWorkingCopy::check_out` depends on.
+    #[tokio::test]
+    async fn check_out_updates_root_tree_and_validates_input() {
+        let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount(&svc, &path).await;
+
+        // Build a non-empty tree and write it to the per-mount store.
+        let file_id = svc
+            .write_file(Request::new(WriteFileReq {
+                working_copy_path: path.clone(),
+                data: b"hello".to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let tree_id = svc
+            .write_tree(Request::new(WriteTreeReq {
+                working_copy_path: path.clone(),
+                tree: Some(Tree {
+                    entries: vec![tree::Entry {
+                        name: "hello.txt".into(),
+                        value: Some(TreeValue {
+                            value: Some(tree_value::Value::File(tree_value::File {
+                                id: file_id.file_id.clone(),
+                                executable: false,
+                                copy_id: Vec::new(),
+                            })),
+                        }),
+                    }],
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Check out the new tree.
+        svc.check_out(Request::new(CheckOutReq {
+            working_copy_path: path.clone(),
+            new_tree_id: tree_id.tree_id.clone(),
+        }))
+        .await
+        .expect("check_out");
+
+        // GetTreeState now returns the new tree id.
+        let after = svc
+            .get_tree_state(Request::new(GetTreeStateReq {
+                working_copy_path: path.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(after.tree_id, tree_id.tree_id);
+
+        // Snapshot reflects the same updated root tree id (still a stub
+        // until M6, but the mount-side state must agree).
+        let snap = svc
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: path.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(snap.tree_id, tree_id.tree_id);
+
+        // Checking out an unknown tree id rejects with failed_precondition,
+        // and leaves `root_tree_id` as it was after the successful swap.
+        let bogus = vec![0xee; 32];
+        let err = svc
+            .check_out(Request::new(CheckOutReq {
+                working_copy_path: path.clone(),
+                new_tree_id: bogus,
+            }))
+            .await
+            .expect_err("expected failed_precondition for unknown tree");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let still = svc
+            .get_tree_state(Request::new(GetTreeStateReq {
+                working_copy_path: path,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(still.tree_id, tree_id.tree_id);
+    }
+
+    /// CheckOut against a missing mount must NotFound, mirroring the
+    /// other store/WC RPCs. Catches a typo in the lookup path.
+    #[tokio::test]
+    async fn check_out_without_mount_is_not_found() {
+        let svc = JujutsuService::bare();
+        let err = svc
+            .check_out(Request::new(CheckOutReq {
+                working_copy_path: "/never/initialized".into(),
+                new_tree_id: vec![0; 32],
             }))
             .await
             .expect_err("expected not_found");

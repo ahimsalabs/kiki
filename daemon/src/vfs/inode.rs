@@ -102,6 +102,40 @@ impl InodeSlab {
         self.inner.lock().inodes.get(&id).cloned()
     }
 
+    /// Re-root the slab at `new_root_tree`.
+    ///
+    /// Updates the root inode's `NodeRef::Tree` and clears the
+    /// `(parent, name)` reverse cache so subsequent `lookup` calls see
+    /// the new tree's children. Existing non-root inode entries are
+    /// retained so the kernel doesn't immediately ESTALE on cached ids;
+    /// they're orphaned in the `inodes` map but harmless (`next_id`
+    /// keeps moving forward, so nothing reuses their numbers).
+    ///
+    /// This is the M5 contract: swap the visible root, keep ids
+    /// monotonic. Pushing kernel-side invalidation (so the kernel
+    /// re-`lookup`s rather than reusing its own cached entries) needs
+    /// fuse3 to expose `Session::get_notify` publicly — tracked in
+    /// docs/PLAN.md M5 §"Deferred".
+    pub fn swap_root(&self, new_root_tree: Id) {
+        let mut inner = self.inner.lock();
+        // Replace the root inode's NodeRef in place; keep parent/name as the
+        // root's self-reference + empty name.
+        inner.inodes.insert(
+            ROOT_INODE,
+            Inode {
+                parent: ROOT_INODE,
+                name: String::new(),
+                node: NodeRef::Tree(new_root_tree),
+            },
+        );
+        // Drop every (parent, name) → id mapping. This is necessary even
+        // for unchanged paths: the cached id might point at a node that
+        // doesn't exist in the new tree, so we err on the side of letting
+        // each path re-allocate. Tradeoff is more inode churn; the slab
+        // is small per workspace, so we eat the cost.
+        inner.by_parent.clear();
+    }
+
     /// Resolve a child by name under `parent`, allocating an inode id if
     /// this `(parent, name)` pair hasn't been seen before. `make_node` is
     /// invoked only on cache miss so callers don't pay store lookups
@@ -184,5 +218,32 @@ mod tests {
         assert_eq!(b, a + 1);
         assert_eq!(c, b + 1);
         assert!(a > ROOT_INODE);
+    }
+
+    /// `swap_root` rewrites the root inode and clears the (parent, name)
+    /// reverse cache so subsequent intern_child calls allocate fresh
+    /// ids. Older non-root ids stay live in `inodes` (orphaned but
+    /// safe).
+    #[test]
+    fn swap_root_updates_root_and_clears_reverse_cache() {
+        let slab = InodeSlab::new(id(1));
+        let old_a = slab.intern_child(ROOT_INODE, "a", || NodeRef::File {
+            id: id(2),
+            executable: false,
+        });
+
+        slab.swap_root(id(99));
+
+        // Root now points at the new tree id.
+        let root = slab.get(ROOT_INODE).expect("root present");
+        assert!(matches!(root.node, NodeRef::Tree(t) if t == id(99)));
+
+        // Re-interning "a" allocates a fresh id (the reverse cache was
+        // cleared); monotonic ordering still holds.
+        let new_a = slab.intern_child(ROOT_INODE, "a", || NodeRef::File {
+            id: id(3),
+            executable: false,
+        });
+        assert!(new_a > old_a, "expected monotonic id");
     }
 }

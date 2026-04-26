@@ -122,6 +122,15 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
     async fn readdir(&self, dir: InodeId) -> Result<Vec<DirEntry>, FsError>;
 
     async fn readlink(&self, ino: InodeId) -> Result<String, FsError>;
+
+    /// Re-root the filesystem at `new_root_tree`. Subsequent reads through
+    /// this `JjYakFs` (and through any kernel mount the adapters expose)
+    /// see the new tree.
+    ///
+    /// `new_root_tree` must already be present in the backing store —
+    /// returns `FsError::StoreMiss` otherwise. The daemon's `CheckOut`
+    /// RPC handler turns that into `failed_precondition`.
+    async fn check_out(&self, new_root_tree: Id) -> Result<(), FsError>;
 }
 
 /// Concrete `JjYakFs` backed by a [`Store`] and the inode slab.
@@ -287,6 +296,15 @@ impl JjYakFs for YakFs {
                 .map(|s| s.target),
             _ => Err(FsError::NotASymlink),
         }
+    }
+
+    async fn check_out(&self, new_root_tree: Id) -> Result<(), FsError> {
+        // Validate the target tree is present before we touch the slab —
+        // otherwise we'd swap the root to an unreadable id and surface
+        // every subsequent lookup as `StoreMiss`.
+        let _ = self.read_tree(new_root_tree)?;
+        self.slab.swap_root(new_root_tree);
+        Ok(())
     }
 }
 
@@ -479,5 +497,76 @@ mod tests {
         let fs = YakFs::new(store, root);
         let err = fs.getattr(99_999).await.unwrap_err();
         assert_eq!(err, FsError::NotFound);
+    }
+
+    /// `check_out` swaps the visible root tree. Lookups after the swap
+    /// must see the new tree's children and not the old's.
+    #[tokio::test]
+    async fn check_out_swaps_visible_tree() {
+        let store = Arc::new(Store::new());
+        // Build two distinct one-file root trees.
+        let a_id = store
+            .write_file(File {
+                content: b"a-content".to_vec(),
+            })
+            .await;
+        let b_id = store
+            .write_file(File {
+                content: b"b-content".to_vec(),
+            })
+            .await;
+        let tree_a = store
+            .write_tree(Tree {
+                entries: vec![TreeEntryMapping {
+                    name: "only-in-a.txt".into(),
+                    entry: TreeEntry::File {
+                        id: a_id,
+                        executable: false,
+                        copy_id: Vec::new(),
+                    },
+                }],
+            })
+            .await;
+        let tree_b = store
+            .write_tree(Tree {
+                entries: vec![TreeEntryMapping {
+                    name: "only-in-b.txt".into(),
+                    entry: TreeEntry::File {
+                        id: b_id,
+                        executable: false,
+                        copy_id: Vec::new(),
+                    },
+                }],
+            })
+            .await;
+
+        let fs = YakFs::new(store, tree_a);
+        // Tree A is visible.
+        fs.lookup(fs.root(), "only-in-a.txt").await.expect("A");
+        assert_eq!(
+            fs.lookup(fs.root(), "only-in-b.txt").await.unwrap_err(),
+            FsError::NotFound
+        );
+
+        // Swap to tree B.
+        fs.check_out(tree_b).await.expect("check_out");
+        fs.lookup(fs.root(), "only-in-b.txt").await.expect("B");
+        assert_eq!(
+            fs.lookup(fs.root(), "only-in-a.txt").await.unwrap_err(),
+            FsError::NotFound
+        );
+    }
+
+    /// Checking out a tree id that isn't in the store must surface a
+    /// `StoreMiss` so the daemon can refuse the RPC cleanly instead of
+    /// quietly swapping to an unreadable root.
+    #[tokio::test]
+    async fn check_out_unknown_tree_is_store_miss() {
+        let (store, root) = build_synthetic_tree().await;
+        let fs = YakFs::new(store, root);
+        let err = fs.check_out(Id([0xff; 32])).await.unwrap_err();
+        assert_eq!(err, FsError::StoreMiss);
+        // Original tree is still visible.
+        fs.lookup(fs.root(), "hello.txt").await.expect("still A");
     }
 }
