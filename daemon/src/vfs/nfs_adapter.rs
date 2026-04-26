@@ -36,6 +36,8 @@ fn fs_err_to_nfs(e: FsError) -> nfsstat3 {
         // doesn't have a direct equivalent of EINVAL for "kind mismatch".
         FsError::NotAFile => nfsstat3::NFS3ERR_ISDIR,
         FsError::NotASymlink => nfsstat3::NFS3ERR_INVAL,
+        FsError::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
+        FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
         FsError::StoreMiss => nfsstat3::NFS3ERR_IO,
     }
 }
@@ -247,13 +249,11 @@ mod tests {
     /// Build the same tiny tree the YakFs tests use, scaled down. Verifies
     /// the NFS adapter passes through to the trait without losing fidelity
     /// (kind, size, exec bit) and that attribute conversion is consistent.
-    async fn build_adapter() -> NfsAdapter {
+    fn build_adapter() -> NfsAdapter {
         let store = Arc::new(Store::new());
-        let hello_id = store
-            .write_file(File {
-                content: b"hi".to_vec(),
-            })
-            .await;
+        let hello_id = store.write_file(File {
+            content: b"hi".to_vec(),
+        });
         let root = Tree {
             entries: vec![TreeEntryMapping {
                 name: "hello.txt".into(),
@@ -264,21 +264,21 @@ mod tests {
                 },
             }],
         };
-        let root_id = store.write_tree(root).await;
+        let root_id = store.write_tree(root);
         let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id));
         NfsAdapter::new(yak)
     }
 
     #[tokio::test]
     async fn root_attrs_resolve() {
-        let nfs = build_adapter().await;
+        let nfs = build_adapter();
         let attr = nfs.getattr(nfs.root_dir()).await.expect("getattr");
         assert!(matches!(attr.ftype, ftype3::NF3DIR));
     }
 
     #[tokio::test]
     async fn lookup_then_read_round_trips_through_adapter() {
-        let nfs = build_adapter().await;
+        let nfs = build_adapter();
         let id = nfs
             .lookup(nfs.root_dir(), &b"hello.txt"[..].into())
             .await
@@ -293,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn readdir_returns_entries_with_attrs() {
-        let nfs = build_adapter().await;
+        let nfs = build_adapter();
         let result = nfs.readdir(nfs.root_dir(), 0, 100).await.expect("readdir");
         assert!(result.end);
         assert_eq!(result.entries.len(), 1);
@@ -303,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_side_is_rofs() {
-        let nfs = build_adapter().await;
+        let nfs = build_adapter();
         let err = nfs
             .write(nfs.root_dir(), 0, b"x")
             .await

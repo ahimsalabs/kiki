@@ -55,8 +55,15 @@ impl Store {
         tree_store.get(&id).cloned()
     }
 
+    // Store methods are sync rather than async: every body just locks an
+    // in-memory `parking_lot::Mutex` (no I/O, no real await points). Keeping
+    // them async would force every caller into an async context — most
+    // painfully, the recursive `JjYakFs::snapshot` walk in `yak_fs.rs`,
+    // which would otherwise need `async-recursion` or `Box::pin` to
+    // satisfy the borrow checker. Layer B (durable storage) may add real
+    // I/O here; switch back to async if/when that lands.
     #[tracing::instrument]
-    pub async fn write_tree(&self, tree: Tree) -> Id {
+    pub fn write_tree(&self, tree: Tree) -> Id {
         let mut tree_store = self.trees.lock();
         let hash = tree.get_hash();
         tree_store.insert(hash, tree);
@@ -69,7 +76,7 @@ impl Store {
     }
 
     #[tracing::instrument]
-    pub async fn write_commit(&self, commit: Commit) -> Id {
+    pub fn write_commit(&self, commit: Commit) -> Id {
         let mut commit_store = self.commits.lock();
         let hash = commit.get_hash();
         commit_store.insert(hash, commit);
@@ -77,7 +84,7 @@ impl Store {
     }
 
     #[tracing::instrument]
-    pub async fn write_file(&self, file: File) -> Id {
+    pub fn write_file(&self, file: File) -> Id {
         let mut file_store = self.files.lock();
         let hash = file.get_hash();
         file_store.insert(hash, file);
@@ -90,7 +97,7 @@ impl Store {
     }
 
     #[tracing::instrument]
-    pub async fn write_symlink(&self, symlink: Symlink) -> Id {
+    pub fn write_symlink(&self, symlink: Symlink) -> Id {
         let mut symlink_store = self.symlinks.lock();
         let hash = symlink.get_hash();
         symlink_store.insert(hash, symlink);

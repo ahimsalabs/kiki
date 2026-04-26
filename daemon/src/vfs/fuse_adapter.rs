@@ -70,6 +70,8 @@ fn fs_err_to_errno(e: FsError) -> Errno {
         FsError::NotADirectory => libc::ENOTDIR,
         FsError::NotAFile => libc::EISDIR,
         FsError::NotASymlink => libc::EINVAL,
+        FsError::AlreadyExists => libc::EEXIST,
+        FsError::NotEmpty => libc::ENOTEMPTY,
         FsError::StoreMiss => libc::EIO,
     };
     raw.into()
@@ -324,13 +326,11 @@ mod tests {
         }
     }
 
-    async fn build_adapter() -> FuseAdapter {
+    fn build_adapter() -> FuseAdapter {
         let store = Arc::new(Store::new());
-        let hello_id = store
-            .write_file(File {
-                content: b"hi".to_vec(),
-            })
-            .await;
+        let hello_id = store.write_file(File {
+            content: b"hi".to_vec(),
+        });
         let root = Tree {
             entries: vec![TreeEntryMapping {
                 name: "hello.txt".into(),
@@ -341,14 +341,14 @@ mod tests {
                 },
             }],
         };
-        let root_id = store.write_tree(root).await;
+        let root_id = store.write_tree(root);
         let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id));
         FuseAdapter::new(yak)
     }
 
     #[tokio::test]
     async fn lookup_then_read_round_trips_through_adapter() {
-        let fuse = build_adapter().await;
+        let fuse = build_adapter();
         let entry = fuse
             .lookup(req(), ROOT_INODE, OsStr::new("hello.txt"))
             .await
@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn getattr_root_is_directory() {
-        let fuse = build_adapter().await;
+        let fuse = build_adapter();
         let attr = fuse.getattr(req(), ROOT_INODE, None, 0).await.expect("getattr");
         assert_eq!(attr.attr.kind, FileType::Directory);
     }
@@ -373,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_includes_dot_and_dotdot_then_real_entries() {
         use futures::StreamExt;
-        let fuse = build_adapter().await;
+        let fuse = build_adapter();
         let reply = fuse.readdir(req(), ROOT_INODE, 0, 0).await.expect("readdir");
         let entries: Vec<DirectoryEntry> = reply
             .entries
@@ -391,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_offset_resumes_after_dotdot() {
         use futures::StreamExt;
-        let fuse = build_adapter().await;
+        let fuse = build_adapter();
         // offset=2 means "I already saw entries with offsets 1 and 2"
         // (i.e. `.` and `..`). Should return only the real entry.
         let reply = fuse.readdir(req(), ROOT_INODE, 0, 2).await.expect("readdir");
@@ -406,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_missing_returns_enoent() {
-        let fuse = build_adapter().await;
+        let fuse = build_adapter();
         let err = fuse
             .lookup(req(), ROOT_INODE, OsStr::new("missing"))
             .await
