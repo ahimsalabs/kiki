@@ -79,7 +79,7 @@ impl Default for TestEnvironment {
         std::fs::write(
             &daemon_config,
             format!(
-                "grpc_addr = \"[::1]:{daemon_port}\"\ncache = \"{daemon_dir_str}\"\ndisable_mount = false\n[nfs]\nmin_port = 1100\nmax_port = 1200\n"
+                "grpc_addr = \"[::1]:{daemon_port}\"\nstorage_dir = \"{daemon_dir_str}\"\ndisable_mount = false\n[nfs]\nmin_port = 1100\nmax_port = 1200\n"
             ),
         )
         .expect("Failed to write daemon config toml for testing setup");

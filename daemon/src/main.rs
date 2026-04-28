@@ -5,6 +5,8 @@ use serde::Deserialize;
 use tonic::transport::Server as GrpcServer;
 use tracing::{error, info};
 
+use crate::service::StorageConfig;
+
 mod hash;
 mod service;
 mod store;
@@ -28,11 +30,19 @@ struct Args {
 struct Config {
     /// Address the jj CLI connects over
     pub grpc_addr: String,
-    /// Local cache. Required in the config file but not yet consumed by the
-    /// daemon — kept here so existing `daemon.toml` files continue to parse
-    /// and so the field shows up in the `Debug` log line at startup.
+    /// Per-mount durable storage root directory (M8 / Layer B). Each
+    /// mount's redb file lives at
+    /// `<storage_dir>/mounts/<hash(working_copy_path)>/store.redb`.
+    /// Must be writable; created on demand. Replaces the pre-M8 `cache`
+    /// field — old `daemon.toml` files need to rename `cache` to
+    /// `storage_dir` (or keep both: `cache` is now ignored).
+    pub storage_dir: PathBuf,
+    /// Pre-M8 alias for `storage_dir`. Accepted but ignored — kept so old
+    /// `daemon.toml` files still parse during migration. Remove once
+    /// every consumer has switched.
+    #[serde(default)]
     #[allow(dead_code)]
-    pub cache: PathBuf,
+    pub cache: Option<PathBuf>,
     /// NFS configuration
     pub nfs: NfsConfig,
     /// Skip mountpoint validation and the VFS attach in `Initialize`. The
@@ -77,7 +87,8 @@ async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
         info!("disable_mount=true: skipping mountpoint validation and VFS attach");
     }
 
-    let jj_svc = service::JujutsuService::new(vfs_handle);
+    let storage = StorageConfig::on_disk(config.storage_dir.clone());
+    let jj_svc = service::JujutsuService::new(vfs_handle, storage);
 
     let reflection_svc = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)

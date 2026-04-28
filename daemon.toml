@@ -1,5 +1,7 @@
 grpc_addr = "[::1]:12000"
-cache = "/tmp/yak-cache"
+# M8 / Layer B: per-mount redb file lives at
+# <storage_dir>/mounts/<hash(wc_path)>/store.redb.
+storage_dir = "/tmp/yak-storage"
 
 [nfs]
 min_port = 12000

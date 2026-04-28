@@ -67,6 +67,12 @@ impl FuseAdapter {
 const TTL: Duration = Duration::ZERO;
 
 fn fs_err_to_errno(e: FsError) -> Errno {
+    // Tracing-side fingerprint before we collapse the error onto a numeric
+    // errno: `StoreError` carries a stringified anyhow chain that is much
+    // more useful than `EIO` alone when debugging a real mount.
+    if let FsError::StoreError(ref msg) = e {
+        tracing::warn!(error = %msg, "FUSE op failed with store error");
+    }
     let raw: i32 = match e {
         FsError::NotFound => libc::ENOENT,
         FsError::NotADirectory => libc::ENOTDIR,
@@ -74,7 +80,7 @@ fn fs_err_to_errno(e: FsError) -> Errno {
         FsError::NotASymlink => libc::EINVAL,
         FsError::AlreadyExists => libc::EEXIST,
         FsError::NotEmpty => libc::ENOTEMPTY,
-        FsError::StoreMiss => libc::EIO,
+        FsError::StoreMiss | FsError::StoreError(_) => libc::EIO,
     };
     raw.into()
 }
@@ -653,7 +659,7 @@ impl Filesystem for FuseAdapter {
 mod tests {
     use std::sync::Arc;
 
-    use crate::store::Store;
+    use crate::store::{Store, StoreTestExt as _};
     use crate::ty::{File, Tree, TreeEntry, TreeEntryMapping};
     use crate::vfs::yak_fs::YakFs;
 
@@ -671,8 +677,8 @@ mod tests {
     }
 
     fn build_adapter() -> FuseAdapter {
-        let store = Arc::new(Store::new());
-        let hello_id = store.write_file(File {
+        let store = Arc::new(Store::new_in_memory());
+        let hello_id = store.put_file(File {
             content: b"hi".to_vec(),
         });
         let root = Tree {
@@ -685,7 +691,7 @@ mod tests {
                 },
             }],
         };
-        let root_id = store.write_tree(root);
+        let root_id = store.put_tree(root);
         let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id));
         FuseAdapter::new(yak)
     }

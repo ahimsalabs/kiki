@@ -22,6 +22,7 @@ parking_lot.workspace = true
 prost.workspace = true
 proto = { path = "../proto" }
 rand.workspace = true
+redb.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

@@ -40,6 +40,11 @@ impl NfsAdapter {
 }
 
 fn fs_err_to_nfs(e: FsError) -> nfsstat3 {
+    // Same pattern as the FUSE adapter: log the anyhow chain that Layer B
+    // attached before collapsing onto NFS3ERR_IO.
+    if let FsError::StoreError(ref msg) = e {
+        tracing::warn!(error = %msg, "NFS op failed with store error");
+    }
     match e {
         FsError::NotFound => nfsstat3::NFS3ERR_NOENT,
         FsError::NotADirectory => nfsstat3::NFS3ERR_NOTDIR,
@@ -49,7 +54,7 @@ fn fs_err_to_nfs(e: FsError) -> nfsstat3 {
         FsError::NotASymlink => nfsstat3::NFS3ERR_INVAL,
         FsError::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
         FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
-        FsError::StoreMiss => nfsstat3::NFS3ERR_IO,
+        FsError::StoreMiss | FsError::StoreError(_) => nfsstat3::NFS3ERR_IO,
     }
 }
 
@@ -354,7 +359,7 @@ const _: fn() = || {
 mod tests {
     use std::sync::Arc;
 
-    use crate::store::Store;
+    use crate::store::{Store, StoreTestExt as _};
     use crate::ty::{File, Tree, TreeEntry, TreeEntryMapping};
     use crate::vfs::yak_fs::YakFs;
 
@@ -364,8 +369,8 @@ mod tests {
     /// the NFS adapter passes through to the trait without losing fidelity
     /// (kind, size, exec bit) and that attribute conversion is consistent.
     fn build_adapter() -> NfsAdapter {
-        let store = Arc::new(Store::new());
-        let hello_id = store.write_file(File {
+        let store = Arc::new(Store::new_in_memory());
+        let hello_id = store.put_file(File {
             content: b"hi".to_vec(),
         });
         let root = Tree {
@@ -378,7 +383,7 @@ mod tests {
                 },
             }],
         };
-        let root_id = store.write_tree(root);
+        let root_id = store.put_tree(root);
         let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id));
         NfsAdapter::new(yak)
     }

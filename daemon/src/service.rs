@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use proto::jj_interface::*;
@@ -12,6 +12,61 @@ use crate::ty;
 use crate::vfs::{FsError, JjYakFs, YakFs};
 use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle};
 
+/// Where per-mount redb files live. Production runs are always
+/// [`StorageConfig::OnDisk`]; tests can use [`StorageConfig::InMemory`]
+/// to skip the filesystem entirely.
+#[derive(Clone, Debug)]
+pub enum StorageConfig {
+    /// Each mount opens a redb file under
+    /// `<root>/mounts/<hash(wc_path)>/store.redb`. The directory is
+    /// created on demand.
+    OnDisk { root: PathBuf },
+    /// Each mount gets a fresh `redb::backends::InMemoryBackend`. Used
+    /// by `JujutsuService::bare()` and any test that doesn't care about
+    /// persistence across `Initialize`.
+    ///
+    /// `#[allow(dead_code)]` because the production daemon binary never
+    /// constructs this variant (only `bare()` does, and that's
+    /// `cfg(test)`); declaring it here keeps the prod and test
+    /// constructors symmetrical without a `cfg` split on the enum
+    /// itself.
+    #[allow(dead_code)]
+    InMemory,
+}
+
+impl StorageConfig {
+    pub fn on_disk(root: PathBuf) -> Self {
+        StorageConfig::OnDisk { root }
+    }
+
+    /// Where the redb file for `working_copy_path` should live, if any.
+    /// Returns `None` for the in-memory variant.
+    fn store_path_for(&self, working_copy_path: &str) -> Option<PathBuf> {
+        match self {
+            StorageConfig::OnDisk { root } => Some(
+                root.join("mounts")
+                    .join(mount_dir_name(working_copy_path))
+                    .join("store.redb"),
+            ),
+            StorageConfig::InMemory => None,
+        }
+    }
+}
+
+/// Path-safe stable id for a working-copy path. Uses blake3 (already a
+/// workspace dep, used by the content-addressed `Id`) truncated to 16
+/// hex chars (64 bits) — collisions in this namespace require ~4 billion
+/// unique mounts on one host, which is well outside the design space.
+fn mount_dir_name(working_copy_path: &str) -> String {
+    let hash = crate::hash::blake3_bytes(working_copy_path.as_bytes());
+    let mut s = String::with_capacity(16);
+    for b in &hash.as_bytes()[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
 /// Map a fallible proto-decode error onto an `invalid_argument` gRPC status.
 /// Use for any conversion that came off the wire — peers that send malformed
 /// requests should get a clean error, not crash the daemon. Uses the
@@ -20,6 +75,13 @@ use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle
 /// outer context.
 fn decode_status<E: std::fmt::Display>(context: &str) -> impl FnOnce(E) -> Status + '_ {
     move |e| Status::invalid_argument(format!("{context}: {e:#}"))
+}
+
+/// Map a Store-layer `anyhow::Error` (Layer B I/O failures, redb
+/// commit/read errors) onto `internal`. Uses the alternate formatter so
+/// the chained context survives across the wire.
+fn store_status(context: &str) -> impl FnOnce(anyhow::Error) -> Status + '_ {
+    move |e| Status::internal(format!("{context}: {e:#}"))
 }
 
 fn hex(id: &ty::Id) -> String {
@@ -81,6 +143,8 @@ pub struct JujutsuService {
     /// `None` only in `bare()` test mode. Production `Initialize`
     /// requires it.
     vfs_handle: Option<VfsManagerHandle>,
+    /// Where per-mount redb files live. M8 / Layer B.
+    storage: StorageConfig,
 }
 
 impl JujutsuService {
@@ -89,12 +153,19 @@ impl JujutsuService {
     /// `None` is the integration-test path (see `Config.disable_mount`):
     /// per-mount state is still tracked and store/WC RPCs work, but
     /// nothing is mounted at `working_copy_path`.
+    ///
+    /// `storage` decides where per-mount Stores live. Production passes
+    /// `StorageConfig::OnDisk { root: <storage_dir from daemon.toml> }`;
+    /// tests that don't care about durability use
+    /// `StorageConfig::InMemory`.
     pub fn new(
         vfs_handle: Option<VfsManagerHandle>,
+        storage: StorageConfig,
     ) -> jujutsu_interface_server::JujutsuInterfaceServer<Self> {
         jujutsu_interface_server::JujutsuInterfaceServer::new(JujutsuService {
             mounts: Arc::new(Mutex::new(HashMap::new())),
             vfs_handle,
+            storage,
         })
     }
 
@@ -103,11 +174,13 @@ impl JujutsuService {
     /// skips both mountpoint validation and VFS bind, so callers can use
     /// arbitrary string paths (`/tmp/repo`, `/never/initialized`) without
     /// creating real directories or spinning up a real VFS manager.
+    /// Always uses in-memory storage so tests don't litter the disk.
     #[cfg(test)]
     fn bare() -> Self {
         JujutsuService {
             mounts: Arc::new(Mutex::new(HashMap::new())),
             vfs_handle: None,
+            storage: StorageConfig::InMemory,
         }
     }
 
@@ -201,6 +274,18 @@ fn transport_to_proto(info: TransportInfo) -> initialize_reply::Transport {
     }
 }
 
+/// Open a per-mount [`Store`] according to the daemon's `StorageConfig`.
+/// On disk: redb file at `<root>/mounts/<hash(wc_path)>/store.redb`,
+/// reused if it already exists (Layer B durability — second `Initialize`
+/// rehydrates instead of starting empty). In-memory: fresh
+/// `InMemoryBackend` per call.
+fn open_store_for(storage: &StorageConfig, working_copy_path: &str) -> anyhow::Result<Store> {
+    match storage.store_path_for(working_copy_path) {
+        Some(path) => Store::open(&path),
+        None => Ok(Store::new_in_memory()),
+    }
+}
+
 /// Look up a mount by `working_copy_path` and clone its store handle so
 /// the lock can be released before doing real work. All store RPCs use
 /// this — the lock is short, the RPC body is long.
@@ -241,7 +326,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             }
         }
 
-        let store = Arc::new(Store::new());
+        let store = Arc::new(open_store_for(&self.storage, &req.path).map_err(|e| {
+            Status::internal(format!("opening store for {}: {e:#}", req.path))
+        })?);
         let root_tree_id = store.get_empty_tree_id();
 
         // Build the per-mount FS up front so we can hand the same `Arc`
@@ -333,7 +420,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<FileId>, Status> {
         let req = request.into_inner();
         let store = store_for(&self.mounts, &req.working_copy_path).await?;
-        let file_id = store.write_file(ty::File { content: req.data }).into();
+        let file_id = store
+            .write_file(ty::File { content: req.data })
+            .map_err(store_status("write_file"))?
+            .into();
         Ok(Response::new(FileId { file_id }))
     }
 
@@ -349,6 +439,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(decode_status("file id"))?;
         let file = store
             .get_file(file_id)
+            .map_err(store_status("get_file"))?
             .ok_or_else(|| Status::not_found(format!("file {} not found", hex(&file_id))))?;
         Ok(Response::new(file.as_proto()))
     }
@@ -361,7 +452,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let req = request.into_inner();
         let store = store_for(&self.mounts, &req.working_copy_path).await?;
         let symlink = ty::Symlink { target: req.target };
-        let symlink_id = store.write_symlink(symlink).into();
+        let symlink_id = store
+            .write_symlink(symlink)
+            .map_err(store_status("write_symlink"))?
+            .into();
         Ok(Response::new(SymlinkId { symlink_id }))
     }
 
@@ -377,6 +471,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(decode_status("symlink id"))?;
         let symlink = store
             .get_symlink(symlink_id)
+            .map_err(store_status("get_symlink"))?
             .ok_or_else(|| Status::not_found(format!("symlink {} not found", hex(&symlink_id))))?;
         Ok(Response::new(symlink.as_proto()))
     }
@@ -392,7 +487,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .tree
             .ok_or_else(|| Status::invalid_argument("WriteTreeReq.tree is required"))?;
         let tree: ty::Tree = tree_proto.try_into().map_err(decode_status("tree"))?;
-        let tree_id = store.write_tree(tree).into();
+        let tree_id = store
+            .write_tree(tree)
+            .map_err(store_status("write_tree"))?
+            .into();
         Ok(Response::new(TreeId { tree_id }))
     }
 
@@ -408,6 +506,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(decode_status("tree id"))?;
         let tree = store
             .get_tree(tree_id)
+            .map_err(store_status("get_tree"))?
             .ok_or_else(|| Status::not_found(format!("tree {} not found", hex(&tree_id))))?;
         Ok(Response::new(tree.as_proto()))
     }
@@ -426,7 +525,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             return Err(Status::internal("Cannot write a commit with no parents"));
         }
         let commit: ty::Commit = commit_proto.try_into().map_err(decode_status("commit"))?;
-        let commit_id = store.write_commit(commit).into();
+        let commit_id = store
+            .write_commit(commit)
+            .map_err(store_status("write_commit"))?
+            .into();
         Ok(Response::new(CommitId { commit_id }))
     }
 
@@ -442,6 +544,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(decode_status("commit id"))?;
         let commit = store
             .get_commit(commit_id)
+            .map_err(store_status("get_commit"))?
             .ok_or_else(|| Status::not_found(format!("commit {} not found", hex(&commit_id))))?;
         Ok(Response::new(commit.as_proto()))
     }

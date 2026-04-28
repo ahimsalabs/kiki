@@ -39,6 +39,10 @@ parking_lot = "0.12.3"
 prost = "0.12"
 proto = { path = "./proto" }
 rand = "0.8.5"
+# Layer B (PLAN.md §8): per-mount durable storage. redb 2.x is pure-Rust,
+# ACID, supports an in-memory backend for tests, and gives us a sync
+# `Database` so the existing Store sync API survives the swap.
+redb = "2"
 regex = "1.11.1"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

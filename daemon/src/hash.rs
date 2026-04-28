@@ -11,3 +11,10 @@ pub fn blake3(x: &(impl ContentHash + ?Sized + std::fmt::Debug)) -> blake3::Hash
     x.hash(&mut hasher);
     hasher.finalize()
 }
+
+/// Hash an opaque byte slice with blake3. Used to derive stable
+/// path-safe identifiers (e.g. per-mount storage subdirectories) from
+/// arbitrary input.
+pub fn blake3_bytes(bytes: &[u8]) -> blake3::Hash {
+    blake3::hash(bytes)
+}
