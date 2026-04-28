@@ -3963,10 +3963,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "0.0.1"
-
-[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
