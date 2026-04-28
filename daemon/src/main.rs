@@ -8,6 +8,7 @@ use tracing::{error, info};
 use crate::service::StorageConfig;
 
 mod hash;
+mod mount_meta;
 mod service;
 mod store;
 mod ty;
@@ -88,7 +89,14 @@ async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
     }
 
     let storage = StorageConfig::on_disk(config.storage_dir.clone());
-    let jj_svc = service::JujutsuService::new(vfs_handle, storage);
+    let svc = service::JujutsuService::new(vfs_handle, storage);
+
+    // Re-attach mounts left behind by a previous daemon process.
+    // Done before we start the gRPC listener so an early `Initialize`
+    // can't race with the rehydrate scan.
+    svc.rehydrate()
+        .await
+        .context("rehydrating persisted mounts")?;
 
     let reflection_svc = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
@@ -97,7 +105,7 @@ async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
     info!("Serving jj gRPC interface");
     let grpc_fut = GrpcServer::builder()
         .add_service(reflection_svc)
-        .add_service(jj_svc)
+        .add_service(svc.into_server())
         .serve(addr);
 
     let vfs_fut = vfs_mgr.serve();

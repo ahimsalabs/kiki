@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use proto::jj_interface::*;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use crate::mount_meta::{self, MountMetadata};
 use crate::store::Store;
 use crate::ty;
 use crate::vfs::{FsError, JjYakFs, YakFs};
@@ -43,28 +45,23 @@ impl StorageConfig {
     /// Returns `None` for the in-memory variant.
     fn store_path_for(&self, working_copy_path: &str) -> Option<PathBuf> {
         match self {
-            StorageConfig::OnDisk { root } => Some(
-                root.join("mounts")
-                    .join(mount_dir_name(working_copy_path))
-                    .join("store.redb"),
-            ),
+            StorageConfig::OnDisk { root } => {
+                Some(mount_meta::store_path(root, working_copy_path))
+            }
             StorageConfig::InMemory => None,
         }
     }
-}
 
-/// Path-safe stable id for a working-copy path. Uses blake3 (already a
-/// workspace dep, used by the content-addressed `Id`) truncated to 16
-/// hex chars (64 bits) — collisions in this namespace require ~4 billion
-/// unique mounts on one host, which is well outside the design space.
-fn mount_dir_name(working_copy_path: &str) -> String {
-    let hash = crate::hash::blake3_bytes(working_copy_path.as_bytes());
-    let mut s = String::with_capacity(16);
-    for b in &hash.as_bytes()[..8] {
-        use std::fmt::Write;
-        let _ = write!(&mut s, "{b:02x}");
+    /// Where the `mount.toml` for `working_copy_path` should live, if
+    /// any. Returns `None` for the in-memory variant.
+    fn meta_path_for(&self, working_copy_path: &str) -> Option<PathBuf> {
+        match self {
+            StorageConfig::OnDisk { root } => {
+                Some(mount_meta::meta_path(root, working_copy_path))
+            }
+            StorageConfig::InMemory => None,
+        }
     }
-    s
 }
 
 /// Map a fallible proto-decode error onto an `invalid_argument` gRPC status.
@@ -133,6 +130,42 @@ struct Mount {
     /// `VfsManagerHandle`. Production `Initialize` always populates it.
     #[allow(dead_code)] // dropped on Mount drop, never read directly
     attachment: Option<MountAttachment>,
+    /// Where the persisted `mount.toml` lives (M8 / Layer B). `None`
+    /// for `StorageConfig::InMemory`. Mutating RPCs
+    /// (`SetCheckoutState`, `CheckOut`, `Snapshot`) re-write this file
+    /// so a daemon restart sees current state.
+    meta_path: Option<PathBuf>,
+}
+
+impl Mount {
+    /// Snapshot the persistable subset of this mount's state.
+    fn metadata(&self) -> MountMetadata {
+        MountMetadata {
+            working_copy_path: self.working_copy_path.clone(),
+            remote: self.remote.clone(),
+            op_id: self.op_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            root_tree_id: self.root_tree_id.clone(),
+        }
+    }
+
+    /// Persist the current metadata to disk if the mount is backed by
+    /// a real `<storage_dir>` (not the in-memory test variant). Logs
+    /// failures rather than propagating them — the in-memory state is
+    /// still authoritative; a transient write failure shouldn't fail
+    /// the RPC. Hard failures will resurface on the next restart's
+    /// rehydrate scan.
+    fn persist_metadata(&self) {
+        if let Some(path) = &self.meta_path {
+            if let Err(e) = self.metadata().write_to(path) {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %format!("{e:#}"),
+                    "failed to persist mount metadata"
+                );
+            }
+        }
+    }
 }
 
 pub struct JujutsuService {
@@ -158,15 +191,102 @@ impl JujutsuService {
     /// `StorageConfig::OnDisk { root: <storage_dir from daemon.toml> }`;
     /// tests that don't care about durability use
     /// `StorageConfig::InMemory`.
-    pub fn new(
-        vfs_handle: Option<VfsManagerHandle>,
-        storage: StorageConfig,
-    ) -> jujutsu_interface_server::JujutsuInterfaceServer<Self> {
-        jujutsu_interface_server::JujutsuInterfaceServer::new(JujutsuService {
+    ///
+    /// Returns the bare `JujutsuService`. Call [`Self::rehydrate`] to
+    /// re-attach mounts left behind by a previous daemon process, then
+    /// [`Self::into_server`] to wrap it for tonic.
+    pub fn new(vfs_handle: Option<VfsManagerHandle>, storage: StorageConfig) -> Self {
+        JujutsuService {
             mounts: Arc::new(Mutex::new(HashMap::new())),
             vfs_handle,
             storage,
-        })
+        }
+    }
+
+    /// Wrap the service in the tonic-generated server type. Consumes
+    /// `self` because the server takes the service by value.
+    pub fn into_server(self) -> jujutsu_interface_server::JujutsuInterfaceServer<Self> {
+        jujutsu_interface_server::JujutsuInterfaceServer::new(self)
+    }
+
+    /// Re-attach every mount described by a `mount.toml` under
+    /// `<storage_dir>/mounts/`. Run once at startup, before the gRPC
+    /// listener accepts connections — otherwise an early `Initialize`
+    /// could race with the rehydrate scan.
+    ///
+    /// Failures for a single mount are logged and skipped; a corrupt
+    /// mount.toml or missing redb shouldn't take the daemon down. The
+    /// operator can prune the broken subdir manually.
+    pub async fn rehydrate(&self) -> anyhow::Result<()> {
+        let root = match &self.storage {
+            StorageConfig::OnDisk { root } => root.clone(),
+            StorageConfig::InMemory => return Ok(()),
+        };
+        let entries = mount_meta::list_persisted(&root)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        info!(count = entries.len(), "rehydrating mounts from {}", root.display());
+        for (mount_dir, meta) in entries {
+            if let Err(e) = self.rehydrate_one(&meta).await {
+                tracing::error!(
+                    path = %meta.working_copy_path,
+                    dir = %mount_dir.display(),
+                    error = %format!("{e:#}"),
+                    "failed to rehydrate mount; skipping"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn rehydrate_one(&self, meta: &MountMetadata) -> anyhow::Result<()> {
+        let store = Arc::new(open_store_for(&self.storage, &meta.working_copy_path)?);
+        let root_tree_id: ty::Id = if meta.root_tree_id.is_empty() {
+            store.get_empty_tree_id()
+        } else {
+            meta.root_tree_id
+                .clone()
+                .try_into()
+                .context("decoding stored root_tree_id")?
+        };
+        let fs: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store.clone(), root_tree_id));
+
+        // The previous daemon's FUSE/NFS mount went away when its
+        // process exited (kernel drops the mount). On restart the path
+        // is no longer a mountpoint, so `validate_mountpoint` should
+        // accept it as long as no one repopulated the dir in between.
+        let attachment = if let Some(vfs) = &self.vfs_handle {
+            validate_mountpoint(&meta.working_copy_path).map_err(|e| {
+                anyhow::anyhow!("mountpoint no longer valid for rehydrate: {e}")
+            })?;
+            let (_transport, attachment) = vfs
+                .bind(meta.working_copy_path.clone(), fs.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("vfs bind failed: {e}"))?;
+            Some(attachment)
+        } else {
+            None
+        };
+
+        let meta_path = self.storage.meta_path_for(&meta.working_copy_path);
+        let mut mounts = self.mounts.lock().await;
+        mounts.insert(
+            meta.working_copy_path.clone(),
+            Mount {
+                working_copy_path: meta.working_copy_path.clone(),
+                remote: meta.remote.clone(),
+                op_id: meta.op_id.clone(),
+                workspace_id: meta.workspace_id.clone(),
+                root_tree_id: root_tree_id.0.to_vec(),
+                store,
+                fs,
+                attachment,
+                meta_path,
+            },
+        );
+        info!(path = %meta.working_copy_path, "rehydrated mount");
+        Ok(())
     }
 
     /// Bare service without the gRPC server wrapping or any VFS attach.
@@ -362,19 +482,32 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 req.path
             )));
         }
-        mounts.insert(
-            req.path.clone(),
-            Mount {
-                working_copy_path: req.path,
-                remote: req.remote,
-                op_id: Vec::new(),
-                workspace_id: Vec::new(),
-                root_tree_id: root_tree_id.0.to_vec(),
-                store,
-                fs,
-                attachment,
-            },
-        );
+        let meta_path = self.storage.meta_path_for(&req.path);
+        let mount = Mount {
+            working_copy_path: req.path.clone(),
+            remote: req.remote,
+            op_id: Vec::new(),
+            workspace_id: Vec::new(),
+            root_tree_id: root_tree_id.0.to_vec(),
+            store,
+            fs,
+            attachment,
+            meta_path,
+        };
+        // Persist initial metadata so `rehydrate` can re-attach the
+        // mount across daemon restarts even before the CLI's first
+        // `SetCheckoutState`. Failure here is fatal — the mount has
+        // not been registered yet and we'd rather report the error
+        // than have a half-persisted state.
+        if let Some(path) = &mount.meta_path {
+            mount.metadata().write_to(path).map_err(|e| {
+                Status::internal(format!(
+                    "writing initial mount.toml for {}: {e:#}",
+                    req.path
+                ))
+            })?;
+        }
+        mounts.insert(req.path.clone(), mount);
 
         let reply = InitializeReply {
             transport: transport.map(transport_to_proto),
@@ -612,6 +745,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         })?;
         mount.op_id = checkout.op_id;
         mount.workspace_id = checkout.workspace_id;
+        mount.persist_metadata();
         Ok(Response::new(SetCheckoutStateReply {}))
     }
 
@@ -649,6 +783,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let mut mounts = self.mounts.lock().await;
         if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
             mount.root_tree_id = new_root.0.to_vec();
+            mount.persist_metadata();
         } else {
             // Mount disappeared between the two locks; surface as
             // not_found rather than internal-error so a transient race
@@ -706,6 +841,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let mut mounts = self.mounts.lock().await;
         if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
             mount.root_tree_id = req.new_tree_id;
+            mount.persist_metadata();
         } else {
             // Mount disappeared between the two locks. Extremely
             // unlikely (no Unmount RPC exists yet) but we should not
@@ -1252,5 +1388,94 @@ mod tests {
             let path = dir.path().to_str().unwrap().to_owned();
             validate_mountpoint(&path).expect("empty dir on same fs");
         }
+    }
+
+    /// `Initialize` writes `mount.toml`; `SetCheckoutState` updates it;
+    /// rehydrate on a fresh service rebuilds the in-memory `Mount` from
+    /// the on-disk metadata + redb store (M8 / Layer B).
+    #[tokio::test]
+    async fn persisted_mount_rehydrates_after_restart() {
+        let storage_dir = tempfile::tempdir().expect("storage tempdir");
+        let mount_path = "/tmp/yak-rehydrate-test";
+
+        // Phase 1: initialize and stamp some checkout state into the
+        // first daemon. No VFS bind (vfs_handle = None) so we can use
+        // arbitrary string paths without creating real directories.
+        let svc1 = JujutsuService::new(
+            None,
+            StorageConfig::on_disk(storage_dir.path().to_owned()),
+        );
+        svc1.initialize(Request::new(InitializeReq {
+            path: mount_path.into(),
+            remote: "remote-x".into(),
+        }))
+        .await
+        .expect("initialize");
+
+        let op_id = vec![0xab, 0xcd, 0xef];
+        let workspace_id = b"default".to_vec();
+        svc1.set_checkout_state(Request::new(SetCheckoutStateReq {
+            working_copy_path: mount_path.into(),
+            checkout_state: Some(CheckoutState {
+                op_id: op_id.clone(),
+                workspace_id: workspace_id.clone(),
+            }),
+        }))
+        .await
+        .expect("set_checkout_state");
+
+        // Confirm mount.toml exists with expected content.
+        let meta_path = mount_meta::meta_path(storage_dir.path(), mount_path);
+        let on_disk = MountMetadata::read_from(&meta_path).expect("read mount.toml");
+        assert_eq!(on_disk.working_copy_path, mount_path);
+        assert_eq!(on_disk.remote, "remote-x");
+        assert_eq!(on_disk.op_id, op_id);
+        assert_eq!(on_disk.workspace_id, workspace_id);
+
+        // Drop svc1 — simulates daemon restart.
+        drop(svc1);
+
+        // Phase 2: fresh service over the same storage_dir. Rehydrate
+        // re-attaches the mount; subsequent `GetCheckoutState` returns
+        // the values we wrote earlier.
+        let svc2 = JujutsuService::new(
+            None,
+            StorageConfig::on_disk(storage_dir.path().to_owned()),
+        );
+        svc2.rehydrate().await.expect("rehydrate");
+
+        let got = svc2
+            .get_checkout_state(Request::new(GetCheckoutStateReq {
+                working_copy_path: mount_path.into(),
+            }))
+            .await
+            .expect("get_checkout_state")
+            .into_inner();
+        assert_eq!(got.op_id, op_id);
+        assert_eq!(got.workspace_id, workspace_id);
+
+        // DaemonStatus should also list the rehydrated mount with the
+        // correct remote, proving Mount.remote round-tripped.
+        let status = svc2
+            .daemon_status(Request::new(DaemonStatusReq {}))
+            .await
+            .expect("daemon_status")
+            .into_inner();
+        assert_eq!(status.data.len(), 1);
+        assert_eq!(status.data[0].path, mount_path);
+        assert_eq!(status.data[0].remote, "remote-x");
+    }
+
+    /// Rehydrating an empty `storage_dir` is a no-op (the
+    /// `<storage_dir>/mounts/` directory may not exist yet on a fresh
+    /// install). It must not error.
+    #[tokio::test]
+    async fn rehydrate_with_no_mounts_is_noop() {
+        let storage_dir = tempfile::tempdir().expect("storage tempdir");
+        let svc = JujutsuService::new(
+            None,
+            StorageConfig::on_disk(storage_dir.path().to_owned()),
+        );
+        svc.rehydrate().await.expect("rehydrate empty dir");
     }
 }
