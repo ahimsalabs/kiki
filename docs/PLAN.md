@@ -1,18 +1,23 @@
 # jj-yak: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C). M1–M7
-done — see [`PLAN-M1-6.md`](./PLAN-M1-6.md) for M1–M6 detail and §10
-below for the M7 outcome. **Integration tests now run with
+Status: active. Transport architecture decided (§4.3 Path C). M1–M8
+done — see [`PLAN-M1-6.md`](./PLAN-M1-6.md) for M1–M6 detail, §10
+for M7, and §12 for M8. **Integration tests now run with
 `disable_mount = false`**: `jj yak init` + `jj new` round-trip
 through a real Linux FUSE mount, `.jj/` is excluded from snapshots,
 and the working-copy `@` advances correctly across mutations.
 A post-M7 code audit (§10.3) closed four real bugs and two clippy
 warnings; `cargo clippy --workspace --all-targets -- -D warnings`
-is clean and 88/88 tests pass.
-The next milestone is **Layer B — durable storage** (§8). Until that
-lands the daemon's per-mount `HashMap` `Store` loses everything on
-restart.
-Last updated: 2026-04-26
+is clean and 99/99 tests pass.
+M8 (Layer B) is done: per-mount `Store` is now backed by a redb
+file under `<storage_dir>/mounts/<hash(wc_path)>/store.redb`, and
+per-mount metadata (`op_id`, `workspace_id`, `root_tree_id`,
+`remote`) persists in `mount.toml`; the daemon rehydrates known
+mounts on startup. The next milestone is **Layer C — remote
+storage** (§3, §4). Inode handle stability (§7 decision 6) is
+still deferred; the in-memory slab is fine until kernel handles
+need to survive a daemon restart in production.
+Last updated: 2026-04-28
 
 This document captures the roadmap for getting jj-yak from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -92,17 +97,31 @@ After M6 the daemon-side VCS surface is feature-complete.
     false`, M7-gated `test_nested_tree_round_trips` and
     `test_symlink_tree_round_trips` un-ignored.
 
+- **M8.** Layer B done — per-mount durable storage. redb-backed
+  `Store` (one file per mount under
+  `<storage_dir>/mounts/<hash(wc_path)>/store.redb`); same sync API
+  as the M1–M7 `HashMap` impl, but methods now return
+  `anyhow::Result<…>` so I/O failures don't panic. Mount metadata
+  (`working_copy_path`, `remote`, `op_id`, `workspace_id`,
+  `root_tree_id`) persists in `mount.toml` next to the store.
+  `JujutsuService::rehydrate` runs at daemon startup before the
+  gRPC listener accepts connections, re-binding every persisted
+  mount. `server/` crate deleted as a hygiene capstone. Detail in
+  §12.
+
 ## 3. What's deferred
 
-- **Layer B (persistence):** the daemon's `HashMap` `Store` loses state on
-  restart. Add `sled` or `redb` next.
 - **Layer C (remote):** `Initialize.remote` is currently a string that's
-  stored and ignored. Make it real after Layer B.
+  stored on the per-mount `mount.toml` and surfaced via `DaemonStatus`,
+  but otherwise ignored. Wire to a real remote next.
+- **Inode handle stability across restarts (§7 decision 6):** the
+  in-memory slab still uses monotonic `next_id`. Layer B persists the
+  Store but kernel handles still don't survive a daemon restart;
+  applications keeping fds open across the restart will see ESTALE.
+  Land alongside the `fuser` migration (§11) when perf matters.
 - **Sparse patterns:** `set_sparse_patterns` can stay `todo!` until there's
   a real reason. Most yak users probably don't want sparse if the FS is
   already lazy.
-- **Cleanup of `server/` crate:** `server/src/main.rs` is 3 lines (just
-  `Hello, world!`). Delete it next time you're in `Cargo.toml`.
 
 ## 4. Areas of concern
 
@@ -353,33 +372,34 @@ Worth doing in passing, not blocking:
 
 ## 8. Recommended starting point
 
-**M1–M7 are done.** Integration tests run with `disable_mount = false`:
+**M1–M8 are done.** Integration tests run with `disable_mount = false`:
 `jj yak init`, `jj new`, `jj log`, `jj op log`, and the
 `test_nested_tree_round_trips` / `test_symlink_tree_round_trips`
-end-to-end paths succeed on a real Linux FUSE mount. M7 detail in §10.
+end-to-end paths succeed on a real Linux FUSE mount, and the
+per-mount Store is now durable across daemon restarts (M8 detail in
+§12). M7 detail in §10.
 
-**Next: Layer B — durable storage.** The per-mount `HashMap<Id, …>`
-`Store` loses everything on daemon restart (M6's
-snapshot-cleans-the-slab pattern means even an in-flight write is
-durable across `Snapshot` calls but not across daemon restarts).
-Pick `redb` or `sled`, swap the `HashMap` impls behind the same
-sync API, and the Mount-id derivation in §7 decision 6 becomes
-necessary so kernel handles survive restart.
+**Next: Layer C — remote storage.** `Initialize.remote` currently
+round-trips through `mount.toml` and `DaemonStatus` but is otherwise
+a string the daemon ignores. Wiring it up means: an outbound store
+that pushes new commits/files/trees to the remote on `Snapshot`,
+read-through fetch on `StoreMiss` during `lookup`/`read`, and
+concurrency arbitration when two mounts at the same remote try to
+write the same tree id. The redb store is the natural cache layer;
+each remote-fetched blob lands in the same redb file. PLAN §7
+decision 8 calls out concurrency-against-shared-remote as the
+specific Layer C question.
 
-**Hygiene to fold in around Layer B:**
+**Hygiene still pending:**
 
 - **Inode handle stability across restarts** (§7 decision 6).
-  Implementation lands alongside Layer B; the slab API is already the
-  right shape, just swap the id source from monotonic `next_id` to a
-  derived `(parent_tree_id, name)` hash.
-- **`unwrap()` audit.** Acceptable while the daemon is single-developer,
-  but tighter error-mapping should land before any user touches the
-  daemon (`BackendError::Other` / `WorkingCopyStateError::Other`
-  passthrough at every boundary). Partially done in §10.3; the
-  Layer B work will pick up the remaining boundaries when the
-  `redb`/`sled` swap forces a fresh look at the Store API.
-- **Delete `server/` crate.** Three lines of "Hello, world!"; just
-  remove from `Cargo.toml`.
+  Layer B persists the Store but kernel handles still don't survive
+  a daemon restart. Land alongside the `fuser` migration (§11). The
+  slab API is the right shape; just swap the id source from
+  monotonic `next_id` to a derived `(parent_tree_id, name)` hash.
+- **`unwrap()` audit.** Partially done in §10.3 and §12. The
+  remaining 33 `Mutex::lock().unwrap()` in `cli/src/blocking_client.rs`
+  are CLI-process-lifetime safe and tracked separately.
 - **Tracing for the CLI.** Daemon already has it; CLI gets `RUST_LOG`
   setup that helps debug snapshot/checkout RPC traffic.
 
@@ -604,3 +624,120 @@ switching to a sync trait.
 
 Land alongside Layer B if possible (we'll already be touching
 per-Mount state for stable inode ids).
+
+## 12. M8 outcome — Layer B durable storage (done)
+
+Two pieces had to land before the daemon could survive a restart with
+the `Mount` map still meaningful: durable per-mount blobs (12.1) and
+durable per-mount metadata (12.2). Both shipped; 99 tests pass, clippy
+clean, integration suite still green on a real FUSE mount.
+
+Decisions made up front (see request log 2026-04-28):
+
+- **redb 2.x** over sled or fjall. Pure-Rust, ACID, sync `Database`
+  fits the existing `Store` shape; built-in `InMemoryBackend` for
+  tests; stable 2.x API with no LSM-style background merges.
+- **Configurable storage_dir, default to a daemon-managed dir.**
+  `daemon.toml` now requires `storage_dir`; `cache` is parsed via
+  `#[serde(default)]` so old configs still load but the field has no
+  effect.
+- **In scope:** persist Store + persist Mount metadata + rehydrate on
+  startup + delete `server/` crate.
+- **Out of scope (deferred):** stable inode ids derived from
+  `(parent_tree_id, name)` (§7 decision 6). Kernel handles still
+  don't survive a daemon restart — applications keeping fds open
+  through a restart will see ESTALE. Lands when perf justifies the
+  `fuser` migration (§11).
+
+### 12.1 redb-backed Store
+
+Schema is four tables (`commits_v1`, `files_v1`, `symlinks_v1`,
+`trees_v1`), keyed by 32-byte content-hash bytes, values prost-
+encoded. The `_v1` suffix is intentional — schema breaks bump the
+suffix and add a migration step rather than reusing a name. The
+empty tree is seeded on first open so callers can still
+`get_empty_tree_id` -> `get_tree` without a special case.
+
+Surface changes:
+
+- `Store::new()` → `Store::open(path)` for production,
+  `Store::new_in_memory()` for tests. Tests opt into an
+  `InMemoryBackend` (no tempdir clutter).
+- All Store getters/writers now return `anyhow::Result<…>`. The
+  pre-M8 infallible API was a `HashMap` artifact; redb commits, table
+  opens, and prost decodes are all real failure points. PLAN.md §10.3
+  just removed `panic!` from the daemon's hot paths — introducing
+  new ones would have regressed.
+- New `FsError::StoreError(String)` variant alongside `StoreMiss`.
+  Both adapters map it to `EIO`/`NFS3ERR_IO` and emit a
+  `tracing::warn!` carrying the chained anyhow context before
+  collapsing — surfacing the underlying redb message at the trace
+  layer is much more useful than a bare errno.
+- `JujutsuService::new` now takes a `StorageConfig`
+  (`OnDisk { root }` or `InMemory`); `Initialize` opens the per-mount
+  Store at `<root>/mounts/<hash(wc_path)>/store.redb` (blake3 of the
+  WC path, truncated to 16 hex chars; collisions in this namespace
+  would require ~4B unique mounts on one host).
+- New `StoreTestExt` trait (`#[cfg(test)]`) preserves test-site
+  ergonomics — `store.put_file(...)` / `store.read_tree(id)` instead
+  of `.expect("write_file").expect("file present")` everywhere.
+
+### 12.2 Mount metadata + rehydrate
+
+Each per-mount directory now holds `mount.toml` next to `store.redb`,
+carrying everything `Mount` previously kept only in memory:
+`working_copy_path`, `remote`, `op_id`, `workspace_id`,
+`root_tree_id`. TOML rather than a redb table: trivial to inspect,
+zero coupling to the content-addressed store, atomic writes via
+`<file>.tmp` + rename. Bytes are hex-encoded since TOML has no
+native byte type.
+
+Persist points:
+
+- `Initialize` writes the initial file. Failure here is fatal
+  (`Status::internal`) — the mount has not been registered yet, and
+  half-state would be worse than a clean error.
+- `SetCheckoutState`, `Snapshot`, `CheckOut` re-write on relevant
+  mutations. Failure here is logged at `error` level but doesn't
+  fail the RPC; the in-memory state is still authoritative, and a
+  transient write failure shouldn't surface as `jj log` failing.
+
+Rehydrate:
+
+- `JujutsuService::rehydrate` runs once at startup, *before* the
+  gRPC listener accepts connections. Otherwise an early `Initialize`
+  could race with the rehydrate scan.
+- Per-mount failures (corrupt TOML, missing redb, mountpoint no
+  longer empty) are logged and the mount is skipped. Bringing the
+  daemon down on one bad subdir is worse than letting the operator
+  clean up.
+- Sort by `working_copy_path` so `DaemonStatus` is deterministic
+  across restarts.
+- Surface change: `JujutsuService::new` now returns `Self`; add
+  `into_server(self)` for the wrapped form `main.rs` needs after
+  rehydrate.
+
+Test coverage: `persisted_mount_rehydrates_after_restart` drops a
+service after writing checkout state, builds a fresh one over the
+same `storage_dir`, and confirms `GetCheckoutState` and
+`DaemonStatus` both see the rehydrated mount; `mount_meta::tests`
+covers TOML round-trip, hex parser, and `list_persisted` skipping
+unreadable entries; `Store::open_persists_across_reopen` covers the
+redb durability primitive itself.
+
+### 12.3 What `unwrap()` audit picked up alongside
+
+- `Store` API now `Result`-returning across the board (above).
+- New `store_status` helper in `service.rs` mirrors the existing
+  `decode_status`: maps Layer-B errors to `Status::internal` with
+  the chained `{:#}` formatter so the root cause survives the wire.
+
+Still un-touched: the 33 `Mutex::lock().unwrap()` in
+`cli/src/blocking_client.rs`. CLI-process-lifetime safe, tracked in
+§5.
+
+### 12.4 Hygiene capstone
+
+Deleted the empty `server/` workspace member (3-line
+`Hello, world!` `main.rs`, no dependencies, never wired up). PLAN.md
+§3 had flagged it for deletion since M1.
