@@ -13,8 +13,8 @@ M8 (Layer B) is done: per-mount `Store` is now backed by a redb
 file under `<storage_dir>/mounts/<hash(wc_path)>/store.redb`, and
 per-mount metadata (`op_id`, `workspace_id`, `root_tree_id`,
 `remote`) persists in `mount.toml`; the daemon rehydrates known
-mounts on startup. The next milestone is **Layer C — remote
-storage** (§3, §4). Inode handle stability (§7 decision 6) is
+mounts on startup. **M9 (Layer C — remote blob CAS) is in
+flight**; spec in §13. Inode handle stability (§7 decision 6) is
 still deferred; the in-memory slab is fine until kernel handles
 need to survive a daemon restart in production.
 Last updated: 2026-04-28
@@ -113,7 +113,10 @@ After M6 the daemon-side VCS surface is feature-complete.
 
 - **Layer C (remote):** `Initialize.remote` is currently a string that's
   stored on the per-mount `mount.toml` and surfaced via `DaemonStatus`,
-  but otherwise ignored. Wire to a real remote next.
+  but otherwise ignored. M9 (§13) wires a byte-typed
+  `RemoteStore` trait + two backends (`dir://`, `grpc://`) into
+  the per-mount `Store` for blob-CAS read-through and write-through.
+  Mutable pointers (op heads) deferred to M10.
 - **Inode handle stability across restarts (§7 decision 6):** the
   in-memory slab still uses monotonic `next_id`. Layer B persists the
   Store but kernel handles still don't survive a daemon restart;
@@ -379,16 +382,17 @@ end-to-end paths succeed on a real Linux FUSE mount, and the
 per-mount Store is now durable across daemon restarts (M8 detail in
 §12). M7 detail in §10.
 
-**Next: Layer C — remote storage.** `Initialize.remote` currently
-round-trips through `mount.toml` and `DaemonStatus` but is otherwise
-a string the daemon ignores. Wiring it up means: an outbound store
-that pushes new commits/files/trees to the remote on `Snapshot`,
-read-through fetch on `StoreMiss` during `lookup`/`read`, and
-concurrency arbitration when two mounts at the same remote try to
-write the same tree id. The redb store is the natural cache layer;
-each remote-fetched blob lands in the same redb file. PLAN §7
-decision 8 calls out concurrency-against-shared-remote as the
-specific Layer C question.
+**Next: M9 — Layer C: remote blob CAS.** Spec in §13.
+`Initialize.remote` currently round-trips through `mount.toml` and
+`DaemonStatus` but is otherwise a string the daemon ignores. M9
+wires a byte-typed `RemoteStore` trait (`get_blob`/`put_blob`/
+`has_blob`) with two backends — `dir://` (filesystem fake, also a
+permanent test fixture) and `grpc://` (peer daemon over the
+existing tonic listener) — into the per-mount `Store` for
+synchronous write-through on `Snapshot` and read-through fetch on
+local miss. Mutable pointers (op heads, ref tips) and multi-mount
+concurrency arbitration are out of scope for M9 and tracked for
+M10.
 
 **Hygiene still pending:**
 
@@ -741,3 +745,185 @@ Still un-touched: the 33 `Mutex::lock().unwrap()` in
 Deleted the empty `server/` workspace member (3-line
 `Hello, world!` `main.rs`, no dependencies, never wired up). PLAN.md
 §3 had flagged it for deletion since M1.
+
+## 13. M9 — Layer C: remote blob CAS (in flight)
+
+M9 wires `Initialize.remote` from a passive string on `mount.toml`
+into a real outbound + read-through path. Scope is deliberately
+narrow: **content-addressed blobs only**. Mutable pointers (op
+heads, ref tips) are explicitly out of scope — they ride on
+top of CAS but need their own arbitration story (§13.5) and that
+story doesn't fit cleanly inside one milestone.
+
+### 13.1 Trait shape
+
+The local `Store` is jj-typed (`get_tree`/`write_file`/...) because
+it round-trips prost messages. The remote doesn't need to know
+about jj types — it's a content-addressed blob store. Blob IDs are
+already 32-byte hashes; values are already prost-encoded `bytes`.
+So the trait is byte-typed:
+
+```rust
+#[async_trait]
+trait RemoteStore: Send + Sync {
+    async fn get_blob(&self, kind: BlobKind, id: &Id) -> Result<Option<Bytes>>;
+    async fn put_blob(&self, kind: BlobKind, id: &Id, bytes: Bytes) -> Result<()>;
+    async fn has_blob(&self, kind: BlobKind, id: &Id) -> Result<bool>;
+}
+
+enum BlobKind { Tree, File, Symlink, Commit }
+```
+
+`BlobKind` is on the trait — not implicit in the bytes — because
+the wire-side storage can route by table the same way redb does
+locally, and because a content hash collision across kinds is
+benign-but-confusing without it. Keeping it on the trait also lets
+backends that prefer one big keyspace (S3 prefix, IPLD) flatten it
+themselves.
+
+**Why byte-typed beats Store-mirror:**
+
+- Three methods × N backends instead of twelve. Smaller surface
+  for every new backend.
+- Decouples the remote protocol from prost schema evolution. Proto
+  v2 lands → daemon-to-daemon RPC stays the same; only the daemon
+  cares about decoding.
+- Idempotent by construction: byte-identical puts under the same
+  `(kind, id)` are no-ops. Two mounts pushing the same blob is
+  benign — no coordination needed for blobs (the §7 #8 concurrency
+  question reduces to mutable-pointer arbitration, which is
+  deferred).
+
+### 13.2 Composition: `Store` learns to wrap a `RemoteStore`
+
+`Store::open` and `Store::new_in_memory` grow a sibling
+`open_with_remote(path, remote)` /
+`new_in_memory_with_remote(remote)`. Wrap-shape:
+
+- **write-through.** `write_file/tree/symlink/commit` first commit
+  to local redb, then `put_blob` to the remote. Synchronous push:
+  the RPC blocks until the remote is durable (§13.4). On `put_blob`
+  failure, the local write has already happened — return the error
+  but don't roll back. The next snapshot will reattempt push for
+  every still-locally-resident blob; the daemon doesn't track
+  "already-pushed" state in M9 (idempotent put + has_blob is enough
+  to make this cheap when it matters).
+- **read-through.** `get_*` returns local hit fast. On local miss
+  *and* a remote is configured, `get_blob`, decode, write-back to
+  local redb, return. On local miss with no remote: `Ok(None)` —
+  the existing `StoreMiss` path keeps working.
+- **bytes encoding.** The encoding is exactly what redb stores
+  today: `prost::Message::encode_to_vec()` on the `*::as_proto()`
+  result. Local→remote is a `Bytes::clone` of the same buffer.
+  No re-encoding.
+
+### 13.3 Backends
+
+Two impls in M9. Two is the magic number for trait extraction —
+with one impl the trait is shaped by what's easy, not what's
+needed.
+
+- **`FsRemoteStore`** (`dir://` scheme). Blobs at
+  `<root>/<kind>/<hex(id)>`. Atomic put: write to
+  `<root>/<kind>/.tmp.<rand>`, fsync, rename. `has_blob` is a
+  `metadata().is_ok()` probe. No locking; concurrent identical-puts
+  race on rename and the loser gets `EEXIST` (treated as success).
+  Stays as a permanent test fixture and "shared NFS dir between two
+  hosts" tool.
+- **`GrpcRemoteStore`** (`grpc://host:port` scheme). Tonic client
+  against the new `RemoteStore` service (§13.6). The same daemon
+  binary serves the `RemoteStore` service on its existing gRPC
+  listener, so any daemon can act as the remote for another. No
+  new auth design — same trust assumptions as the existing
+  `JujutsuInterface` (single-user, localhost). TLS + auth land in
+  M11 alongside S3.
+
+URL parsing in `daemon/src/remote/mod.rs::parse(remote: &str) ->
+Result<Option<Arc<dyn RemoteStore>>>`. Empty string = `None`
+(current behavior preserved). Unknown scheme =
+`Status::invalid_argument` at `Initialize`.
+
+### 13.4 Push timing: synchronous on Snapshot
+
+`Snapshot` blocks until every newly-written blob lands on the
+remote. Pros: deterministic, easy to test, matches the "WC commit
+is durable" mental model. Cons: ties RPC latency to remote latency
+— fine for `dir://` and localhost gRPC, will hurt with a real
+network remote.
+
+Async background queue (with restart-survivable state) is the
+M10/M11 follow-up. The current sync code path is the right shape
+for the queue: `Store::write_file` returns the same `Id` either
+way, and the queue just batches `put_blob` calls instead of
+inlining them.
+
+### 13.5 Out of scope (explicit)
+
+- **Mutable pointers (op heads, ref tips).** Pushing the bytes of
+  `.jj/op_heads/heads/<id>` works today via §10.1's
+  pinned-`.jj`-walk-into-Store path, and those file blobs would
+  flow to the remote naturally under M9. But the *catalog* — "what
+  is the latest op_id for this remote?" — has no home in CAS, and
+  M9 doesn't add one. Two daemons sharing a `dir://` blob store
+  can sync content but not op-log linearity.
+- **Concurrency arbitration across mounts (§7 #8).** Single-mount-
+  per-remote remains the documented assumption. Two mounts at the
+  same remote pushing the same blob is benign (idempotent CAS); two
+  mounts pushing competing op-log heads is undefined and won't be
+  defined until M10's mutable-pointer protocol.
+- **Auth, TLS, retry/backoff.** Localhost-only, single-user, no
+  TLS. Land alongside S3 (M11+).
+- **Stable inode ids across restarts (§7 decision 6).** Still
+  deferred; lands with the `fuser` migration (§11).
+
+### 13.6 Wire protocol (gRPC backend)
+
+New `service RemoteStore` in `proto/jj_interface.proto`:
+
+```
+service RemoteStore {
+  rpc GetBlob(GetBlobReq) returns (GetBlobReply) {}
+  rpc PutBlob(PutBlobReq) returns (PutBlobReply) {}
+  rpc HasBlob(HasBlobReq) returns (HasBlobReply) {}
+}
+
+enum BlobKind { TREE = 0; FILE = 1; SYMLINK = 2; COMMIT = 3; }
+message GetBlobReq  { BlobKind kind = 1; bytes id = 2; }
+message GetBlobReply { bool found = 1; bytes bytes = 2; }
+message PutBlobReq  { BlobKind kind = 1; bytes id = 2; bytes bytes = 3; }
+message PutBlobReply {}
+message HasBlobReq  { BlobKind kind = 1; bytes id = 2; }
+message HasBlobReply { bool found = 1; }
+```
+
+Unary RPCs in M9. Streaming put/get for large blobs is the obvious
+follow-up but not in scope; jj's typical blob sizes are well under
+the default 4 MiB tonic message cap.
+
+### 13.7 Test strategy
+
+- **Unit** — every Store method exercised against
+  `FsRemoteStore` over a `tempdir()`: write-through populates remote,
+  read-through on local miss populates local cache.
+- **Integration** — two `JujutsuService` instances over distinct
+  `storage_dir`s sharing a `dir://` remote. Service A writes a
+  file; service B issues `read_file` for the same id and gets the
+  content via read-through. Confirms the abstraction works
+  end-to-end and that two daemons over the same remote see each
+  other's blobs (modulo the §13.5 mutable-pointer caveat).
+- **gRPC backend** — analogous integration test where the "remote"
+  is service B's `RemoteStore` server. Proves the byte-typed trait
+  is honest under a real network transport.
+
+### 13.8 Commit plan
+
+One commit per task:
+
+1. PLAN.md §13 (this section).
+2. Proto: `service RemoteStore` + bindings.
+3. `RemoteStore` trait + `FsRemoteStore` + URL parser + unit tests.
+4. `Store` composition (read-through + write-through) + unit tests.
+5. `Initialize.remote` URL parse → per-mount RemoteStore.
+6. `GrpcRemoteStore` + daemon-side server impl + integration test.
+7. End-to-end fs-fake test (two services, shared `dir://` remote).
+8. PLAN.md M9 outcome (§13.9).
