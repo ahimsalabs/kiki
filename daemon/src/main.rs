@@ -9,6 +9,13 @@ use crate::service::StorageConfig;
 
 mod hash;
 mod mount_meta;
+// `remote` is exercised entirely by its own #[cfg(test)] tests in this
+// commit; wiring into production (`Store` composition + `Initialize.remote`
+// parse) lands in the next two commits, at which point this allow goes
+// away. Clippy `-D warnings` would otherwise fail on the public surface
+// being "never constructed" by the binary.
+#[allow(dead_code)]
+mod remote;
 mod service;
 mod store;
 mod ty;
