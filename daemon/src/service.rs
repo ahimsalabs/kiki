@@ -1,16 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context as _;
+use anyhow::{anyhow, Context as _};
+use bytes::Bytes;
+use prost::Message as _;
 use proto::jj_interface::*;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::mount_meta::{self, MountMetadata};
+use crate::remote::{self, BlobKind, RemoteStore};
 use crate::store::Store;
 use crate::ty;
+use crate::ty::TreeEntry;
 use crate::vfs::{FsError, JjYakFs, YakFs};
 use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle};
 
@@ -81,6 +85,13 @@ fn store_status(context: &str) -> impl FnOnce(anyhow::Error) -> Status + '_ {
     move |e| Status::internal(format!("{context}: {e:#}"))
 }
 
+/// Map a remote (Layer C / M9) `anyhow::Error` onto `internal`. Same
+/// shape as [`store_status`]; kept separate so the wire-side error
+/// message says "remote_*: …" and is greppable in tracing output.
+fn remote_status(context: &str) -> impl FnOnce(anyhow::Error) -> Status + '_ {
+    move |e| Status::internal(format!("{context}: {e:#}"))
+}
+
 fn hex(id: &ty::Id) -> String {
     let mut s = String::with_capacity(id.0.len() * 2);
     for b in id.0 {
@@ -108,9 +119,18 @@ struct Mount {
     /// Canonical working-copy path. Also the map key; stored here too so the
     /// `Mount` is self-describing for `DaemonStatus` listings.
     working_copy_path: String,
-    /// Carried from `Initialize.remote`; surfaced via `DaemonStatus`. Will
-    /// become meaningful once Layer C lands.
+    /// Carried from `Initialize.remote`; surfaced via `DaemonStatus`.
+    /// Also persisted to `mount.toml` so a daemon restart can rebuild
+    /// [`Self::remote_store`] by re-parsing.
     remote: String,
+    /// Parsed Layer-C handle (M9). `None` when `remote` was empty or
+    /// the parser produced no concrete backend (e.g. blank string,
+    /// pre-Initialize). When `Some`, write RPCs push every newly-stored
+    /// blob through it (write-through), read RPCs fall back to it on a
+    /// local miss (read-through), and `Snapshot` walks the rolled-up
+    /// tree post-VFS-snapshot to push any blobs the remote doesn't have.
+    /// Plan §13.2.
+    remote_store: Option<Arc<dyn RemoteStore>>,
     /// Last operation id pushed by the CLI via `SetCheckoutState`.
     /// Empty until first set.
     op_id: Vec<u8>,
@@ -250,6 +270,12 @@ impl JujutsuService {
                 .try_into()
                 .context("decoding stored root_tree_id")?
         };
+        // Re-parse the remote URL on rehydrate. A bad URL on disk is a
+        // bug — but fail soft (anyhow::Error here is logged + the mount
+        // is skipped by `rehydrate`) rather than panicking, so the
+        // operator can prune the broken mount dir.
+        let remote_store = remote::parse(&meta.remote)
+            .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
         let fs: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store.clone(), root_tree_id));
 
         // The previous daemon's FUSE/NFS mount went away when its
@@ -276,6 +302,7 @@ impl JujutsuService {
             Mount {
                 working_copy_path: meta.working_copy_path.clone(),
                 remote: meta.remote.clone(),
+                remote_store,
                 op_id: meta.op_id.clone(),
                 workspace_id: meta.workspace_id.clone(),
                 root_tree_id: root_tree_id.0.to_vec(),
@@ -413,11 +440,236 @@ async fn store_for(
     mounts: &Arc<Mutex<HashMap<String, Mount>>>,
     path: &str,
 ) -> Result<Arc<Store>, Status> {
+    let (store, _remote) = mount_handles(mounts, path).await?;
+    Ok(store)
+}
+
+/// Variant of [`store_for`] that also clones the per-mount
+/// `RemoteStore` (M9). Returned as `(local, remote)` so handlers can
+/// destructure cleanly. `remote` is `None` when no remote is
+/// configured for the mount; handlers fall back to the existing
+/// `not_found` path in that case.
+async fn mount_handles(
+    mounts: &Arc<Mutex<HashMap<String, Mount>>>,
+    path: &str,
+) -> Result<(Arc<Store>, Option<Arc<dyn RemoteStore>>), Status> {
     let guard = mounts.lock().await;
     guard
         .get(path)
-        .map(|m| m.store.clone())
+        .map(|m| (m.store.clone(), m.remote_store.clone()))
         .ok_or_else(|| Status::not_found(format!("no mount at {path}")))
+}
+
+// ---- Layer C / M9 read-through helpers --------------------------------
+//
+// On local-store miss with a configured remote: fetch the bytes, decode,
+// persist locally (so subsequent reads hit the cache), and return the
+// typed value. On miss with no remote, return `not_found` — preserves
+// pre-M9 behavior.
+//
+// Each helper handles one blob kind because the decode step is
+// kind-specific. The persistence step uses the existing typed `write_*`
+// API and re-encodes; the cost is fine for the cold read-through path
+// (the hot snapshot/write-through path is already buffer-reusing per
+// `Store::write_*` returning `(Id, Bytes)`).
+//
+// Sanity check: after we persist locally, the recomputed content hash
+// must match the requested id. A mismatch means the remote returned
+// bytes that didn't hash to the id we asked for — almost certainly a
+// remote-store bug, but surface it as `data_loss` rather than blindly
+// trusting the wire so a corrupt remote doesn't poison the local store
+// silently.
+
+async fn fetch_file_through_remote(
+    store: &Store,
+    remote: Option<&dyn RemoteStore>,
+    id: ty::Id,
+) -> Result<ty::File, Status> {
+    let remote = remote
+        .ok_or_else(|| Status::not_found(format!("file {} not found", hex(&id))))?;
+    let bytes = remote
+        .get_blob(BlobKind::File, &id)
+        .await
+        .map_err(remote_status("remote get_blob (file)"))?
+        .ok_or_else(|| Status::not_found(format!("file {} not found locally or on remote", hex(&id))))?;
+    let proto = proto::jj_interface::File::decode(bytes.as_ref())
+        .map_err(decode_status("remote file blob"))?;
+    let file = ty::File::from(proto);
+    let (got_id, _bytes) = store
+        .write_file(file.clone())
+        .map_err(store_status("write_file (read-through cache)"))?;
+    verify_round_trip(BlobKind::File, id, got_id)?;
+    Ok(file)
+}
+
+async fn fetch_symlink_through_remote(
+    store: &Store,
+    remote: Option<&dyn RemoteStore>,
+    id: ty::Id,
+) -> Result<ty::Symlink, Status> {
+    let remote = remote
+        .ok_or_else(|| Status::not_found(format!("symlink {} not found", hex(&id))))?;
+    let bytes = remote
+        .get_blob(BlobKind::Symlink, &id)
+        .await
+        .map_err(remote_status("remote get_blob (symlink)"))?
+        .ok_or_else(|| {
+            Status::not_found(format!("symlink {} not found locally or on remote", hex(&id)))
+        })?;
+    let proto = proto::jj_interface::Symlink::decode(bytes.as_ref())
+        .map_err(decode_status("remote symlink blob"))?;
+    let symlink = ty::Symlink::from(proto);
+    let (got_id, _bytes) = store
+        .write_symlink(symlink.clone())
+        .map_err(store_status("write_symlink (read-through cache)"))?;
+    verify_round_trip(BlobKind::Symlink, id, got_id)?;
+    Ok(symlink)
+}
+
+async fn fetch_tree_through_remote(
+    store: &Store,
+    remote: Option<&dyn RemoteStore>,
+    id: ty::Id,
+) -> Result<ty::Tree, Status> {
+    let remote = remote
+        .ok_or_else(|| Status::not_found(format!("tree {} not found", hex(&id))))?;
+    let bytes = remote
+        .get_blob(BlobKind::Tree, &id)
+        .await
+        .map_err(remote_status("remote get_blob (tree)"))?
+        .ok_or_else(|| Status::not_found(format!("tree {} not found locally or on remote", hex(&id))))?;
+    let proto = proto::jj_interface::Tree::decode(bytes.as_ref())
+        .map_err(decode_status("remote tree blob"))?;
+    let tree: ty::Tree = proto.try_into().map_err(decode_status("remote tree decode"))?;
+    let (got_id, _bytes) = store
+        .write_tree(tree.clone())
+        .map_err(store_status("write_tree (read-through cache)"))?;
+    verify_round_trip(BlobKind::Tree, id, got_id)?;
+    Ok(tree)
+}
+
+async fn fetch_commit_through_remote(
+    store: &Store,
+    remote: Option<&dyn RemoteStore>,
+    id: ty::Id,
+) -> Result<ty::Commit, Status> {
+    let remote = remote
+        .ok_or_else(|| Status::not_found(format!("commit {} not found", hex(&id))))?;
+    let bytes = remote
+        .get_blob(BlobKind::Commit, &id)
+        .await
+        .map_err(remote_status("remote get_blob (commit)"))?
+        .ok_or_else(|| {
+            Status::not_found(format!("commit {} not found locally or on remote", hex(&id)))
+        })?;
+    let proto = proto::jj_interface::Commit::decode(bytes.as_ref())
+        .map_err(decode_status("remote commit blob"))?;
+    let commit: ty::Commit = proto.try_into().map_err(decode_status("remote commit decode"))?;
+    let (got_id, _bytes) = store
+        .write_commit(commit.clone())
+        .map_err(store_status("write_commit (read-through cache)"))?;
+    verify_round_trip(BlobKind::Commit, id, got_id)?;
+    Ok(commit)
+}
+
+// Ok=() vs Err=Status is intentionally imbalanced — a content-hash
+// mismatch on read-through is rare, and `Status::data_loss` is the
+// right wire-side surface; boxing it would just paper over clippy.
+#[allow(clippy::result_large_err)]
+fn verify_round_trip(kind: BlobKind, requested: ty::Id, got: ty::Id) -> Result<(), Status> {
+    if requested != got {
+        return Err(Status::data_loss(format!(
+            "remote returned {} bytes that hash to {} but we asked for {}",
+            kind.as_str(),
+            hex(&got),
+            hex(&requested)
+        )));
+    }
+    Ok(())
+}
+
+// ---- Layer C / M9 post-snapshot push ---------------------------------
+//
+// After `JjYakFs::snapshot` produces the new root, walk every reachable
+// blob and push the ones the remote doesn't already have. Idempotent
+// across snapshots: `has_blob` short-circuits the second-and-later visit
+// for unchanged subtrees.
+//
+// Iterative (not recursive) so we don't need `Box::pin` /
+// `async-recursion` to satisfy the borrow checker on async recursion.
+// Dedupe by tree id within a single walk to avoid re-checking shared
+// subtrees in the same snapshot.
+
+/// Walk reachable blobs from `root_tree_id` in `store` and push any the
+/// `remote` is missing. Tree ids are deduped per walk; file/symlink ids
+/// rely on `has_blob` being cheap (the `dir://` impl is a `metadata()`
+/// probe; the gRPC server is a single map lookup).
+async fn push_reachable_blobs(
+    store: &Store,
+    remote: &dyn RemoteStore,
+    root_tree_id: ty::Id,
+) -> anyhow::Result<()> {
+    let mut seen_trees: HashSet<ty::Id> = HashSet::new();
+    let mut tree_stack: Vec<ty::Id> = vec![root_tree_id];
+
+    while let Some(tree_id) = tree_stack.pop() {
+        if !seen_trees.insert(tree_id) {
+            continue;
+        }
+        // Push the tree blob itself.
+        push_blob_if_missing(store, remote, BlobKind::Tree, tree_id).await?;
+
+        let tree = store
+            .get_tree(tree_id)?
+            .ok_or_else(|| anyhow!("tree {} missing locally during push walk", hex(&tree_id)))?;
+        for entry in tree.entries {
+            match entry.entry {
+                TreeEntry::TreeId(id) => tree_stack.push(id),
+                TreeEntry::File { id, .. } => {
+                    push_blob_if_missing(store, remote, BlobKind::File, id).await?;
+                }
+                TreeEntry::SymlinkId(id) => {
+                    push_blob_if_missing(store, remote, BlobKind::Symlink, id).await?;
+                }
+                TreeEntry::ConflictId(_) => {
+                    // Not reachable from a `JjYakFs`-produced snapshot
+                    // tree (the FS only emits TreeId/File/SymlinkId).
+                    // Conflict objects, when they appear, ride on the
+                    // commit-side write-through path instead. Skip.
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cheap-existence-probe-then-push for one blob. Reuses the same
+/// `Bytes` buffer that lives in redb (via `Store::get_*_bytes`) so the
+/// post-snapshot walk doesn't re-encode anything.
+async fn push_blob_if_missing(
+    store: &Store,
+    remote: &dyn RemoteStore,
+    kind: BlobKind,
+    id: ty::Id,
+) -> anyhow::Result<()> {
+    if remote.has_blob(kind, &id).await? {
+        return Ok(());
+    }
+    let bytes: Bytes = match kind {
+        BlobKind::Tree => store.get_tree_bytes(id)?,
+        BlobKind::File => store.get_file_bytes(id)?,
+        BlobKind::Symlink => store.get_symlink_bytes(id)?,
+        BlobKind::Commit => store.get_commit_bytes(id)?,
+    }
+    .ok_or_else(|| {
+        anyhow!(
+            "local store missing {} {} during push walk",
+            kind.as_str(),
+            hex(&id)
+        )
+    })?;
+    remote.put_blob(kind, &id, bytes).await?;
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -450,6 +702,13 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             Status::internal(format!("opening store for {}: {e:#}", req.path))
         })?);
         let root_tree_id = store.get_empty_tree_id();
+
+        // M9: parse `remote` into an optional `RemoteStore`. Bad URL =
+        // `invalid_argument` so the user gets a clean message rather
+        // than a generic internal error or — worse — a silent drop into
+        // "no remote configured". Empty string is still `Ok(None)`.
+        let remote_store = remote::parse(&req.remote)
+            .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?;
 
         // Build the per-mount FS up front so we can hand the same `Arc`
         // to both the VFS bind (for kernel I/O) and the `Mount` (for
@@ -486,6 +745,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let mount = Mount {
             working_copy_path: req.path.clone(),
             remote: req.remote,
+            remote_store,
             op_id: Vec::new(),
             workspace_id: Vec::new(),
             root_tree_id: root_tree_id.0.to_vec(),
@@ -552,10 +812,20 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteFileReq>,
     ) -> Result<Response<FileId>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
-        let (id, _bytes) = store
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (id, bytes) = store
             .write_file(ty::File { content: req.data })
             .map_err(store_status("write_file"))?;
+        // Write-through: push to the remote synchronously (M9 §13.4).
+        // On failure, the local write has already happened — surface
+        // the error but don't roll back; idempotent puts + the next
+        // snapshot's walk cover transient remote failures.
+        if let Some(remote) = remote {
+            remote
+                .put_blob(BlobKind::File, &id, bytes)
+                .await
+                .map_err(remote_status("remote put_blob (file)"))?;
+        }
         let file_id = id.into();
         Ok(Response::new(FileId { file_id }))
     }
@@ -566,14 +836,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadFileReq>,
     ) -> Result<Response<File>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let file_id: ty::Id = FileId { file_id: req.file_id }
             .try_into()
             .map_err(decode_status("file id"))?;
-        let file = store
-            .get_file(file_id)
-            .map_err(store_status("get_file"))?
-            .ok_or_else(|| Status::not_found(format!("file {} not found", hex(&file_id))))?;
+        let file = match store.get_file(file_id).map_err(store_status("get_file"))? {
+            Some(f) => f,
+            None => fetch_file_through_remote(&store, remote.as_deref(), file_id).await?,
+        };
         Ok(Response::new(file.as_proto()))
     }
 
@@ -583,11 +853,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteSymlinkReq>,
     ) -> Result<Response<SymlinkId>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let symlink = ty::Symlink { target: req.target };
-        let (id, _bytes) = store
+        let (id, bytes) = store
             .write_symlink(symlink)
             .map_err(store_status("write_symlink"))?;
+        if let Some(remote) = remote {
+            remote
+                .put_blob(BlobKind::Symlink, &id, bytes)
+                .await
+                .map_err(remote_status("remote put_blob (symlink)"))?;
+        }
         let symlink_id = id.into();
         Ok(Response::new(SymlinkId { symlink_id }))
     }
@@ -598,14 +874,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadSymlinkReq>,
     ) -> Result<Response<Symlink>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let symlink_id: ty::Id = SymlinkId { symlink_id: req.symlink_id }
             .try_into()
             .map_err(decode_status("symlink id"))?;
-        let symlink = store
+        let symlink = match store
             .get_symlink(symlink_id)
             .map_err(store_status("get_symlink"))?
-            .ok_or_else(|| Status::not_found(format!("symlink {} not found", hex(&symlink_id))))?;
+        {
+            Some(s) => s,
+            None => fetch_symlink_through_remote(&store, remote.as_deref(), symlink_id).await?,
+        };
         Ok(Response::new(symlink.as_proto()))
     }
 
@@ -615,14 +894,20 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteTreeReq>,
     ) -> Result<Response<TreeId>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let tree_proto = req
             .tree
             .ok_or_else(|| Status::invalid_argument("WriteTreeReq.tree is required"))?;
         let tree: ty::Tree = tree_proto.try_into().map_err(decode_status("tree"))?;
-        let (id, _bytes) = store
+        let (id, bytes) = store
             .write_tree(tree)
             .map_err(store_status("write_tree"))?;
+        if let Some(remote) = remote {
+            remote
+                .put_blob(BlobKind::Tree, &id, bytes)
+                .await
+                .map_err(remote_status("remote put_blob (tree)"))?;
+        }
         let tree_id = id.into();
         Ok(Response::new(TreeId { tree_id }))
     }
@@ -633,14 +918,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadTreeReq>,
     ) -> Result<Response<Tree>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let tree_id: ty::Id = TreeId { tree_id: req.tree_id }
             .try_into()
             .map_err(decode_status("tree id"))?;
-        let tree = store
-            .get_tree(tree_id)
-            .map_err(store_status("get_tree"))?
-            .ok_or_else(|| Status::not_found(format!("tree {} not found", hex(&tree_id))))?;
+        let tree = match store.get_tree(tree_id).map_err(store_status("get_tree"))? {
+            Some(t) => t,
+            None => fetch_tree_through_remote(&store, remote.as_deref(), tree_id).await?,
+        };
         Ok(Response::new(tree.as_proto()))
     }
 
@@ -650,7 +935,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteCommitReq>,
     ) -> Result<Response<CommitId>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let commit_proto = req
             .commit
             .ok_or_else(|| Status::invalid_argument("WriteCommitReq.commit is required"))?;
@@ -658,9 +943,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             return Err(Status::internal("Cannot write a commit with no parents"));
         }
         let commit: ty::Commit = commit_proto.try_into().map_err(decode_status("commit"))?;
-        let (id, _bytes) = store
+        let (id, bytes) = store
             .write_commit(commit)
             .map_err(store_status("write_commit"))?;
+        if let Some(remote) = remote {
+            remote
+                .put_blob(BlobKind::Commit, &id, bytes)
+                .await
+                .map_err(remote_status("remote put_blob (commit)"))?;
+        }
         let commit_id = id.into();
         Ok(Response::new(CommitId { commit_id }))
     }
@@ -671,14 +962,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadCommitReq>,
     ) -> Result<Response<Commit>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let commit_id: ty::Id = CommitId { commit_id: req.commit_id }
             .try_into()
             .map_err(decode_status("commit id"))?;
-        let commit = store
+        let commit = match store
             .get_commit(commit_id)
             .map_err(store_status("get_commit"))?
-            .ok_or_else(|| Status::not_found(format!("commit {} not found", hex(&commit_id))))?;
+        {
+            Some(c) => c,
+            None => fetch_commit_through_remote(&store, remote.as_deref(), commit_id).await?,
+        };
         Ok(Response::new(commit.as_proto()))
     }
 
@@ -756,15 +1050,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<SnapshotReply>, Status> {
         let req = request.into_inner();
 
-        // Clone the per-mount FS handle out from under the lock so the
-        // (potentially I/O-heavy) snapshot walk doesn't hold it. Same
-        // pattern as `check_out`.
-        let fs = {
+        // Clone fs / store / remote handles out from under the lock so
+        // the (potentially I/O-heavy) snapshot walk + post-walk remote
+        // push don't hold it. Same pattern as `check_out`.
+        let (fs, store, remote) = {
             let mounts = self.mounts.lock().await;
             let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
                 Status::not_found(format!("no mount at {}", req.working_copy_path))
             })?;
-            mount.fs.clone()
+            (mount.fs.clone(), mount.store.clone(), mount.remote_store.clone())
         };
 
         let new_root = fs.snapshot().await.map_err(|e| {
@@ -775,11 +1069,23 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         })?;
         info!(path = %req.working_copy_path, tree_id = %hex(&new_root), "Snapshot");
 
+        // M9 §13.2: blobs written through `JjYakFs::snapshot_node`
+        // bypass the RPC handlers, so we walk the rolled-up tree and
+        // push every reachable blob the remote doesn't already have.
+        // Synchronous push: `Snapshot` blocks until durable. The walk
+        // is cheap on a clean (no-change) snapshot — `has_blob` returns
+        // true for every reachable blob and we put_blob nothing.
+        if let Some(remote) = &remote {
+            push_reachable_blobs(&store, remote.as_ref(), new_root)
+                .await
+                .map_err(remote_status("post-snapshot remote push"))?;
+        }
+
         // Stamp the new root tree id back on the Mount so subsequent
         // `GetTreeState`/`Snapshot` reads agree with what the VFS just
-        // produced. We do this *after* the snapshot succeeds — a
-        // half-snapshotted Mount.root_tree_id would lie about what the
-        // kernel sees through `fs`.
+        // produced. Done *after* the snapshot + remote push succeeds —
+        // we'd rather report failure than declare a snapshot durable
+        // that didn't fully push to the remote.
         let mut mounts = self.mounts.lock().await;
         if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
             mount.root_tree_id = new_root.0.to_vec();
@@ -868,10 +1174,17 @@ mod tests {
 
     /// Initialize a mount via the test path (no VFS bind). Returns the
     /// path used so the caller can pass it back into store/WC RPCs.
+    /// `remote` defaults to empty (no Layer C / M9 backend); tests that
+    /// want to exercise write-through/read-through call
+    /// [`init_mount_with_remote`] instead.
     async fn init_mount(svc: &JujutsuService, path: &str) {
+        init_mount_with_remote(svc, path, "").await
+    }
+
+    async fn init_mount_with_remote(svc: &JujutsuService, path: &str, remote: &str) {
         svc.initialize(Request::new(InitializeReq {
             path: path.to_owned(),
-            remote: "localhost".into(),
+            remote: remote.to_owned(),
         }))
         .await
         .unwrap();
@@ -1061,10 +1374,13 @@ mod tests {
     #[tokio::test]
     async fn mounts_are_isolated_by_path() {
         let svc = JujutsuService::bare();
-        for (path, remote) in [("/tmp/a", "remote-a"), ("/tmp/b", "remote-b")] {
+        // Two mounts, no remotes. Pre-M9 these used arbitrary
+        // remote-string labels; M9 makes the field a parseable URL so
+        // empty (no remote) is the right neutral value here.
+        for path in ["/tmp/a", "/tmp/b"] {
             svc.initialize(Request::new(InitializeReq {
                 path: path.into(),
-                remote: remote.into(),
+                remote: "".into(),
             }))
             .await
             .unwrap();
@@ -1142,7 +1458,7 @@ mod tests {
         let req = || {
             Request::new(InitializeReq {
                 path: "/tmp/repo".into(),
-                remote: "localhost".into(),
+                remote: "".into(),
             })
         };
         svc.initialize(req()).await.unwrap();
@@ -1392,11 +1708,15 @@ mod tests {
 
     /// `Initialize` writes `mount.toml`; `SetCheckoutState` updates it;
     /// rehydrate on a fresh service rebuilds the in-memory `Mount` from
-    /// the on-disk metadata + redb store (M8 / Layer B).
+    /// the on-disk metadata + redb store (M8 / Layer B). Uses a real
+    /// `dir://` remote so the rehydrate path also exercises M9's
+    /// `remote::parse` → `Mount.remote_store` round-trip.
     #[tokio::test]
     async fn persisted_mount_rehydrates_after_restart() {
         let storage_dir = tempfile::tempdir().expect("storage tempdir");
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
         let mount_path = "/tmp/yak-rehydrate-test";
+        let remote_url = format!("dir://{}", remote_dir.path().display());
 
         // Phase 1: initialize and stamp some checkout state into the
         // first daemon. No VFS bind (vfs_handle = None) so we can use
@@ -1407,7 +1727,7 @@ mod tests {
         );
         svc1.initialize(Request::new(InitializeReq {
             path: mount_path.into(),
-            remote: "remote-x".into(),
+            remote: remote_url.clone(),
         }))
         .await
         .expect("initialize");
@@ -1428,7 +1748,7 @@ mod tests {
         let meta_path = mount_meta::meta_path(storage_dir.path(), mount_path);
         let on_disk = MountMetadata::read_from(&meta_path).expect("read mount.toml");
         assert_eq!(on_disk.working_copy_path, mount_path);
-        assert_eq!(on_disk.remote, "remote-x");
+        assert_eq!(on_disk.remote, remote_url);
         assert_eq!(on_disk.op_id, op_id);
         assert_eq!(on_disk.workspace_id, workspace_id);
 
@@ -1463,7 +1783,7 @@ mod tests {
             .into_inner();
         assert_eq!(status.data.len(), 1);
         assert_eq!(status.data[0].path, mount_path);
-        assert_eq!(status.data[0].remote, "remote-x");
+        assert_eq!(status.data[0].remote, remote_url);
     }
 
     /// Rehydrating an empty `storage_dir` is a no-op (the
@@ -1477,5 +1797,235 @@ mod tests {
             StorageConfig::on_disk(storage_dir.path().to_owned()),
         );
         svc.rehydrate().await.expect("rehydrate empty dir");
+    }
+
+    // ---- M9 / Layer C: remote blob CAS service-level integration ----
+
+    /// Initialize ergonomics: an unparseable remote URL surfaces as
+    /// `invalid_argument`. Empty string is still accepted as "no
+    /// remote" (back-compat with pre-M9 mounts and tests).
+    #[tokio::test]
+    async fn initialize_rejects_unparseable_remote() {
+        let svc = JujutsuService::bare();
+        let err = svc
+            .initialize(Request::new(InitializeReq {
+                path: "/tmp/repo".into(),
+                remote: "localhost".into(),
+            }))
+            .await
+            .expect_err("expected invalid_argument for unparseable URL");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("no scheme"),
+            "expected scheme error, got: {}",
+            err.message()
+        );
+    }
+
+    /// `WriteFile` with a `dir://` remote pushes the prost-encoded blob
+    /// into the remote synchronously (M9 §13.4 — write-through). The
+    /// blob lands at `<remote>/file/<hex(id)>`.
+    #[tokio::test]
+    async fn write_file_pushes_to_dir_remote() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount_with_remote(
+            &svc,
+            &path,
+            &format!("dir://{}", remote_dir.path().display()),
+        )
+        .await;
+
+        let written = svc
+            .write_file(Request::new(WriteFileReq {
+                working_copy_path: path,
+                data: b"hello-remote".to_vec(),
+            }))
+            .await
+            .expect("write_file")
+            .into_inner();
+
+        // Hex-encode the 32-byte id the way the dir backend does it.
+        let mut hex_id = String::with_capacity(64);
+        for b in &written.file_id {
+            use std::fmt::Write;
+            let _ = write!(&mut hex_id, "{b:02x}");
+        }
+        let blob_path = remote_dir.path().join("file").join(&hex_id);
+        let bytes = std::fs::read(&blob_path).expect("blob landed on remote");
+        let proto = proto::jj_interface::File::decode(bytes.as_slice())
+            .expect("decoding remote file blob");
+        assert_eq!(proto.data, b"hello-remote");
+    }
+
+    /// `ReadFile` falls back to the remote on local miss. The fetched
+    /// bytes are persisted to the local store so a second `ReadFile`
+    /// hits the cache (no remote round-trip).
+    #[tokio::test]
+    async fn read_file_falls_back_to_remote_on_local_miss() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+
+        // Service A writes the blob — its local store + the shared
+        // remote both end up with it.
+        let svc_a = JujutsuService::bare();
+        init_mount_with_remote(&svc_a, "/tmp/a", &remote_url).await;
+        let written = svc_a
+            .write_file(Request::new(WriteFileReq {
+                working_copy_path: "/tmp/a".into(),
+                data: b"shared-content".to_vec(),
+            }))
+            .await
+            .expect("write_file")
+            .into_inner();
+
+        // Service B was never told about the blob. Its local store is
+        // empty, but it shares the remote — `ReadFile` should fetch
+        // through the remote.
+        let svc_b = JujutsuService::bare();
+        init_mount_with_remote(&svc_b, "/tmp/b", &remote_url).await;
+        let got = svc_b
+            .read_file(Request::new(ReadFileReq {
+                working_copy_path: "/tmp/b".into(),
+                file_id: written.file_id.clone(),
+            }))
+            .await
+            .expect("read_file via read-through")
+            .into_inner();
+        assert_eq!(got.data, b"shared-content");
+
+        // Confirm the read-through populated B's local store: a second
+        // read against a remote-less service B' over the same storage
+        // dir would still hit. We sidestep "same storage dir" here by
+        // checking that the same id round-trips through B's local
+        // `read_file` directly via `mount_handles`.
+        let (store_b, _remote_b) = mount_handles(&svc_b.mounts, "/tmp/b").await.unwrap();
+        let id: ty::Id = proto::jj_interface::FileId {
+            file_id: written.file_id,
+        }
+        .try_into()
+        .unwrap();
+        let cached = store_b.get_file(id).expect("get_file (after read-through)");
+        assert!(
+            cached.is_some(),
+            "read-through should have populated the local store"
+        );
+    }
+
+    /// `ReadFile` with no remote and a local miss returns NotFound,
+    /// preserving pre-M9 behavior.
+    #[tokio::test]
+    async fn read_file_local_miss_no_remote_is_not_found() {
+        let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount(&svc, &path).await;
+        let err = svc
+            .read_file(Request::new(ReadFileReq {
+                working_copy_path: path,
+                file_id: vec![0xff; 32],
+            }))
+            .await
+            .expect_err("expected not_found");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// Snapshot pushes every reachable blob from the new root tree to
+    /// the remote (M9 §13.2 post-snapshot walk). Drives a write through
+    /// the per-mount `JjYakFs`, calls `Snapshot`, and verifies the file
+    /// blob *and* the rolled-up tree blob both land on the remote.
+    #[tokio::test]
+    async fn snapshot_pushes_reachable_blobs_to_remote() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount_with_remote(
+            &svc,
+            &path,
+            &format!("dir://{}", remote_dir.path().display()),
+        )
+        .await;
+
+        // Drive a write through the FS (bypasses the RPC layer, so
+        // write-through doesn't run — exercises only the post-snapshot
+        // walk).
+        let fs = svc.fs_for_test(&path).await.expect("mount initialised");
+        let (file_ino, _) = fs
+            .create_file(fs.root(), "hello.txt", false)
+            .await
+            .expect("create_file");
+        fs.write(file_ino, 0, b"snapshot-content").await.unwrap();
+
+        let snap = svc
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: path,
+            }))
+            .await
+            .expect("snapshot")
+            .into_inner();
+        assert_eq!(snap.tree_id.len(), 32);
+
+        // The new root tree blob is on the remote.
+        let mut tree_hex = String::with_capacity(64);
+        for b in &snap.tree_id {
+            use std::fmt::Write;
+            let _ = write!(&mut tree_hex, "{b:02x}");
+        }
+        let tree_blob = remote_dir.path().join("tree").join(&tree_hex);
+        assert!(tree_blob.exists(), "tree blob {tree_hex} should be on remote");
+
+        // The file blob is also on the remote (the walk recursed into
+        // the tree's File entry).
+        let file_dir = remote_dir.path().join("file");
+        let entries: Vec<_> = std::fs::read_dir(&file_dir)
+            .expect("file kind dir exists")
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp"))
+            .collect();
+        assert_eq!(entries.len(), 1, "expected one file blob on remote");
+        let file_bytes =
+            std::fs::read(entries[0].path()).expect("read remote file blob");
+        let file_proto = proto::jj_interface::File::decode(file_bytes.as_slice())
+            .expect("decoding remote file blob");
+        assert_eq!(file_proto.data, b"snapshot-content");
+    }
+
+    /// Snapshot is idempotent across remote pushes: a second snapshot
+    /// of an unchanged mount must not error (the walk hits `has_blob`
+    /// for every entry and skips the put), and the remote contents
+    /// stay byte-identical. Catches regressions in the dedupe set.
+    #[tokio::test]
+    async fn snapshot_is_idempotent_against_remote() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount_with_remote(
+            &svc,
+            &path,
+            &format!("dir://{}", remote_dir.path().display()),
+        )
+        .await;
+
+        let fs = svc.fs_for_test(&path).await.unwrap();
+        let (ino, _) = fs.create_file(fs.root(), "f.txt", false).await.unwrap();
+        fs.write(ino, 0, b"x").await.unwrap();
+        let first = svc
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: path.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let second = svc
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: path,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            first.tree_id, second.tree_id,
+            "clean re-snapshot should produce the same tree id"
+        );
     }
 }

@@ -113,6 +113,13 @@ impl Store {
         })
     }
 
+    /// Read the prost-encoded tree blob without decoding. Used by the
+    /// post-snapshot walk in [`crate::service`] to push reachable blobs
+    /// to a remote without an extra encode pass.
+    pub fn get_tree_bytes(&self, id: Id) -> Result<Option<Bytes>> {
+        self.read_raw(TREES, id)
+    }
+
     /// Write a tree and return both the content-addressed id and the
     /// prost-encoded bytes that landed in redb.
     ///
@@ -137,6 +144,11 @@ impl Store {
         })
     }
 
+    /// See [`Self::get_tree_bytes`].
+    pub fn get_file_bytes(&self, id: Id) -> Result<Option<Bytes>> {
+        self.read_raw(FILES, id)
+    }
+
     /// See [`Self::write_tree`] for the rationale on returning bytes.
     #[tracing::instrument(skip(self, file), fields(len = file.content.len()))]
     pub fn write_file(&self, file: File) -> Result<(Id, Bytes)> {
@@ -154,6 +166,11 @@ impl Store {
         })
     }
 
+    /// See [`Self::get_tree_bytes`].
+    pub fn get_symlink_bytes(&self, id: Id) -> Result<Option<Bytes>> {
+        self.read_raw(SYMLINKS, id)
+    }
+
     /// See [`Self::write_tree`] for the rationale on returning bytes.
     #[tracing::instrument(skip(self))]
     pub fn write_symlink(&self, symlink: Symlink) -> Result<(Id, Bytes)> {
@@ -169,6 +186,11 @@ impl Store {
                 .context("decoding stored commit proto")?;
             Commit::try_from(proto).context("converting stored commit proto")
         })
+    }
+
+    /// See [`Self::get_tree_bytes`].
+    pub fn get_commit_bytes(&self, id: Id) -> Result<Option<Bytes>> {
+        self.read_raw(COMMITS, id)
     }
 
     /// See [`Self::write_tree`] for the rationale on returning bytes.
@@ -193,6 +215,21 @@ impl Store {
             Some(slot) => decode(slot.value()).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Read the raw, prost-encoded bytes for `id` from `table` without
+    /// decoding. Returns `None` if the row is absent. Used for
+    /// remote-store push (M9) where the bytes round-trip without a
+    /// caller ever needing the typed value.
+    fn read_raw(
+        &self,
+        table: TableDefinition<'_, &'static [u8; 32], &'static [u8]>,
+        id: Id,
+    ) -> Result<Option<Bytes>> {
+        let txn = self.db.begin_read().context("redb begin_read")?;
+        let tbl = txn.open_table(table).context("open table for read")?;
+        let raw = tbl.get(&id.0).context("redb get")?;
+        Ok(raw.map(|slot| Bytes::copy_from_slice(slot.value())))
     }
 
     fn write_value(

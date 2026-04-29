@@ -99,7 +99,15 @@ async fn run_yak_command(
             ui.request_pager();
             let mut formatter = ui.stdout_formatter();
             for session in resp.into_inner().data {
-                writeln!(formatter, "{} - {}", session.path, session.remote)?;
+                // M9 made `remote` actually mean "URL of the configured
+                // RemoteStore" (empty = no remote). Drop the ` - <remote>`
+                // tail when there's nothing to show, instead of emitting
+                // a dangling `path - ` with trailing whitespace.
+                if session.remote.is_empty() {
+                    writeln!(formatter, "{}", session.path)?;
+                } else {
+                    writeln!(formatter, "{} - {}", session.path, session.remote)?;
+                }
             }
             Ok(())
         }

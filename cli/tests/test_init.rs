@@ -4,7 +4,7 @@ use crate::common::TestEnvironment;
 fn test_init() {
     let test_env = TestEnvironment::default();
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo""#);
     let repo_path = test_env.env_root().join("repo");
@@ -29,7 +29,7 @@ fn test_init() {
 #[test]
 fn test_op_id_round_trip() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     let stdout = test_env.jj_cmd_success(
@@ -52,13 +52,13 @@ fn test_op_id_round_trip() {
 fn test_multiple_init() {
     let test_env = TestEnvironment::default();
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo1"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo1"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo1""#);
     let repo1_path = test_env.env_root().join("repo1");
 
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo2"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo2"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo2""#);
     let repo2_path = test_env.env_root().join("repo2");
@@ -79,8 +79,8 @@ fn test_multiple_init() {
 
     let stdout = test_env.jj_cmd_success(&repo2_path, &["yak", "status"]);
     insta::assert_snapshot!(stdout, @r"
-    $TEST_ENV/repo1 - localhost
-    $TEST_ENV/repo2 - localhost
+    $TEST_ENV/repo1
+    $TEST_ENV/repo2
     ");
 }
 
@@ -94,13 +94,13 @@ fn test_multiple_init() {
 fn test_repos_are_independent() {
     let test_env = TestEnvironment::default();
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo1"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo1"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo1""#);
     let repo1_path = test_env.env_root().join("repo1");
 
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo2"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo2"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo2""#);
     let repo2_path = test_env.env_root().join("repo2");
@@ -131,8 +131,8 @@ fn test_repos_are_independent() {
 
     let stdout = test_env.jj_cmd_success(&repo2_path, &["yak", "status"]);
     insta::assert_snapshot!(stdout, @r"
-    $TEST_ENV/repo1 - localhost
-    $TEST_ENV/repo2 - localhost
+    $TEST_ENV/repo1
+    $TEST_ENV/repo2
     ");
 }
 
@@ -144,7 +144,7 @@ fn test_repos_are_independent() {
 #[test]
 fn test_nested_tree_round_trips() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
     let dir_path = repo_path.join("dir");
     std::fs::create_dir(&dir_path).unwrap();
@@ -162,7 +162,7 @@ fn test_nested_tree_round_trips() {
 #[test]
 fn test_symlink_tree_round_trips() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "localhost", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
     std::os::unix::fs::symlink("target", repo_path.join("link")).unwrap();
 
