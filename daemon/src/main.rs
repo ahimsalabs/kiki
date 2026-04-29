@@ -10,6 +10,7 @@ use crate::remote::{fs::FsRemoteStore, server::RemoteStoreService, RemoteStore};
 use crate::service::StorageConfig;
 
 mod hash;
+mod local_refs;
 mod mount_meta;
 mod remote;
 mod service;

@@ -105,6 +105,16 @@ impl Store {
         self.empty_tree_id
     }
 
+    /// Hand out the underlying [`redb::Database`] handle so sibling
+    /// modules (M10.5: [`crate::local_refs::LocalRefs`]) can open their
+    /// own tables in the same per-mount file. Sharing the `Arc<Database>`
+    /// keeps the catalog and the blob store on a single redb instance —
+    /// one writer/many-readers serialization, one fsync per mutating
+    /// transaction.
+    pub fn database(&self) -> Arc<Database> {
+        self.db.clone()
+    }
+
     pub fn get_tree(&self, id: Id) -> Result<Option<Tree>> {
         self.read_value(TREES, id, |bytes| {
             let proto = proto::jj_interface::Tree::decode(bytes)
