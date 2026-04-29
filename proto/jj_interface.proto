@@ -2,6 +2,59 @@ syntax = "proto3";
 
 package jj_interface;
 
+// Remote blob CAS (Layer C / M9, PLAN.md §13). Byte-typed: callers pass a
+// (kind, id) and bytes; the remote stores them as opaque blobs. Decoupled
+// from the prost schemas in `JujutsuInterface` so a daemon-to-daemon
+// remote keeps working across schema bumps. Same gRPC listener serves
+// both services — every daemon can act as the remote for another.
+//
+// Auth, TLS, retry/backoff, streaming for large blobs are explicitly out
+// of scope for M9; see §13.5/§13.6.
+service RemoteStore {
+  rpc GetBlob(GetBlobReq) returns (GetBlobReply) {}
+  rpc PutBlob(PutBlobReq) returns (PutBlobReply) {}
+  rpc HasBlob(HasBlobReq) returns (HasBlobReply) {}
+}
+
+// Which content-addressed table the (id, bytes) pair belongs to. Mirrors
+// the four redb tables in `daemon/src/store.rs` (commits_v1, files_v1,
+// symlinks_v1, trees_v1). Carrying the kind on the wire lets backends
+// route by table (the same way redb does locally) and avoids confusing —
+// though benign — content-hash collisions across kinds.
+enum BlobKind {
+  BLOB_KIND_UNSPECIFIED = 0;
+  BLOB_KIND_TREE = 1;
+  BLOB_KIND_FILE = 2;
+  BLOB_KIND_SYMLINK = 3;
+  BLOB_KIND_COMMIT = 4;
+}
+
+message GetBlobReq {
+  BlobKind kind = 1;
+  bytes id = 2;
+}
+message GetBlobReply {
+  // `found = false` distinguishes "remote doesn't have it" from "remote
+  // has an empty blob". `bytes` is meaningless when `found == false`.
+  bool found = 1;
+  bytes bytes = 2;
+}
+
+message PutBlobReq {
+  BlobKind kind = 1;
+  bytes id = 2;
+  bytes bytes = 3;
+}
+message PutBlobReply {}
+
+message HasBlobReq {
+  BlobKind kind = 1;
+  bytes id = 2;
+}
+message HasBlobReply {
+  bool found = 1;
+}
+
 service JujutsuInterface {
   // Initalize a new repository
   rpc Initialize(InitializeReq) returns (InitializeReply) {}
