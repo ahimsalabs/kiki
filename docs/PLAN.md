@@ -3,17 +3,17 @@
 Status: active. Transport architecture decided (§4.3 Path C). M1–M9
 done — see [`PLAN-M1-6.md`](./PLAN-M1-6.md) for M1–M6 detail and
 [`PLAN-M7-9.md`](./PLAN-M7-9.md) for M7–M9 detail (including the
-"Ship (d)" interim that landed between M6 and M7). One-line state:
-integration tests run with `disable_mount = false` on a real Linux
-FUSE mount, the per-mount `Store` is redb-backed and rehydrates
-across daemon restart, and the per-mount `RemoteStore` (parsed from
-`Initialize.remote`) does write-through + read-through + post-
-snapshot push against `dir://` and `grpc://` backends. 115/115
-daemon tests + 14/14 cli tests pass; `cargo clippy --workspace
---all-targets -- -D warnings` is clean. Inode handle stability (§7
-decision 6) is still deferred; the in-memory slab is fine until
-kernel handles need to survive a daemon restart in production.
-Last updated: 2026-04-29
+"Ship (d)" interim that landed between M6 and M7). M10 spec at §10;
+in flight. One-line state: integration tests run with `disable_mount
+= false` on a real Linux FUSE mount, the per-mount `Store` is
+redb-backed and rehydrates across daemon restart, and the per-mount
+`RemoteStore` (parsed from `Initialize.remote`) does write-through +
+read-through + post-snapshot push against `dir://` and `grpc://`
+backends. 115/115 daemon tests + 14/14 cli tests pass; `cargo clippy
+--workspace --all-targets -- -D warnings` is clean. Inode handle
+stability (§7 decision 6) is still deferred; the in-memory slab is
+fine until kernel handles need to survive a daemon restart in
+production. Last updated: 2026-04-30
 
 This document captures the roadmap for getting jj-yak from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -125,16 +125,22 @@ missing FUSE methods between M6 and M7). One-line summaries:
 - **Mutable pointers (op heads, ref tips).** Layer C blobs are content-
   addressed and idempotent across pushes; mutable pointers are not.
   Two daemons over the same `dir://` blob store can sync content but
-  not op-log linearity. M10 owns the catalog protocol — see
-  [`PLAN-M7-9.md`](./PLAN-M7-9.md) §13.5 for the M9 boundary.
+  not op-log linearity. **M10 owns the catalog protocol — spec at
+  §10, in flight.** See [`PLAN-M7-9.md`](./PLAN-M7-9.md) §13.5 for
+  the M9 boundary the spec rides on top of.
 - **FUSE-side read-through on `StoreMiss`.** `vfs/yak_fs.rs`'s
   `lookup`/`read`/`readdir` paths still map `StoreMiss` to `EIO`. M9
   integrated at `service.rs` rather than `Store`
   ([`PLAN-M7-9.md`](./PLAN-M7-9.md) §13.2 decision), so yak_fs.rs
   doesn't see the remote without the orchestration cost duplicated
-  there or `Store` upgraded to async. Lands at M10 alongside
-  clone-style workflows where the remote actually has blobs the
-  kernel might ask for through the mount.
+  there or `Store` upgraded to async. **M10 §10.6 lands the lazy
+  fetch on miss inside `YakFs`** (see §10.6 for why lazy beat
+  warm-on-CheckOut).
+- **CLI op-store / op-heads-store integration with the catalog.**
+  M10's catalog RPCs are daemon-to-daemon. Plumbing them into a
+  custom jj-lib `OpHeadsStore` so two CLIs against a shared
+  remote actually serialize op-log advances is its own milestone
+  (probably M10.5). M10 §10.9 lists this as explicit out-of-scope.
 - **Inode handle stability across restarts (§7 decision 6):** the
   in-memory slab still uses monotonic `next_id`. Layer B persists the
   Store but kernel handles still don't survive a daemon restart;
@@ -413,20 +419,14 @@ rides on every write/read RPC + post-snapshot walk (M9 in
 [`PLAN-M7-9.md`](./PLAN-M7-9.md) §13). M7 detail in
 [`PLAN-M7-9.md`](./PLAN-M7-9.md) §10.
 
-**Next: M10 — mutable pointers + concurrency arbitration.**
-Two daemons sharing a Layer C blob store today can sync content but
-not op-log linearity ([`PLAN-M7-9.md`](./PLAN-M7-9.md) §13.5). M10
-owns the catalog protocol: how is "the latest op_id for this remote"
-stored, how do two daemons race to advance it, what happens on
-conflict. Likely shape: small mutable-pointers RPC alongside the
-existing `RemoteStore` service, with an arbitration story closer to
-git's ref locking than to CAS. Spec to be written; the M9
-read/write/snapshot path provides the content layer it needs to ride
-on top of. FUSE-side read-through on `StoreMiss`
-([`PLAN-M7-9.md`](./PLAN-M7-9.md) §13.5) lands at the same milestone
-— clone-style flows where the kernel asks the FS for content the
-local store doesn't have are exactly the case the catalog protocol
-unblocks.
+**In flight: M10 — mutable pointers + concurrency arbitration
+(§10).** CAS-arbitrated catalog RPCs alongside the existing
+`RemoteStore` service (§10.1–10.5), plus FUSE-side lazy
+read-through on `StoreMiss` inside `YakFs` (§10.6). Both pieces
+ride on top of the M9 read/write/snapshot path. Out of scope for
+M10: CLI op-store integration (M10.5), lock-based arbitration
+(CAS is enough; §10.1), local-fallback catalog (§10.2). Commit
+plan at §10.8.
 
 **Hygiene still pending:**
 
@@ -476,5 +476,326 @@ are sync as of M6). So the sync→async bridge in the new fuser
 adapter is light: the bodies don't await anything we'd lose by
 switching to a sync trait.
 
+**M10 update (2026-04-30):** that "async in name only" claim is no
+longer true at the read paths. M10 §10.6's lazy remote read-through
+makes `YakFs::read_tree`/`read_file`/`read_symlink` actually `await`
+the `RemoteStore` on local miss. The fuser migration cost goes up
+slightly: the sync fuser callback bodies need a runtime handle for
+the post-M10 read paths the same way their write paths already
+need it. Still small relative to the rest of the migration.
+
 Land alongside Layer B if possible (we'll already be touching
 per-Mount state for stable inode ids).
+
+## 10. M10 — mutable pointers + concurrency arbitration
+
+M10 owns two pieces that the M9 outcome left as explicit non-goals
+([`PLAN-M7-9.md`](./PLAN-M7-9.md) §13.5):
+
+1. **Catalog protocol** — a CAS-arbitrated mutable name → bytes
+   map alongside the existing content-addressed blob store, so two
+   daemons over a shared remote can serialize "what's the latest
+   op_id" without each silently overwriting the other.
+2. **FUSE-side remote read-through on `StoreMiss`.** Today
+   `vfs/yak_fs.rs::read_tree`/`read_file`/`read_symlink` map a
+   local-store miss straight onto `EIO`. M9 wired the remote into
+   `service.rs` for the RPC layer; M10 threads it into the FS
+   layer too, so clone-style flows (where the kernel asks the
+   mount for blobs only the remote has) work end-to-end.
+
+Wiring jj-lib's actual `OpHeadsStore` / `OpStore` to use the new
+catalog RPCs is **out of scope** — that needs a custom store impl
+on the CLI side and is a sizeable enough chunk to warrant its own
+milestone (probably M10.5). M10 lays the wire and the trait; the
+CLI integration rides on top later.
+
+### 10.1 Trait shape
+
+The catalog is "blobs but mutable". It can't share `RemoteStore`'s
+content-addressed contract — different keyspace, different
+arbitration story — so we extend the trait by adding ref methods
+rather than overload `(BlobKind, Id) → bytes`:
+
+```rust
+#[async_trait]
+trait RemoteStore: Send + Sync + Debug {
+    // ... existing M9 methods (get_blob/put_blob/has_blob) ...
+
+    /// Read a ref. `Ok(None)` when the ref does not exist.
+    async fn get_ref(&self, name: &str) -> Result<Option<Bytes>>;
+
+    /// Compare-and-swap. If the current value matches `expected`,
+    /// install `new` and return `CasOutcome::Updated`. Otherwise
+    /// return `CasOutcome::Conflict { actual }` so the caller can
+    /// retry against the real current value.
+    ///
+    /// `expected = None` means "must not exist" (create-only).
+    /// `new = None` means "delete".
+    async fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<&Bytes>,
+        new: Option<&Bytes>,
+    ) -> Result<CasOutcome>;
+
+    /// List every ref name. Refs are scarce (op heads, branch tips,
+    /// not arbitrary catalog data), so non-paginated is fine.
+    async fn list_refs(&self) -> Result<Vec<String>>;
+}
+
+enum CasOutcome { Updated, Conflict { actual: Option<Bytes> } }
+```
+
+**Why one trait instead of a sibling `RemoteRefs`:** every backend
+that ships in M10 (and every plausible future one — S3, redb-on-a-
+shared-nfs, …) wants both surfaces against the same underlying
+storage. Two traits would force every Arc-wielding consumer to
+hold two `Arc<dyn …>` and route by purpose; one trait keeps the
+parse/init/handover paths in `service.rs` single-handle. The
+`Debug + Send + Sync` bounds already match.
+
+**Why CAS, not lock-based.** Decided up-front (PLAN.md design Q,
+2026-04-30): CAS is lock-free, has no lease state machine, and
+matches git's ref-update model in spirit. A CAS loser retries; a
+CAS winner advances. There is no expiry/fencing/crash-recovery
+path to design because there's nothing held across calls.
+Lock-based arbitration becomes interesting if a future workflow
+needs to hold a ref across multiple round-trips without races
+(e.g. "lock op_heads for the duration of a 5-RPC dance"); we'd
+add it as a layer above CAS at that point, not by replacing the
+primitive.
+
+**Why `Option<&Bytes>` for `expected`/`new`:** distinguishes "ref
+must not exist" from "ref must equal empty bytes", and "delete the
+ref" from "set ref to empty". Empty bytes is a valid value (e.g.
+the empty op id); we don't get to conflate it with absent.
+
+**Names are UTF-8 strings, not arbitrary bytes.** Simpler and
+matches what jj-lib uses internally for op-store keys. If a future
+caller needs binary names, hex-encoding at the call site is fine.
+
+### 10.2 Composition
+
+Same shape as M9 §13.2: orchestrate at `service.rs`, keep `Store`
+sync. The catalog RPCs in `JujutsuService` (if we decide to expose
+any — see §10.5 scope note below) take a `working_copy_path` and
+delegate to `Mount.remote_store.cas_ref(...)`. Backends that don't
+have a remote configured surface "no catalog available" as
+`Status::failed_precondition` — same shape as M9's "no remote
+configured" miss path.
+
+Open scope question: should the catalog also have a "local
+fallback" (i.e. when no remote is configured, store refs in the
+per-mount redb)? **Not in M10.** Mount metadata's `op_id` field
+already plays that role for the single-daemon case. The catalog
+exists *because* of the multi-daemon case; a one-daemon shortcut
+would just be a redundant API. (If we later want "always go
+through the catalog API regardless of remote configuration," we
+add an in-memory or redb-backed `RemoteStore` impl and point
+`mount.remote_store` at it.)
+
+### 10.3 Backends
+
+Both M9 backends gain ref methods. Two impls is still the magic
+number for trait extraction; with one, the trait shape gets
+warped by what's easy.
+
+- **`FsRemoteStore`** (`dir://`). Refs at `<root>/refs/<name>`.
+  CAS dance:
+    1. Acquire an exclusive flock on `<root>/refs/.lock` (one
+       lockfile for the whole refs namespace — concurrent CAS on
+       different refs is rare enough that namespace-wide locking
+       beats per-ref lockfile bookkeeping).
+    2. Read current value from `<root>/refs/<name>` (`Ok(None)` if
+       the file doesn't exist).
+    3. Compare to `expected`. Mismatch → release lock, return
+       `Conflict { actual }`.
+    4. Match → write `new` to `<root>/refs/.tmp.<rand>`, fsync,
+       rename into place (or `unlink` if `new = None`). Release
+       lock.
+
+  The flock dance lives in `tokio::task::spawn_blocking` so the
+  async runtime stays unblocked; same pattern as M9's blob
+  put_blob. Names are validated against `/`, NUL, and `..` so
+  callers can't escape the refs subdir.
+
+- **`GrpcRemoteStore`** (`grpc://host:port`). Same trait method
+  set, but calls translate 1:1 to the new tonic RPCs. Tonic's
+  `optional bytes` is an `Option<Vec<u8>>` on the Rust side, so
+  the wire-side CAS preconditions round-trip cleanly.
+
+### 10.4 Wire protocol
+
+Add three RPCs to the existing `service RemoteStore` in
+`proto/jj_interface.proto`:
+
+```proto
+service RemoteStore {
+  // existing M9 RPCs ...
+  rpc GetRef(GetRefReq) returns (GetRefReply) {}
+  rpc CasRef(CasRefReq) returns (CasRefReply) {}
+  rpc ListRefs(ListRefsReq) returns (ListRefsReply) {}
+}
+
+message GetRefReq { string name = 1; }
+message GetRefReply {
+  // false = ref does not exist; bytes meaningless when found=false
+  bool found = 1;
+  bytes value = 2;
+}
+
+message CasRefReq {
+  string name = 1;
+  // proto3 `optional` so absent-vs-empty is distinguishable on
+  // the wire (matches the trait's Option<&Bytes>).
+  optional bytes expected = 2;
+  optional bytes new = 3;
+}
+message CasRefReply {
+  // true = swap applied. false = conflict; `actual` is the value
+  // the server saw, which the caller should retry against (or
+  // surface).
+  bool updated = 1;
+  optional bytes actual = 2;
+}
+
+message ListRefsReq {}
+message ListRefsReply { repeated string names = 1; }
+```
+
+Same `RemoteStore` service so peer daemons get refs for free —
+the always-on M9 server (`main.rs::RemoteStoreService`) extends
+to ref RPCs without a second listener.
+
+### 10.5 Scope at the `JujutsuService` layer
+
+M10 does **not** add catalog-facing RPCs to `JujutsuInterface`.
+The CLI doesn't use them yet (per scope: jj-lib op-store
+integration is M10.5). The proto-side RPCs land on `RemoteStore`
+only — that's the daemon-to-daemon channel.
+
+`Mount.remote_store: Option<Arc<dyn RemoteStore>>` already
+carries the new methods through trait extension; tests that want
+to exercise refs do so against `Mount.remote_store` directly
+(same pattern as the M9 `mount_handles` test helper).
+
+### 10.6 FUSE-side remote read-through on `StoreMiss`
+
+Lazy fetch on miss inside `vfs/yak_fs.rs`. Current shape:
+
+```rust
+fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
+    match self.store.get_tree(id) {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(FsError::StoreMiss),
+        Err(e) => Err(store_err(e)),
+    }
+}
+```
+
+Becomes:
+
+```rust
+async fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
+    if let Some(t) = self.store.get_tree(id).map_err(store_err)? {
+        return Ok(t);
+    }
+    if let Some(remote) = &self.remote {
+        return fetch_tree_through(&self.store, remote.as_ref(), id)
+            .await
+            .map_err(store_err);
+    }
+    Err(FsError::StoreMiss)
+}
+```
+
+Same shape for `read_file` and `read_symlink`. The
+`fetch_*_through` helpers (verify-round-trip + persist locally)
+already exist in `service.rs` — M10 factors them into
+`remote/fetch.rs` so both `service.rs` and `yak_fs.rs` share one
+implementation. No new round-trip semantics — just a relocation.
+
+Mechanical fallout:
+
+- `YakFs` gains `remote: Option<Arc<dyn RemoteStore>>` (set at
+  construction, same as `store`).
+- `YakFs::new` becomes `YakFs::new(store, root_tree, remote)`;
+  `service.rs::Initialize` and `rehydrate` both pass the parsed
+  remote in.
+- `read_tree`/`read_file`/`read_symlink` go from `&self -> Result`
+  to `async &self -> Result`. Their call sites inside the trait's
+  `async` methods already `.await`, so the change propagates.
+- Tests that constructed `YakFs::new(store, root_tree)` switch
+  to `YakFs::new(store, root_tree, None)`.
+
+**Why lazy, not warm-on-CheckOut.** A clone-style workflow
+typically opens a handful of files in a multi-thousand-file tree;
+warming the whole tree would page in O(MB) of blob data the user
+never touches. Lazy pays exactly for what the kernel asks for.
+The downside — first access latency — is bounded by the remote
+RTT, which on a localhost peer is sub-millisecond. If a future
+workload pathologically opens every file in the tree we revisit;
+hybrid (warm + lazy) is a one-flag change at that point.
+
+**Error surfacing.** Remote-fetch failures (transport error,
+data-loss on hash mismatch) collapse to `FsError::StoreError`
+and propagate as `EIO` to the kernel. Same as today's M9 RPC-
+layer fetch — the user gets a real error rather than a silent
+hang.
+
+### 10.7 Test strategy
+
+- **Backend unit tests (FsRemoteStore)** — get/cas/list, CAS hit
+  path, CAS conflict path returns the actual current value, CAS
+  with `expected = None` succeeds only when the ref doesn't
+  exist, CAS with `new = None` deletes, name validation rejects
+  `/` and `..`.
+- **Server unit tests (RemoteStoreService)** — ref RPCs round-
+  trip; `optional` field present-vs-absent decoded correctly.
+- **gRPC end-to-end** — two `GrpcRemoteStore` clients sharing a
+  server: one CASes from None→`v0`; the other observes via
+  `get_ref`; the loser's CAS sees `Conflict { actual: v0 }`.
+- **FUSE-side read-through** — a service-level test analogous to
+  M9's `read_file_falls_back_to_remote_on_local_miss` but
+  exercising the FS path: drive a `lookup`/`read` against an
+  inode whose tree/file blob exists only on the remote; confirm
+  it returns the right bytes and that the second access hits the
+  cached local blob.
+- **Negative case** — `StoreMiss` with no remote still surfaces
+  as `EIO` (preserves pre-M10 behavior for tests that don't
+  configure a remote).
+
+### 10.8 Commit plan
+
+One commit per task:
+
+1. PLAN.md §10 (this section). _← in progress_
+2. Proto: add `GetRef` / `CasRef` / `ListRefs` RPCs + messages.
+3. `RemoteStore` trait gains `get_ref` / `cas_ref` / `list_refs`;
+   `FsRemoteStore` impl + unit tests.
+4. `RemoteStoreService` server impl + unit tests; `GrpcRemoteStore`
+   client impl + the gRPC end-to-end test.
+5. FUSE-side remote read-through: extract shared
+   `fetch_*_through` helpers into `remote/fetch.rs`; thread
+   `Option<Arc<dyn RemoteStore>>` into `YakFs`; flip
+   `read_tree`/`read_file`/`read_symlink` to async; update call
+   sites; add a service-level read-through-via-FS test.
+6. PLAN.md §10.9 — M10 outcome.
+
+### 10.9 Out of scope (explicit)
+
+- **CLI integration with jj-lib's op store / op-heads store.**
+  Needs a custom impl that drives the new catalog RPCs from
+  `cli/src/`. Sizeable; M10.5.
+- **Lock-based arbitration / leases.** §10.1 above. CAS is the
+  primitive; leases land if/when a real workflow needs them.
+- **Local-fallback catalog when no remote is configured.**
+  §10.2. The single-daemon case already has `mount.toml`'s
+  `op_id`.
+- **Auth, TLS, retry/backoff, streaming.** Still M11 alongside
+  S3.
+- **Stable inode ids across restarts (PLAN §7 decision 6).**
+  Still deferred; the M10 read-through change touches the same
+  `YakFs` struct, but the slab-id source is unchanged.
+- **Async background push queue.** Still M10/M11 follow-up;
+  current `Snapshot` blocks on remote.
