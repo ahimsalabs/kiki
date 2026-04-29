@@ -692,7 +692,7 @@ mod tests {
             }],
         };
         let root_id = store.put_tree(root);
-        let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id));
+        let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id, None));
         FuseAdapter::new(yak)
     }
 

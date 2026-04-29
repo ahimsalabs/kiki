@@ -21,6 +21,18 @@ impl From<Id> for Vec<u8> {
     }
 }
 
+/// 64-char lowercase hex. Matches what the dir-backend on disk uses
+/// for blob filenames and what the daemon's `tracing` lines print, so
+/// `format!("{id}")` is greppable across logs and on-disk paths.
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 // Proto-to-Id conversions are fallible because the wire format is `bytes` of
 // arbitrary length while `Id` is a fixed-size 32-byte hash. Previously these
 // were `From` impls that panicked on length mismatch — corrupt or misrouted

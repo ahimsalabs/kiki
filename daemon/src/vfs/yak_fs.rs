@@ -34,6 +34,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
+use crate::remote::fetch::{self, FetchError};
+use crate::remote::RemoteStore;
 use crate::store::Store;
 use crate::ty::{File, Id, Symlink, Tree, TreeEntry, TreeEntryMapping};
 use crate::vfs::inode::{Inode, InodeId, InodeSlab, NodeRef, ROOT_INODE};
@@ -134,6 +136,20 @@ impl std::error::Error for FsError {}
 /// (e.g. "redb commit: …") survives the conversion.
 fn store_err(e: anyhow::Error) -> FsError {
     FsError::StoreError(format!("{e:#}"))
+}
+
+/// Map a [`FetchError`] (from M10 §10.6 read-through) onto an `FsError`.
+/// `NotFound` becomes `StoreMiss` so the adapters' `EIO` mapping fires
+/// the same way it would for a local-store miss with no remote. Every
+/// other variant — DataLoss, decode failure, transport error — collapses
+/// to `StoreError(...)` so the chain surfaces in tracing without
+/// exposing fetch-specific variants to the wire layer (the kernel only
+/// sees `EIO` either way).
+fn fetch_err(e: FetchError) -> FsError {
+    match e {
+        FetchError::NotFound { .. } => FsError::StoreMiss,
+        other => FsError::StoreError(format!("{other:#}")),
+    }
 }
 
 #[async_trait]
@@ -286,6 +302,13 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
 #[derive(Debug)]
 pub struct YakFs {
     store: Arc<Store>,
+    /// M10 §10.6: lazy remote read-through. When set, a local
+    /// [`Store`] miss in [`Self::read_tree`] / [`Self::read_file`] /
+    /// [`Self::read_symlink`] falls through to `RemoteStore::get_blob`
+    /// and persists the result into `store` so subsequent accesses
+    /// hit the cache. `None` preserves pre-M10 behavior (miss surfaces
+    /// as `EIO`).
+    remote: Option<Arc<dyn RemoteStore>>,
     slab: InodeSlab,
     /// Inode id of the pinned `.jj/` subtree, if jj-lib has created one.
     /// `None` until the first `mkdir(root, ".jj")`. See type-level docs
@@ -300,9 +323,17 @@ impl YakFs {
     /// called lazily on the first `lookup`/`readdir`. Constructing with
     /// the store's empty tree id (the M1 default for a fresh mount) is
     /// the common case and yields an empty directory.
-    pub fn new(store: Arc<Store>, root_tree: Id) -> Self {
+    ///
+    /// `remote = Some(...)` enables M10 §10.6 lazy read-through: a
+    /// local-store miss in any of the read paths falls through to the
+    /// remote, persists the fetched blob into `store`, and returns
+    /// the typed value. `remote = None` preserves pre-M10 behavior —
+    /// a miss surfaces as `FsError::StoreMiss` and the kernel sees
+    /// `EIO`.
+    pub fn new(store: Arc<Store>, root_tree: Id, remote: Option<Arc<dyn RemoteStore>>) -> Self {
         YakFs {
             store,
+            remote,
             slab: InodeSlab::new(root_tree),
             jj_subtree: Mutex::new(None),
         }
@@ -319,28 +350,51 @@ impl YakFs {
         parent == self.root() && name == JJ_DIR
     }
 
-    fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
+    /// Read a tree blob. Local store first; on miss with a configured
+    /// remote (M10 §10.6), fall through to `RemoteStore::get_blob`,
+    /// verify the bytes round-trip to the requested id, persist into
+    /// the local store, and return. On miss with no remote, surfaces
+    /// `FsError::StoreMiss` (mapped to `EIO` by the adapters).
+    async fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
         match self.store.get_tree(id) {
-            Ok(Some(t)) => Ok(t),
-            Ok(None) => Err(FsError::StoreMiss),
-            Err(e) => Err(store_err(e)),
+            Ok(Some(t)) => return Ok(t),
+            Ok(None) => {}
+            Err(e) => return Err(store_err(e)),
         }
+        let Some(remote) = &self.remote else {
+            return Err(FsError::StoreMiss);
+        };
+        fetch::fetch_tree(&self.store, remote.as_ref(), id)
+            .await
+            .map_err(fetch_err)
     }
 
-    fn read_file(&self, id: Id) -> Result<File, FsError> {
+    async fn read_file(&self, id: Id) -> Result<File, FsError> {
         match self.store.get_file(id) {
-            Ok(Some(f)) => Ok(f),
-            Ok(None) => Err(FsError::StoreMiss),
-            Err(e) => Err(store_err(e)),
+            Ok(Some(f)) => return Ok(f),
+            Ok(None) => {}
+            Err(e) => return Err(store_err(e)),
         }
+        let Some(remote) = &self.remote else {
+            return Err(FsError::StoreMiss);
+        };
+        fetch::fetch_file(&self.store, remote.as_ref(), id)
+            .await
+            .map_err(fetch_err)
     }
 
-    fn read_symlink(&self, id: Id) -> Result<Symlink, FsError> {
+    async fn read_symlink(&self, id: Id) -> Result<Symlink, FsError> {
         match self.store.get_symlink(id) {
-            Ok(Some(s)) => Ok(s),
-            Ok(None) => Err(FsError::StoreMiss),
-            Err(e) => Err(store_err(e)),
+            Ok(Some(s)) => return Ok(s),
+            Ok(None) => {}
+            Err(e) => return Err(store_err(e)),
         }
+        let Some(remote) = &self.remote else {
+            return Err(FsError::StoreMiss);
+        };
+        fetch::fetch_symlink(&self.store, remote.as_ref(), id)
+            .await
+            .map_err(fetch_err)
     }
 
     /// Map a `TreeEntry` (jj's on-tree type) to a `NodeRef` (our slab type).
@@ -376,21 +430,26 @@ impl YakFs {
     /// `NodeRef::Tree` variant — dirty trees own their children directly,
     /// so callers walking a `DirtyTree` should iterate its `children`
     /// map instead.
-    fn dir_tree(&self, inode: &Inode) -> Result<Tree, FsError> {
+    ///
+    /// Async since M10 §10.6: the underlying [`Self::read_tree`] may
+    /// fall through to a remote fetch on local-store miss.
+    async fn dir_tree(&self, inode: &Inode) -> Result<Tree, FsError> {
         match inode.node {
-            NodeRef::Tree(id) => self.read_tree(id),
+            NodeRef::Tree(id) => self.read_tree(id).await,
             _ => Err(FsError::NotADirectory),
         }
     }
 
     /// Promote `parent` from clean `Tree` into `DirtyTree`. Idempotent —
     /// already-dirty parents are left as-is.
-    fn ensure_dirty_tree(&self, parent: InodeId) -> Result<(), FsError> {
+    ///
+    /// Async since M10 §10.6 (see [`Self::dir_tree`]).
+    async fn ensure_dirty_tree(&self, parent: InodeId) -> Result<(), FsError> {
         let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
         match parent_inode.node {
             NodeRef::DirtyTree { .. } => Ok(()),
             NodeRef::Tree(id) => {
-                let tree = self.read_tree(id)?;
+                let tree = self.read_tree(id).await?;
                 let entries: Vec<(String, NodeRef)> = tree
                     .entries
                     .into_iter()
@@ -411,12 +470,12 @@ impl YakFs {
     /// Promote a clean `File` inode into `DirtyFile` by loading its
     /// content from the store. No-op for already-dirty files. Returns
     /// `NotAFile` for trees and symlinks.
-    fn ensure_dirty_file(&self, ino: InodeId) -> Result<(), FsError> {
+    async fn ensure_dirty_file(&self, ino: InodeId) -> Result<(), FsError> {
         let inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
         match inode.node {
             NodeRef::DirtyFile { .. } => Ok(()),
             NodeRef::File { id, executable } => {
-                let file = self.read_file(id)?;
+                let file = self.read_file(id).await?;
                 self.slab.replace_node(
                     ino,
                     NodeRef::DirtyFile {
@@ -431,14 +490,16 @@ impl YakFs {
     }
 
     /// Detach a slab-attached child of `parent` by `name`, enforcing
-    /// the rmdir-empty rule. Sync because every backing op is sync —
-    /// shared between the trait's async `remove` and the pinned-`.jj/`
-    /// fall-through.
-    fn remove_from_slab(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
+    /// the rmdir-empty rule. Shared between the trait's async `remove`
+    /// and the pinned-`.jj/` fall-through.
+    ///
+    /// Async since M10 §10.6: the empty-check on a still-clean child
+    /// directory may need to fetch the tree blob from the remote.
+    async fn remove_from_slab(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
         // Materialize the parent so we can detach by name. If the named
         // child is itself a directory, refuse on a non-empty body —
         // mirrors POSIX `rmdir`.
-        self.ensure_dirty_tree(parent)?;
+        self.ensure_dirty_tree(parent).await?;
 
         // Peek at the child to enforce the "directory must be empty" rule
         // before we detach. Look up via the just-materialized
@@ -454,19 +515,25 @@ impl YakFs {
             _ => return Err(FsError::NotADirectory),
         };
         let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
-        match &child.node {
+        // Pull the tree id out under the match so we can drop the
+        // `Inode` ref before awaiting on `read_tree` (Inode contains
+        // a non-`Send` parking_lot guard via `slab.get`).
+        let clean_child_tree_id = match &child.node {
             NodeRef::DirtyTree { children } if !children.is_empty() => {
                 return Err(FsError::NotEmpty);
             }
-            NodeRef::Tree(id) => {
-                // Empty check on a still-clean child directory: peek the
-                // tree without materializing.
-                let tree = self.read_tree(*id)?;
-                if !tree.entries.is_empty() {
-                    return Err(FsError::NotEmpty);
-                }
+            NodeRef::Tree(id) => Some(*id),
+            _ => None,
+        };
+        drop(child);
+        if let Some(id) = clean_child_tree_id {
+            // Empty check on a still-clean child directory: peek the
+            // tree (possibly via remote read-through) without
+            // materializing.
+            let tree = self.read_tree(id).await?;
+            if !tree.entries.is_empty() {
+                return Err(FsError::NotEmpty);
             }
-            _ => {}
         }
 
         self.slab
@@ -477,7 +544,9 @@ impl YakFs {
 
     /// Look up a child by name in a (possibly clean) directory inode.
     /// Used by the write path's "does this name already exist?" check.
-    fn child_exists(&self, parent: InodeId, name: &str) -> Result<bool, FsError> {
+    ///
+    /// Async since M10 §10.6 (clean trees may need a remote fetch).
+    async fn child_exists(&self, parent: InodeId, name: &str) -> Result<bool, FsError> {
         // Pinned `.jj/` shadows the user tree at the same name — and is
         // visible whether or not the underlying root is dirty.
         if self.is_jj_root(parent, name) && self.jj_subtree().is_some() {
@@ -487,7 +556,7 @@ impl YakFs {
         match parent_inode.node {
             NodeRef::DirtyTree { children } => Ok(children.contains_key(name)),
             NodeRef::Tree(id) => {
-                let tree = self.read_tree(id)?;
+                let tree = self.read_tree(id).await?;
                 Ok(tree.entries.iter().any(|m| m.name == name))
             }
             _ => Err(FsError::NotADirectory),
@@ -498,7 +567,10 @@ impl YakFs {
     /// Same logic as `getattr`'s body, exposed as a helper so the write
     /// ops can return an `Attr` for the just-created/just-modified inode
     /// without round-tripping through the trait method.
-    fn attr_for(&self, ino: InodeId) -> Result<Attr, FsError> {
+    ///
+    /// Async since M10 §10.6: a still-clean file/symlink whose blob
+    /// isn't local needs a remote fetch to compute its size.
+    async fn attr_for(&self, ino: InodeId) -> Result<Attr, FsError> {
         let inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
         match inode.node {
             NodeRef::Tree(_) | NodeRef::DirtyTree { .. } => Ok(Attr {
@@ -508,7 +580,7 @@ impl YakFs {
                 executable: false,
             }),
             NodeRef::File { id, executable } => {
-                let file = self.read_file(id)?;
+                let file = self.read_file(id).await?;
                 Ok(Attr {
                     inode: ino,
                     kind: FileKind::Regular,
@@ -526,7 +598,7 @@ impl YakFs {
                 executable,
             }),
             NodeRef::Symlink(id) => {
-                let symlink = self.read_symlink(id)?;
+                let symlink = self.read_symlink(id).await?;
                 Ok(Attr {
                     inode: ino,
                     kind: FileKind::Symlink,
@@ -653,7 +725,7 @@ impl JjYakFs for YakFs {
                 children.get(name).copied().ok_or(FsError::NotFound)
             }
             NodeRef::Tree(id) => {
-                let tree = self.read_tree(id)?;
+                let tree = self.read_tree(id).await?;
                 let mapping = tree
                     .entries
                     .iter()
@@ -667,7 +739,7 @@ impl JjYakFs for YakFs {
     }
 
     async fn getattr(&self, ino: InodeId) -> Result<Attr, FsError> {
-        self.attr_for(ino)
+        self.attr_for(ino).await
     }
 
     async fn read(
@@ -681,14 +753,19 @@ impl JjYakFs for YakFs {
         // files round-trip through the store. Same off-end semantics in
         // both cases (NFS allows reads past EOF; FUSE just gets a short
         // reply).
-        let content_owned: Option<Vec<u8>>;
-        let content: &[u8] = match inode.node {
-            NodeRef::DirtyFile { ref content, .. } => content,
-            NodeRef::File { id, .. } => {
-                let file = self.read_file(id)?;
-                content_owned = Some(file.content);
-                content_owned.as_deref().expect("just set")
-            }
+        // Pre-fetch the file content if the inode is a clean
+        // `NodeRef::File` so we can drop the slab-held inode before
+        // the slice borrow below; this also moves the (possibly
+        // remote-fetching) `read_file` outside the match-by-ref.
+        let owned_content: Option<Vec<u8>> = if let NodeRef::File { id, .. } = inode.node {
+            Some(self.read_file(id).await?.content)
+        } else {
+            None
+        };
+        let content: &[u8] = match (&inode.node, owned_content.as_deref()) {
+            (NodeRef::DirtyFile { content, .. }, _) => content,
+            (NodeRef::File { .. }, Some(slice)) => slice,
+            (NodeRef::File { .. }, None) => unreachable!("owned_content set above"),
             _ => return Err(FsError::NotAFile),
         };
         let len = content.len() as u64;
@@ -742,7 +819,7 @@ impl JjYakFs for YakFs {
                 Ok(out)
             }
             NodeRef::Tree(_) => {
-                let tree = self.dir_tree(&inode)?;
+                let tree = self.dir_tree(&inode).await?;
                 let mut out = Vec::with_capacity(tree.entries.len() + pinned_jj.is_some() as usize);
                 for mapping in &tree.entries {
                     if pinned_jj.is_some() && mapping.name == JJ_DIR {
@@ -773,7 +850,7 @@ impl JjYakFs for YakFs {
     async fn readlink(&self, ino: InodeId) -> Result<String, FsError> {
         let inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
         match inode.node {
-            NodeRef::Symlink(id) => self.read_symlink(id).map(|s| s.target),
+            NodeRef::Symlink(id) => self.read_symlink(id).await.map(|s| s.target),
             NodeRef::DirtySymlink { target } => Ok(target),
             _ => Err(FsError::NotASymlink),
         }
@@ -782,8 +859,11 @@ impl JjYakFs for YakFs {
     async fn check_out(&self, new_root_tree: Id) -> Result<(), FsError> {
         // Validate the target tree is present before we touch the slab —
         // otherwise we'd swap the root to an unreadable id and surface
-        // every subsequent lookup as `StoreMiss`.
-        let _ = self.read_tree(new_root_tree)?;
+        // every subsequent lookup as `StoreMiss`. M10 §10.6: the
+        // validate-via-`read_tree` path also primes the local cache
+        // from the remote in clone-style flows where the new root
+        // isn't yet local.
+        let _ = self.read_tree(new_root_tree).await?;
         self.slab.swap_root(new_root_tree);
         Ok(())
     }
@@ -794,10 +874,10 @@ impl JjYakFs for YakFs {
         name: &str,
         executable: bool,
     ) -> Result<(InodeId, Attr), FsError> {
-        if self.child_exists(parent, name)? {
+        if self.child_exists(parent, name).await? {
             return Err(FsError::AlreadyExists);
         }
-        self.ensure_dirty_tree(parent)?;
+        self.ensure_dirty_tree(parent).await?;
         let child = self.slab.alloc(
             parent,
             name.to_owned(),
@@ -812,7 +892,7 @@ impl JjYakFs for YakFs {
             // surface it cleanly rather than corrupting state.
             return Err(FsError::AlreadyExists);
         }
-        let attr = self.attr_for(child)?;
+        let attr = self.attr_for(child).await?;
         Ok((child, attr))
     }
 
@@ -820,33 +900,39 @@ impl JjYakFs for YakFs {
         // Pinned `.jj/` slot — bypass the regular slab attachment so the
         // directory survives `swap_root` and stays out of `snapshot`.
         if self.is_jj_root(parent, name) {
-            let mut pinned = self.jj_subtree.lock();
-            if pinned.is_some() {
-                return Err(FsError::AlreadyExists);
-            }
-            // Validate the parent is a directory we *could* attach into,
-            // even though we don't actually attach. This matches the
-            // error contract callers see for non-pinned mkdirs.
-            let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
-            match parent_inode.node {
-                NodeRef::Tree(_) | NodeRef::DirtyTree { .. } => {}
-                _ => return Err(FsError::NotADirectory),
-            }
-            let child = self.slab.alloc(
-                parent,
-                name.to_owned(),
-                NodeRef::DirtyTree {
-                    children: std::collections::BTreeMap::new(),
-                },
-            );
-            *pinned = Some(child);
-            let attr = self.attr_for(child)?;
+            // Hold `pinned` across the synchronous slab op; release
+            // before awaiting `attr_for`.
+            let child = {
+                let mut pinned = self.jj_subtree.lock();
+                if pinned.is_some() {
+                    return Err(FsError::AlreadyExists);
+                }
+                // Validate the parent is a directory we *could* attach
+                // into, even though we don't actually attach. This
+                // matches the error contract callers see for non-pinned
+                // mkdirs.
+                let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
+                match parent_inode.node {
+                    NodeRef::Tree(_) | NodeRef::DirtyTree { .. } => {}
+                    _ => return Err(FsError::NotADirectory),
+                }
+                let child = self.slab.alloc(
+                    parent,
+                    name.to_owned(),
+                    NodeRef::DirtyTree {
+                        children: std::collections::BTreeMap::new(),
+                    },
+                );
+                *pinned = Some(child);
+                child
+            };
+            let attr = self.attr_for(child).await?;
             return Ok((child, attr));
         }
-        if self.child_exists(parent, name)? {
+        if self.child_exists(parent, name).await? {
             return Err(FsError::AlreadyExists);
         }
-        self.ensure_dirty_tree(parent)?;
+        self.ensure_dirty_tree(parent).await?;
         let child = self.slab.alloc(
             parent,
             name.to_owned(),
@@ -857,7 +943,7 @@ impl JjYakFs for YakFs {
         if !self.slab.attach_child(parent, name.to_owned(), child) {
             return Err(FsError::AlreadyExists);
         }
-        let attr = self.attr_for(child)?;
+        let attr = self.attr_for(child).await?;
         Ok((child, attr))
     }
 
@@ -867,10 +953,10 @@ impl JjYakFs for YakFs {
         name: &str,
         target: &str,
     ) -> Result<(InodeId, Attr), FsError> {
-        if self.child_exists(parent, name)? {
+        if self.child_exists(parent, name).await? {
             return Err(FsError::AlreadyExists);
         }
-        self.ensure_dirty_tree(parent)?;
+        self.ensure_dirty_tree(parent).await?;
         let child = self.slab.alloc(
             parent,
             name.to_owned(),
@@ -881,12 +967,12 @@ impl JjYakFs for YakFs {
         if !self.slab.attach_child(parent, name.to_owned(), child) {
             return Err(FsError::AlreadyExists);
         }
-        let attr = self.attr_for(child)?;
+        let attr = self.attr_for(child).await?;
         Ok((child, attr))
     }
 
     async fn write(&self, ino: InodeId, offset: u64, data: &[u8]) -> Result<u32, FsError> {
-        self.ensure_dirty_file(ino)?;
+        self.ensure_dirty_file(ino).await?;
         let mut inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
         let NodeRef::DirtyFile {
             ref mut content,
@@ -922,10 +1008,10 @@ impl JjYakFs for YakFs {
         // Both fields touch a file — make sure we're working with a
         // dirty buffer.
         if size.is_some() || executable.is_some() {
-            self.ensure_dirty_file(ino)?;
+            self.ensure_dirty_file(ino).await?;
         } else {
             // No-op setattr (e.g. atime-only) just returns current attrs.
-            return self.attr_for(ino);
+            return self.attr_for(ino).await;
         }
 
         let mut inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
@@ -947,7 +1033,7 @@ impl JjYakFs for YakFs {
             executable: *exec_bit,
         };
         self.slab.replace_node(ino, new);
-        self.attr_for(ino)
+        self.attr_for(ino).await
     }
 
     async fn remove(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
@@ -955,34 +1041,52 @@ impl JjYakFs for YakFs {
         // The slab still owns the inode (orphaned, same as `detach_child`)
         // so any cached kernel handle stays resolvable.
         if self.is_jj_root(parent, name) {
-            let mut pinned = self.jj_subtree.lock();
-            let Some(jj_ino) = *pinned else {
+            // Pull the pinned id out without holding the parking_lot
+            // guard across the empty-check await. We re-acquire to
+            // clear the pin once we've confirmed it's safe to drop.
+            let pinned_jj = *self.jj_subtree.lock();
+            let Some(jj_ino) = pinned_jj else {
                 // Fall through: maybe a legacy `.jj` lives in the user tree.
-                drop(pinned);
-                return self.remove_from_slab(parent, name);
+                return self.remove_from_slab(parent, name).await;
             };
             let inode = self.slab.get(jj_ino).ok_or(FsError::NotFound)?;
-            match &inode.node {
-                NodeRef::DirtyTree { children } if !children.is_empty() => {
-                    return Err(FsError::NotEmpty);
-                }
-                NodeRef::Tree(id) => {
-                    let tree = self.read_tree(*id)?;
+            // Extract just the bits we need before the inode goes
+            // out of scope so we can await `read_tree` without
+            // borrowing the inode across the await.
+            enum PinShape {
+                EmptyDirty,
+                CleanTree(Id),
+                NonEmptyDirty,
+                NotADir,
+            }
+            let shape = match &inode.node {
+                NodeRef::DirtyTree { children } if children.is_empty() => PinShape::EmptyDirty,
+                NodeRef::DirtyTree { .. } => PinShape::NonEmptyDirty,
+                NodeRef::Tree(id) => PinShape::CleanTree(*id),
+                _ => PinShape::NotADir,
+            };
+            drop(inode);
+            match shape {
+                PinShape::NonEmptyDirty => return Err(FsError::NotEmpty),
+                PinShape::NotADir => return Err(FsError::NotADirectory),
+                PinShape::CleanTree(id) => {
+                    let tree = self.read_tree(id).await?;
                     if !tree.entries.is_empty() {
                         return Err(FsError::NotEmpty);
                     }
                 }
-                NodeRef::DirtyTree { .. } => {}
-                _ => {
-                    // Pinned slot held a non-directory? Shouldn't happen
-                    // — `mkdir` is the only path that populates it.
-                    return Err(FsError::NotADirectory);
-                }
+                PinShape::EmptyDirty => {}
             }
-            *pinned = None;
+            // Re-check that nobody re-pinned a different `.jj/` while
+            // we were awaiting (no current code path does, but keep the
+            // invariant locally enforced).
+            let mut pinned = self.jj_subtree.lock();
+            if *pinned == Some(jj_ino) {
+                *pinned = None;
+            }
             return Ok(());
         }
-        self.remove_from_slab(parent, name)
+        self.remove_from_slab(parent, name).await
     }
 
     async fn rename(
@@ -1004,9 +1108,9 @@ impl JjYakFs for YakFs {
         // children maps. They might be the same inode (same-directory
         // rename — the common case for jj-lib's tmpfile→final swap).
         // Materialize both; same-parent is a no-op the second time.
-        self.ensure_dirty_tree(parent)?;
+        self.ensure_dirty_tree(parent).await?;
         if new_parent != parent {
-            self.ensure_dirty_tree(new_parent)?;
+            self.ensure_dirty_tree(new_parent).await?;
         }
 
         // POSIX rename rules we honour:
@@ -1046,22 +1150,42 @@ impl JjYakFs for YakFs {
                 // Same path resolves to same inode — POSIX no-op.
                 return Ok(());
             }
-            let src = self.slab.get(src_inode_id).ok_or(FsError::NotFound)?;
-            let dst = self.slab.get(dst_id).ok_or(FsError::NotFound)?;
-            let src_is_dir =
-                matches!(src.node, NodeRef::Tree(_) | NodeRef::DirtyTree { .. });
-            let dst_is_dir =
-                matches!(dst.node, NodeRef::Tree(_) | NodeRef::DirtyTree { .. });
-            match (src_is_dir, dst_is_dir) {
+            // Pull the type/empty info out of the slab synchronously,
+            // then drop the inode handles before any potential await.
+            // Tree id is captured for the clean-dir empty-check below.
+            #[derive(PartialEq)]
+            enum DirShape {
+                Dir,
+                NonDir,
+            }
+            let (src_shape, dst_shape, dst_clean_tree_id, dst_dirty_empty) = {
+                let src = self.slab.get(src_inode_id).ok_or(FsError::NotFound)?;
+                let dst = self.slab.get(dst_id).ok_or(FsError::NotFound)?;
+                let src_shape = match src.node {
+                    NodeRef::Tree(_) | NodeRef::DirtyTree { .. } => DirShape::Dir,
+                    _ => DirShape::NonDir,
+                };
+                let (dst_shape, dst_clean_tree_id, dst_dirty_empty) = match &dst.node {
+                    NodeRef::Tree(id) => (DirShape::Dir, Some(*id), None),
+                    NodeRef::DirtyTree { children } => {
+                        (DirShape::Dir, None, Some(children.is_empty()))
+                    }
+                    _ => (DirShape::NonDir, None, None),
+                };
+                (src_shape, dst_shape, dst_clean_tree_id, dst_dirty_empty)
+            };
+            match (src_shape == DirShape::Dir, dst_shape == DirShape::Dir) {
                 (true, false) => return Err(FsError::NotADirectory),
                 (false, true) => return Err(FsError::NotAFile),
                 (true, true) => {
                     // Empty-check the destination directory before
                     // clobbering. Mirrors `remove`'s rmdir-empty rule.
-                    let empty = match &dst.node {
-                        NodeRef::DirtyTree { children } => children.is_empty(),
-                        NodeRef::Tree(id) => self.read_tree(*id)?.entries.is_empty(),
-                        _ => true,
+                    // Clean dst may need a remote fetch on M10
+                    // §10.6's read-through path.
+                    let empty = if let Some(id) = dst_clean_tree_id {
+                        self.read_tree(id).await?.entries.is_empty()
+                    } else {
+                        dst_dirty_empty.expect("dirty branch sets dst_dirty_empty")
                     };
                     if !empty {
                         return Err(FsError::NotEmpty);
@@ -1175,7 +1299,7 @@ mod tests {
     #[tokio::test]
     async fn empty_repo_has_only_root() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let entries = fs.readdir(fs.root()).await.expect("readdir empty root");
         assert!(entries.is_empty(), "got {entries:?}");
         let attr = fs.getattr(fs.root()).await.expect("getattr root");
@@ -1185,7 +1309,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_finds_top_level_file() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.expect("lookup");
         let attr = fs.getattr(id).await.expect("getattr");
         assert_eq!(attr.kind, FileKind::Regular);
@@ -1196,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_traverses_subdirectory() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let bin_id = fs.lookup(fs.root(), "bin").await.expect("bin");
         let bin_attr = fs.getattr(bin_id).await.expect("getattr bin");
         assert_eq!(bin_attr.kind, FileKind::Directory);
@@ -1209,7 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_is_idempotent() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let a = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         let b = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         assert_eq!(a, b);
@@ -1218,7 +1342,7 @@ mod tests {
     #[tokio::test]
     async fn read_returns_file_content_with_eof_flag() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.unwrap();
 
         // Whole file in one shot.
@@ -1240,7 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_lists_all_top_level_entries_with_kind() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let mut entries = fs.readdir(fs.root()).await.unwrap();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -1255,7 +1379,7 @@ mod tests {
     #[tokio::test]
     async fn readlink_returns_target() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "link").await.unwrap();
         assert_eq!(fs.readlink(id).await.unwrap(), "hello.txt");
     }
@@ -1263,7 +1387,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_unknown_name_is_not_found() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let err = fs.lookup(fs.root(), "missing").await.unwrap_err();
         assert_eq!(err, FsError::NotFound);
     }
@@ -1271,7 +1395,7 @@ mod tests {
     #[tokio::test]
     async fn read_on_directory_is_not_a_file() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let err = fs.read(fs.root(), 0, 16).await.unwrap_err();
         assert_eq!(err, FsError::NotAFile);
     }
@@ -1279,7 +1403,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_on_file_is_not_a_directory() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         let err = fs.readdir(id).await.unwrap_err();
         assert_eq!(err, FsError::NotADirectory);
@@ -1288,7 +1412,7 @@ mod tests {
     #[tokio::test]
     async fn getattr_on_unknown_inode_is_not_found() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let err = fs.getattr(99_999).await.unwrap_err();
         assert_eq!(err, FsError::NotFound);
     }
@@ -1326,7 +1450,7 @@ mod tests {
             }],
         });
 
-        let fs = YakFs::new(store, tree_a);
+        let fs = YakFs::new(store, tree_a, None);
         // Tree A is visible.
         fs.lookup(fs.root(), "only-in-a.txt").await.expect("A");
         assert_eq!(
@@ -1349,7 +1473,7 @@ mod tests {
     #[tokio::test]
     async fn check_out_unknown_tree_is_store_miss() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root);
+        let fs = YakFs::new(store, root, None);
         let err = fs.check_out(Id([0xff; 32])).await.unwrap_err();
         assert_eq!(err, FsError::StoreMiss);
         // Original tree is still visible.
@@ -1366,7 +1490,7 @@ mod tests {
     #[tokio::test]
     async fn create_write_read_round_trips() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (file_ino, attr) = fs
             .create_file(fs.root(), "hello.txt", false)
             .await
@@ -1406,7 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn mkdir_then_create_inside_round_trips() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.expect("mkdir");
         let (file_ino, _) = fs
@@ -1447,7 +1571,7 @@ mod tests {
     #[tokio::test]
     async fn symlink_round_trips() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (link_ino, attr) = fs
             .symlink(fs.root(), "link", "target")
             .await
@@ -1478,7 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn create_collision_is_already_exists() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         fs.create_file(fs.root(), "a", false).await.unwrap();
         let err = fs
             .create_file(fs.root(), "a", false)
@@ -1492,7 +1616,7 @@ mod tests {
     #[tokio::test]
     async fn setattr_truncates_file() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1512,7 +1636,7 @@ mod tests {
     #[tokio::test]
     async fn setattr_chmod_preserves_content() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1534,7 +1658,7 @@ mod tests {
     #[tokio::test]
     async fn remove_file_then_lookup_is_not_found() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.remove(fs.root(), "f").await.expect("remove");
         let err = fs.lookup(fs.root(), "f").await.unwrap_err();
@@ -1546,7 +1670,7 @@ mod tests {
     #[tokio::test]
     async fn remove_non_empty_directory_is_not_empty() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (dir, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         fs.create_file(dir, "f", false).await.unwrap();
 
@@ -1561,7 +1685,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_clean_returns_existing_root() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store.clone(), root);
+        let fs = YakFs::new(store.clone(), root, None);
         let id = fs.snapshot().await.expect("snapshot");
         assert_eq!(id, root);
     }
@@ -1572,13 +1696,13 @@ mod tests {
     #[tokio::test]
     async fn snapshot_is_deterministic_under_insertion_order() {
         let store_a = Arc::new(Store::new_in_memory());
-        let fs_a = YakFs::new(store_a.clone(), store_a.get_empty_tree_id());
+        let fs_a = YakFs::new(store_a.clone(), store_a.get_empty_tree_id(), None);
         fs_a.create_file(fs_a.root(), "a", false).await.unwrap();
         fs_a.create_file(fs_a.root(), "b", false).await.unwrap();
         let id_a = fs_a.snapshot().await.unwrap();
 
         let store_b = Arc::new(Store::new_in_memory());
-        let fs_b = YakFs::new(store_b.clone(), store_b.get_empty_tree_id());
+        let fs_b = YakFs::new(store_b.clone(), store_b.get_empty_tree_id(), None);
         // Inserted in the opposite order — final tree should hash the same.
         fs_b.create_file(fs_b.root(), "b", false).await.unwrap();
         fs_b.create_file(fs_b.root(), "a", false).await.unwrap();
@@ -1593,7 +1717,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_preserves_inode_ids() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"x").await.unwrap();
         fs.snapshot().await.unwrap();
@@ -1609,7 +1733,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_excluded_from_snapshot() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Create `.jj/` and a file inside it (matches what jj-lib does
         // during `init_with_factories`).
@@ -1654,7 +1778,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_survives_check_out() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Set up a `.jj/` with some content.
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
@@ -1698,7 +1822,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_pin_is_unique() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         fs.mkdir(fs.root(), ".jj").await.expect("mkdir .jj");
         let err = fs.mkdir(fs.root(), ".jj").await.expect_err("dup mkdir");
         assert_eq!(err, FsError::AlreadyExists);
@@ -1730,7 +1854,7 @@ mod tests {
                 },
             }],
         });
-        let fs = YakFs::new(store.clone(), legacy_tree);
+        let fs = YakFs::new(store.clone(), legacy_tree, None);
 
         // Without a pin, lookup of `.jj` falls through to the user tree
         // and returns the legacy file.
@@ -1748,7 +1872,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_remove_respects_rmdir_empty() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         fs.create_file(jj_ino, "f", false).await.unwrap();
         let err = fs.remove(fs.root(), ".jj").await.unwrap_err();
@@ -1767,7 +1891,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_dirty_buffers_cleaned_on_snapshot() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         let (file_ino, _) = fs.create_file(jj_ino, "config", false).await.unwrap();
         fs.write(file_ino, 0, b"settings").await.unwrap();

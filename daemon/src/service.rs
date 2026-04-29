@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _};
 use bytes::Bytes;
-use prost::Message as _;
 use proto::jj_interface::*;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::mount_meta::{self, MountMetadata};
+use crate::remote::fetch::{self, FetchError};
 use crate::remote::{self, BlobKind, RemoteStore};
 use crate::store::Store;
 use crate::ty;
@@ -276,7 +276,11 @@ impl JujutsuService {
         // operator can prune the broken mount dir.
         let remote_store = remote::parse(&meta.remote)
             .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
-        let fs: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store.clone(), root_tree_id));
+        // M10 §10.6: hand the remote into `YakFs` too, so FUSE-side
+        // reads on a `StoreMiss` fall through to the remote the same
+        // way M9's RPC-layer reads already do.
+        let fs: Arc<dyn JjYakFs> =
+            Arc::new(YakFs::new(store.clone(), root_tree_id, remote_store.clone()));
 
         // The previous daemon's FUSE/NFS mount went away when its
         // process exited (kernel drops the mount). On restart the path
@@ -462,130 +466,82 @@ async fn mount_handles(
 
 // ---- Layer C / M9 read-through helpers --------------------------------
 //
-// On local-store miss with a configured remote: fetch the bytes, decode,
-// persist locally (so subsequent reads hit the cache), and return the
-// typed value. On miss with no remote, return `not_found` — preserves
-// pre-M9 behavior.
+// On local-store miss with a configured remote: delegate to
+// `crate::remote::fetch`, which fetches the bytes, decodes, verifies
+// round-trip (defending against a corrupt peer), and persists locally
+// so subsequent reads hit the cache. On miss with no remote, return
+// `not_found` — preserves pre-M9 behavior.
 //
-// Each helper handles one blob kind because the decode step is
-// kind-specific. The persistence step uses the existing typed `write_*`
-// API and re-encodes; the cost is fine for the cold read-through path
-// (the hot snapshot/write-through path is already buffer-reusing per
-// `Store::write_*` returning `(Id, Bytes)`).
+// M10 §10.6 factored the fetch+verify+persist dance out of this module
+// so `vfs/yak_fs.rs` can share the implementation. The wrapper here
+// translates the typed `FetchError` onto gRPC `Status` codes — keeping
+// `data_loss` distinct from generic `internal` is a real wire-side
+// signal (corrupt peer, not a transient I/O hiccup).
 //
-// Sanity check: after we persist locally, the recomputed content hash
-// must match the requested id. A mismatch means the remote returned
-// bytes that didn't hash to the id we asked for — almost certainly a
-// remote-store bug, but surface it as `data_loss` rather than blindly
-// trusting the wire so a corrupt remote doesn't poison the local store
-// silently.
+// Ok=() vs Err=Status is intentionally imbalanced — Status is large
+// (~176 bytes); the call sites all `?`-propagate without boxing.
+#[allow(clippy::result_large_err)]
+fn fetch_status(err: FetchError) -> Status {
+    match err {
+        FetchError::NotFound { kind, id } => Status::not_found(format!(
+            "{kind} {id} not found locally or on remote"
+        )),
+        FetchError::DataLoss { .. } => Status::data_loss(format!("{err:#}")),
+        FetchError::Decode { .. } | FetchError::DecodeValue { .. } => {
+            Status::invalid_argument(format!("{err:#}"))
+        }
+        FetchError::LocalWrite { .. } | FetchError::Remote { .. } => {
+            Status::internal(format!("{err:#}"))
+        }
+    }
+}
 
+#[allow(clippy::result_large_err)]
 async fn fetch_file_through_remote(
     store: &Store,
     remote: Option<&dyn RemoteStore>,
     id: ty::Id,
 ) -> Result<ty::File, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("file {} not found", hex(&id))))?;
-    let bytes = remote
-        .get_blob(BlobKind::File, &id)
-        .await
-        .map_err(remote_status("remote get_blob (file)"))?
-        .ok_or_else(|| Status::not_found(format!("file {} not found locally or on remote", hex(&id))))?;
-    let proto = proto::jj_interface::File::decode(bytes.as_ref())
-        .map_err(decode_status("remote file blob"))?;
-    let file = ty::File::from(proto);
-    let (got_id, _bytes) = store
-        .write_file(file.clone())
-        .map_err(store_status("write_file (read-through cache)"))?;
-    verify_round_trip(BlobKind::File, id, got_id)?;
-    Ok(file)
+        .ok_or_else(|| Status::not_found(format!("file {id} not found")))?;
+    fetch::fetch_file(store, remote, id).await.map_err(fetch_status)
 }
 
+#[allow(clippy::result_large_err)]
 async fn fetch_symlink_through_remote(
     store: &Store,
     remote: Option<&dyn RemoteStore>,
     id: ty::Id,
 ) -> Result<ty::Symlink, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("symlink {} not found", hex(&id))))?;
-    let bytes = remote
-        .get_blob(BlobKind::Symlink, &id)
+        .ok_or_else(|| Status::not_found(format!("symlink {id} not found")))?;
+    fetch::fetch_symlink(store, remote, id)
         .await
-        .map_err(remote_status("remote get_blob (symlink)"))?
-        .ok_or_else(|| {
-            Status::not_found(format!("symlink {} not found locally or on remote", hex(&id)))
-        })?;
-    let proto = proto::jj_interface::Symlink::decode(bytes.as_ref())
-        .map_err(decode_status("remote symlink blob"))?;
-    let symlink = ty::Symlink::from(proto);
-    let (got_id, _bytes) = store
-        .write_symlink(symlink.clone())
-        .map_err(store_status("write_symlink (read-through cache)"))?;
-    verify_round_trip(BlobKind::Symlink, id, got_id)?;
-    Ok(symlink)
+        .map_err(fetch_status)
 }
 
+#[allow(clippy::result_large_err)]
 async fn fetch_tree_through_remote(
     store: &Store,
     remote: Option<&dyn RemoteStore>,
     id: ty::Id,
 ) -> Result<ty::Tree, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("tree {} not found", hex(&id))))?;
-    let bytes = remote
-        .get_blob(BlobKind::Tree, &id)
-        .await
-        .map_err(remote_status("remote get_blob (tree)"))?
-        .ok_or_else(|| Status::not_found(format!("tree {} not found locally or on remote", hex(&id))))?;
-    let proto = proto::jj_interface::Tree::decode(bytes.as_ref())
-        .map_err(decode_status("remote tree blob"))?;
-    let tree: ty::Tree = proto.try_into().map_err(decode_status("remote tree decode"))?;
-    let (got_id, _bytes) = store
-        .write_tree(tree.clone())
-        .map_err(store_status("write_tree (read-through cache)"))?;
-    verify_round_trip(BlobKind::Tree, id, got_id)?;
-    Ok(tree)
+        .ok_or_else(|| Status::not_found(format!("tree {id} not found")))?;
+    fetch::fetch_tree(store, remote, id).await.map_err(fetch_status)
 }
 
+#[allow(clippy::result_large_err)]
 async fn fetch_commit_through_remote(
     store: &Store,
     remote: Option<&dyn RemoteStore>,
     id: ty::Id,
 ) -> Result<ty::Commit, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("commit {} not found", hex(&id))))?;
-    let bytes = remote
-        .get_blob(BlobKind::Commit, &id)
+        .ok_or_else(|| Status::not_found(format!("commit {id} not found")))?;
+    fetch::fetch_commit(store, remote, id)
         .await
-        .map_err(remote_status("remote get_blob (commit)"))?
-        .ok_or_else(|| {
-            Status::not_found(format!("commit {} not found locally or on remote", hex(&id)))
-        })?;
-    let proto = proto::jj_interface::Commit::decode(bytes.as_ref())
-        .map_err(decode_status("remote commit blob"))?;
-    let commit: ty::Commit = proto.try_into().map_err(decode_status("remote commit decode"))?;
-    let (got_id, _bytes) = store
-        .write_commit(commit.clone())
-        .map_err(store_status("write_commit (read-through cache)"))?;
-    verify_round_trip(BlobKind::Commit, id, got_id)?;
-    Ok(commit)
-}
-
-// Ok=() vs Err=Status is intentionally imbalanced — a content-hash
-// mismatch on read-through is rare, and `Status::data_loss` is the
-// right wire-side surface; boxing it would just paper over clippy.
-#[allow(clippy::result_large_err)]
-fn verify_round_trip(kind: BlobKind, requested: ty::Id, got: ty::Id) -> Result<(), Status> {
-    if requested != got {
-        return Err(Status::data_loss(format!(
-            "remote returned {} bytes that hash to {} but we asked for {}",
-            kind.as_str(),
-            hex(&got),
-            hex(&requested)
-        )));
-    }
-    Ok(())
+        .map_err(fetch_status)
 }
 
 // ---- Layer C / M9 post-snapshot push ---------------------------------
@@ -715,7 +671,12 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // RPCs like `CheckOut` that mutate mount-side state). Even on
         // the disable_mount test path the `Mount` keeps an `fs` so
         // mutating RPCs work end-to-end without the kernel.
-        let fs: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store.clone(), root_tree_id));
+        //
+        // M10 §10.6: the remote is threaded into `YakFs` too — kernel
+        // reads on local-store miss fall through the same way the M9
+        // RPC layer already does at `service.rs`.
+        let fs: Arc<dyn JjYakFs> =
+            Arc::new(YakFs::new(store.clone(), root_tree_id, remote_store.clone()));
 
         // Production path validates and binds; test path skips both so
         // unit tests can use arbitrary string paths.
@@ -1169,8 +1130,16 @@ mod tests {
 
     use assert_matches::assert_matches;
     use proto::jj_interface::jujutsu_interface_server::JujutsuInterface;
+    // Several tests decode raw blob bytes off the dir:// remote to
+    // confirm write-through actually pushed the prost-encoded payload.
+    // The trait import lives here (test-only) rather than at the
+    // module top level — production code uses the typed
+    // `Store::get_*_bytes` helpers and never touches `prost::decode`
+    // directly.
+    use prost::Message as _;
 
     use super::*;
+    use crate::vfs::FileKind;
 
     /// Initialize a mount via the test path (no VFS bind). Returns the
     /// path used so the caller can pass it back into store/WC RPCs.
@@ -2090,5 +2059,185 @@ mod tests {
             first.tree_id, second.tree_id,
             "clean re-snapshot should produce the same tree id"
         );
+    }
+
+    // ---- M10 §10.6: FUSE-side remote read-through ---------------------
+
+    /// End-to-end FUSE-side read-through: service A populates a remote
+    /// (write-through + post-snapshot push); service B initialised
+    /// with the same remote but an empty local store can `lookup` /
+    /// `read` through B's `JjYakFs` and get the right content via
+    /// the lazy remote fetch in `vfs/yak_fs.rs`.
+    ///
+    /// This is the M10 analog of M9's
+    /// `read_file_falls_back_to_remote_on_local_miss`, but exercising
+    /// the FS layer rather than the RPC layer. Pre-M10 this test
+    /// would fail at `lookup` / `getattr` / `read` with EIO because
+    /// `vfs/yak_fs.rs::read_*` mapped `StoreMiss` straight to that;
+    /// now those helpers fall through to `RemoteStore::get_blob`.
+    #[tokio::test]
+    async fn fuse_layer_reads_through_remote_on_local_miss() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+
+        // Service A writes a file + builds a tree containing it,
+        // then snapshots so the remote sees both the file blob and
+        // the rolled-up tree blob.
+        let svc_a = JujutsuService::bare();
+        init_mount_with_remote(&svc_a, "/tmp/a", &remote_url).await;
+        let fs_a = svc_a.fs_for_test("/tmp/a").await.expect("svc_a mount");
+        let (file_ino_a, _) = fs_a
+            .create_file(fs_a.root(), "shared.txt", false)
+            .await
+            .expect("create_file");
+        fs_a.write(file_ino_a, 0, b"read-through-content")
+            .await
+            .unwrap();
+        let snap_a = svc_a
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: "/tmp/a".into(),
+            }))
+            .await
+            .expect("snapshot")
+            .into_inner();
+        let tree_id: ty::Id = TreeId {
+            tree_id: snap_a.tree_id.clone(),
+        }
+        .try_into()
+        .unwrap();
+
+        // Service B: separate storage_dir (so the tree+file blobs
+        // genuinely aren't local), shares the same remote. Tell it
+        // to check out A's tree id; B's `JjYakFs::check_out` calls
+        // `read_tree` which must fall through to the remote.
+        let svc_b = JujutsuService::bare();
+        init_mount_with_remote(&svc_b, "/tmp/b", &remote_url).await;
+        svc_b
+            .check_out(Request::new(CheckOutReq {
+                working_copy_path: "/tmp/b".into(),
+                new_tree_id: tree_id.0.to_vec(),
+            }))
+            .await
+            .expect("check_out via remote read-through");
+
+        // Now drive a kernel-style walk through B's FS: lookup +
+        // getattr + read. Each one would hit StoreMiss without M10
+        // §10.6 because B's local store didn't have the underlying
+        // blobs at init time.
+        let fs_b = svc_b.fs_for_test("/tmp/b").await.expect("svc_b mount");
+        let file_ino_b = fs_b
+            .lookup(fs_b.root(), "shared.txt")
+            .await
+            .expect("lookup via remote");
+        let attr = fs_b
+            .getattr(file_ino_b)
+            .await
+            .expect("getattr via remote");
+        assert_eq!(attr.size, b"read-through-content".len() as u64);
+        let (data, eof) = fs_b
+            .read(file_ino_b, 0, 1024)
+            .await
+            .expect("read via remote");
+        assert!(eof);
+        assert_eq!(data, b"read-through-content");
+    }
+
+    /// Negative case: with no remote configured, a `StoreMiss`
+    /// against `JjYakFs::check_out` still surfaces as the expected
+    /// failed_precondition (tree not in store), preserving pre-M10
+    /// behavior for mounts without a Layer-C remote.
+    #[tokio::test]
+    async fn fuse_layer_store_miss_no_remote_is_failed_precondition() {
+        let svc = JujutsuService::bare();
+        init_mount(&svc, "/tmp/repo").await;
+        // A fabricated tree id that nothing wrote — and no remote
+        // to fetch it from.
+        let bogus = vec![0xaa; 32];
+        let err = svc
+            .check_out(Request::new(CheckOutReq {
+                working_copy_path: "/tmp/repo".into(),
+                new_tree_id: bogus,
+            }))
+            .await
+            .expect_err("expected failed_precondition");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// FUSE-side read-through also primes the local cache: a second
+    /// `lookup` / `read` after the first must not depend on the
+    /// remote being reachable (we don't simulate a "remote going
+    /// down" condition here, but proving the local store now contains
+    /// the blob is the structural guarantee).
+    #[tokio::test]
+    async fn fuse_layer_read_through_populates_local_cache() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+
+        // Service A populates the remote.
+        let svc_a = JujutsuService::bare();
+        init_mount_with_remote(&svc_a, "/tmp/a", &remote_url).await;
+        let fs_a = svc_a.fs_for_test("/tmp/a").await.unwrap();
+        let (ino, _) = fs_a.create_file(fs_a.root(), "f.txt", false).await.unwrap();
+        fs_a.write(ino, 0, b"cached").await.unwrap();
+        let snap = svc_a
+            .snapshot(Request::new(SnapshotReq {
+                working_copy_path: "/tmp/a".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Service B: fetch via read-through.
+        let svc_b = JujutsuService::bare();
+        init_mount_with_remote(&svc_b, "/tmp/b", &remote_url).await;
+        svc_b
+            .check_out(Request::new(CheckOutReq {
+                working_copy_path: "/tmp/b".into(),
+                new_tree_id: snap.tree_id.clone(),
+            }))
+            .await
+            .unwrap();
+        let fs_b = svc_b.fs_for_test("/tmp/b").await.unwrap();
+        let f_ino = fs_b.lookup(fs_b.root(), "f.txt").await.unwrap();
+        let _ = fs_b.read(f_ino, 0, 1024).await.unwrap();
+
+        // After the read-through, B's local store now has the file
+        // and tree blobs. We probe the file blob directly — the
+        // tree blob was already populated by `check_out`'s
+        // validate-via-`read_tree`.
+        let (store_b, _remote_b) = mount_handles(&svc_b.mounts, "/tmp/b").await.unwrap();
+        let listing = fs_b.readdir(fs_b.root()).await.unwrap();
+        let entry = listing.iter().find(|e| e.name == "f.txt").unwrap();
+        // file id is whatever the lookup just resolved to — but we
+        // don't have a clean way to extract it without going through
+        // the slab. Instead, walk the tree blob from the local
+        // store and confirm the file id resolves via store_b too.
+        let tree_id: ty::Id = TreeId {
+            tree_id: snap.tree_id,
+        }
+        .try_into()
+        .unwrap();
+        let tree = store_b
+            .get_tree(tree_id)
+            .expect("tree in local store after read-through")
+            .unwrap();
+        let file_entry = tree
+            .entries
+            .iter()
+            .find(|m| m.name == "f.txt")
+            .expect("file in tree");
+        let file_id = match file_entry.entry {
+            TreeEntry::File { id, .. } => id,
+            _ => panic!("expected file entry"),
+        };
+        assert!(
+            store_b
+                .get_file(file_id)
+                .expect("get_file in local cache")
+                .is_some(),
+            "file blob should be cached locally after read-through"
+        );
+        // Sanity: entry inode matches what readdir saw.
+        assert!(matches!(entry.kind, FileKind::Regular));
     }
 }

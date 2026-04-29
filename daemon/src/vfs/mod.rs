@@ -38,3 +38,10 @@ pub use inode::ROOT_INODE;
 #[cfg(target_os = "macos")]
 pub use nfs_adapter::NfsAdapter;
 pub use yak_fs::{FsError, JjYakFs, YakFs};
+// `FileKind` is consumed only by tests today (the M10 §10.6 service-
+// level read-through tests that walk a `readdir` result for a kind
+// assertion). Re-exported under `cfg(test)` so production builds
+// don't see an "unused import" warning while keeping the symbol
+// reachable from the existing `crate::vfs::FileKind` import path.
+#[cfg(test)]
+pub use yak_fs::FileKind;

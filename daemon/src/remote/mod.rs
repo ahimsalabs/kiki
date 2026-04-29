@@ -21,6 +21,7 @@ use bytes::Bytes;
 
 use crate::ty::Id;
 
+pub mod fetch;
 pub mod fs;
 pub mod grpc;
 pub mod server;
