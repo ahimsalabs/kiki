@@ -141,6 +141,16 @@ struct Mount {
     root_tree_id: Vec<u8>,
     /// Per-mount keyspace.
     store: Arc<Store>,
+    /// Per-mount local-fallback catalog (M10.5, PLAN.md §10.5). Always
+    /// present, regardless of whether `remote_store` is `Some`. The
+    /// catalog RPC handlers prefer `remote_store`'s ref methods when a
+    /// remote is configured (so two daemons sharing a remote serialize
+    /// against each other), and fall back to `local_refs` otherwise
+    /// (so the catalog API works uniformly in the single-daemon case).
+    /// Backed by a redb table inside the same per-mount `store.redb`
+    /// file the blob `store` already owns — sharing the `Arc<Database>`
+    /// keeps everything on a single fsync per mutating txn.
+    local_refs: Arc<crate::local_refs::LocalRefs>,
     /// Per-mount filesystem. The same `Arc` is handed to the VFS bind so
     /// kernel I/O hits this object; we keep a clone here so RPCs that
     /// mutate the mount (today: `CheckOut`) can drive it directly.
@@ -262,6 +272,11 @@ impl JujutsuService {
 
     async fn rehydrate_one(&self, meta: &MountMetadata) -> anyhow::Result<()> {
         let store = Arc::new(open_store_for(&self.storage, &meta.working_copy_path)?);
+        // M10.5: always materialize a local-fallback catalog handle.
+        // It shares the per-mount redb Database, so no extra file or
+        // fsync; on this rehydrate path the table was created on the
+        // previous daemon's first cas_ref (or is implicitly empty).
+        let local_refs = Arc::new(crate::local_refs::LocalRefs::new(store.database()));
         let root_tree_id: ty::Id = if meta.root_tree_id.is_empty() {
             store.get_empty_tree_id()
         } else {
@@ -311,6 +326,7 @@ impl JujutsuService {
                 workspace_id: meta.workspace_id.clone(),
                 root_tree_id: root_tree_id.0.to_vec(),
                 store,
+                local_refs,
                 fs,
                 attachment,
                 meta_path,
@@ -462,6 +478,69 @@ async fn mount_handles(
         .get(path)
         .map(|m| (m.store.clone(), m.remote_store.clone()))
         .ok_or_else(|| Status::not_found(format!("no mount at {path}")))
+}
+
+/// Per-mount catalog handle (M10.5). When the mount has a remote
+/// configured, catalog ops route through that remote's ref methods —
+/// so two daemons sharing one remote serialize against each other.
+/// Otherwise they route through the per-mount [`LocalRefs`] (single
+/// daemon, no cross-process arbitration needed).
+///
+/// The two arms are exposed as a small enum rather than a `dyn
+/// Catalog` trait object: `LocalRefs`'s methods are sync, the
+/// `RemoteStore` ref methods are async, and adding a unifying trait
+/// just to bridge that asymmetry would add code without trimming any.
+#[derive(Clone)]
+enum CatalogHandle {
+    Remote(Arc<dyn RemoteStore>),
+    Local(Arc<crate::local_refs::LocalRefs>),
+}
+
+impl CatalogHandle {
+    async fn get_ref(&self, name: &str) -> anyhow::Result<Option<Bytes>> {
+        match self {
+            CatalogHandle::Remote(r) => r.get_ref(name).await,
+            CatalogHandle::Local(l) => l.get_ref(name),
+        }
+    }
+
+    async fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<&Bytes>,
+        new: Option<&Bytes>,
+    ) -> anyhow::Result<remote::CasOutcome> {
+        match self {
+            CatalogHandle::Remote(r) => r.cas_ref(name, expected, new).await,
+            CatalogHandle::Local(l) => l.cas_ref(name, expected, new),
+        }
+    }
+
+    async fn list_refs(&self) -> anyhow::Result<Vec<String>> {
+        match self {
+            CatalogHandle::Remote(r) => r.list_refs().await,
+            CatalogHandle::Local(l) => l.list_refs(),
+        }
+    }
+}
+
+/// Resolve the catalog handle for a mount: prefer the configured
+/// `RemoteStore` if any, otherwise the per-mount `LocalRefs`. Errors
+/// with `not_found` when the mount itself doesn't exist (same shape
+/// as [`mount_handles`]).
+#[allow(clippy::result_large_err)]
+async fn catalog_for(
+    mounts: &Arc<Mutex<HashMap<String, Mount>>>,
+    path: &str,
+) -> Result<CatalogHandle, Status> {
+    let guard = mounts.lock().await;
+    let m = guard
+        .get(path)
+        .ok_or_else(|| Status::not_found(format!("no mount at {path}")))?;
+    Ok(match &m.remote_store {
+        Some(r) => CatalogHandle::Remote(r.clone()),
+        None => CatalogHandle::Local(m.local_refs.clone()),
+    })
 }
 
 // ---- Layer C / M9 read-through helpers --------------------------------
@@ -657,6 +736,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let store = Arc::new(open_store_for(&self.storage, &req.path).map_err(|e| {
             Status::internal(format!("opening store for {}: {e:#}", req.path))
         })?);
+        // M10.5: always materialize a local-fallback catalog. See the
+        // note in `rehydrate_one`; same shape here.
+        let local_refs = Arc::new(crate::local_refs::LocalRefs::new(store.database()));
         let root_tree_id = store.get_empty_tree_id();
 
         // M9: parse `remote` into an optional `RemoteStore`. Bad URL =
@@ -711,6 +793,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             workspace_id: Vec::new(),
             root_tree_id: root_tree_id.0.to_vec(),
             store,
+            local_refs,
             fs,
             attachment,
             meta_path,
@@ -753,6 +836,83 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .collect();
         data.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Response::new(DaemonStatusReply { data }))
+    }
+
+    // ---- M10.5: per-mount catalog (mutable refs) -------------------
+    //
+    // CLI-facing wrappers around the per-mount catalog handle. The
+    // dispatch (remote vs local) lives in `catalog_for`; these
+    // handlers just thread the bytes across the wire and re-validate
+    // ref names defensively (same pattern as the M10
+    // `RemoteStoreService` handlers).
+
+    #[tracing::instrument(skip(self))]
+    async fn get_catalog_ref(
+        &self,
+        request: Request<GetCatalogRefReq>,
+    ) -> Result<Response<GetCatalogRefReply>, Status> {
+        let req = request.into_inner();
+        remote::validate_ref_name(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("ref name: {e:#}")))?;
+        let catalog = catalog_for(&self.mounts, &req.working_copy_path).await?;
+        let value = catalog
+            .get_ref(&req.name)
+            .await
+            .map_err(remote_status("catalog get_ref"))?;
+        Ok(Response::new(match value {
+            Some(b) => GetCatalogRefReply {
+                found: true,
+                value: b.to_vec(),
+            },
+            None => GetCatalogRefReply {
+                found: false,
+                value: Vec::new(),
+            },
+        }))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn cas_catalog_ref(
+        &self,
+        request: Request<CasCatalogRefReq>,
+    ) -> Result<Response<CasCatalogRefReply>, Status> {
+        let req = request.into_inner();
+        remote::validate_ref_name(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("ref name: {e:#}")))?;
+        let catalog = catalog_for(&self.mounts, &req.working_copy_path).await?;
+        // proto3 `optional bytes` decodes to `Option<Vec<u8>>`; lift
+        // to `Option<Bytes>` so the trait sees the same
+        // absent-vs-empty distinction as the wire.
+        let expected = req.expected.map(Bytes::from);
+        let new = req.new.map(Bytes::from);
+        let outcome = catalog
+            .cas_ref(&req.name, expected.as_ref(), new.as_ref())
+            .await
+            .map_err(remote_status("catalog cas_ref"))?;
+        Ok(Response::new(match outcome {
+            remote::CasOutcome::Updated => CasCatalogRefReply {
+                updated: true,
+                actual: None,
+            },
+            remote::CasOutcome::Conflict { actual } => CasCatalogRefReply {
+                updated: false,
+                actual: actual.map(|b| b.to_vec()),
+            },
+        }))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_catalog_refs(
+        &self,
+        request: Request<ListCatalogRefsReq>,
+    ) -> Result<Response<ListCatalogRefsReply>, Status> {
+        let req = request.into_inner();
+        let catalog = catalog_for(&self.mounts, &req.working_copy_path).await?;
+        let names = catalog
+            .list_refs()
+            .await
+            .map_err(remote_status("catalog list_refs"))?;
+        Ok(Response::new(ListCatalogRefsReply { names }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -2239,5 +2399,195 @@ mod tests {
         );
         // Sanity: entry inode matches what readdir saw.
         assert!(matches!(entry.kind, FileKind::Regular));
+    }
+
+    // ---- M10.5: catalog RPC dispatch ----------------------------
+
+    /// No-remote mount: catalog RPCs route through `LocalRefs`, so
+    /// the create/get/cas/list cycle works against per-mount redb.
+    /// This is the single-daemon flow that all current tests exercise
+    /// (every existing `init_mount` call passes `remote = ""`).
+    #[tokio::test]
+    async fn catalog_rpcs_route_to_local_refs_when_no_remote() {
+        let svc = JujutsuService::bare();
+        let path = "/tmp/repo".to_string();
+        init_mount(&svc, &path).await;
+
+        // Create-only: ref must not exist before this call.
+        let cas = svc
+            .cas_catalog_ref(Request::new(CasCatalogRefReq {
+                working_copy_path: path.clone(),
+                name: "op_heads".into(),
+                expected: None,
+                new: Some(b"v0".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cas.updated);
+        assert!(cas.actual.is_none());
+
+        // Read it back: hits LocalRefs.
+        let got = svc
+            .get_catalog_ref(Request::new(GetCatalogRefReq {
+                working_copy_path: path.clone(),
+                name: "op_heads".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.found);
+        assert_eq!(got.value, b"v0");
+
+        // Stale CAS: precondition mismatch returns the current value.
+        let cas = svc
+            .cas_catalog_ref(Request::new(CasCatalogRefReq {
+                working_copy_path: path.clone(),
+                name: "op_heads".into(),
+                expected: Some(b"WRONG".to_vec()),
+                new: Some(b"v1".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!cas.updated);
+        assert_eq!(cas.actual.as_deref(), Some(b"v0".as_ref()));
+
+        // List sees the one ref.
+        let list = svc
+            .list_catalog_refs(Request::new(ListCatalogRefsReq {
+                working_copy_path: path,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list.names, vec!["op_heads".to_string()]);
+    }
+
+    /// With a `dir://` remote configured, catalog RPCs route through
+    /// the remote's ref methods, not the local fallback. Two daemons
+    /// pointed at the same `dir://` therefore see each other's writes
+    /// — the multi-daemon arbitration property M10 set up.
+    #[tokio::test]
+    async fn catalog_rpcs_route_to_remote_when_configured() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+
+        let svc_a = JujutsuService::bare();
+        init_mount_with_remote(&svc_a, "/tmp/a", &remote_url).await;
+        let svc_b = JujutsuService::bare();
+        init_mount_with_remote(&svc_b, "/tmp/b", &remote_url).await;
+
+        // A creates op_heads.
+        let cas = svc_a
+            .cas_catalog_ref(Request::new(CasCatalogRefReq {
+                working_copy_path: "/tmp/a".into(),
+                name: "op_heads".into(),
+                expected: None,
+                new: Some(b"from-a".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cas.updated);
+
+        // B sees A's value through the same remote.
+        let got = svc_b
+            .get_catalog_ref(Request::new(GetCatalogRefReq {
+                working_copy_path: "/tmp/b".into(),
+                name: "op_heads".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.found, "B should see A's ref through the shared remote");
+        assert_eq!(got.value, b"from-a");
+
+        // B's create-only must conflict — the remote already has the ref.
+        let cas = svc_b
+            .cas_catalog_ref(Request::new(CasCatalogRefReq {
+                working_copy_path: "/tmp/b".into(),
+                name: "op_heads".into(),
+                expected: None,
+                new: Some(b"from-b".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!cas.updated);
+        assert_eq!(cas.actual.as_deref(), Some(b"from-a".as_ref()));
+    }
+
+    /// Two no-remote mounts on the same service have independent
+    /// `LocalRefs` (per-mount redb) — A's writes are invisible to B.
+    /// This verifies the local fallback is per-mount, not global.
+    #[tokio::test]
+    async fn catalog_local_refs_are_per_mount() {
+        let svc = JujutsuService::bare();
+        init_mount(&svc, "/tmp/a").await;
+        init_mount(&svc, "/tmp/b").await;
+
+        svc.cas_catalog_ref(Request::new(CasCatalogRefReq {
+            working_copy_path: "/tmp/a".into(),
+            name: "op_heads".into(),
+            expected: None,
+            new: Some(b"only-on-a".to_vec()),
+        }))
+        .await
+        .unwrap();
+
+        // B's catalog must not see A's local ref.
+        let got = svc
+            .get_catalog_ref(Request::new(GetCatalogRefReq {
+                working_copy_path: "/tmp/b".into(),
+                name: "op_heads".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!got.found);
+    }
+
+    /// Bad ref names are rejected with `invalid_argument` at the wire
+    /// boundary — same shape as the `RemoteStoreService` ref RPCs.
+    #[tokio::test]
+    async fn catalog_rpcs_reject_bad_name() {
+        let svc = JujutsuService::bare();
+        init_mount(&svc, "/tmp/a").await;
+        for bad in ["", "a/b", "..", "a\0b"] {
+            let err = svc
+                .get_catalog_ref(Request::new(GetCatalogRefReq {
+                    working_copy_path: "/tmp/a".into(),
+                    name: bad.into(),
+                }))
+                .await
+                .expect_err(bad);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            let err = svc
+                .cas_catalog_ref(Request::new(CasCatalogRefReq {
+                    working_copy_path: "/tmp/a".into(),
+                    name: bad.into(),
+                    expected: None,
+                    new: Some(b"x".to_vec()),
+                }))
+                .await
+                .expect_err(bad);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    /// Catalog RPCs against an unknown mount surface as `not_found`
+    /// — same as every other per-mount RPC.
+    #[tokio::test]
+    async fn catalog_rpcs_unknown_mount_is_not_found() {
+        let svc = JujutsuService::bare();
+        let err = svc
+            .get_catalog_ref(Request::new(GetCatalogRefReq {
+                working_copy_path: "/never/initialized".into(),
+                name: "op_heads".into(),
+            }))
+            .await
+            .expect_err("must error");
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

@@ -121,6 +121,24 @@ service JujutsuInterface {
 
   rpc DaemonStatus(DaemonStatusReq) returns (DaemonStatusReply) {}
 
+  // M10.5 — catalog (mutable refs) on the per-mount level. Same shape
+  // as the daemon-to-daemon `service RemoteStore` ref RPCs (§10.4) but
+  // routed through the CLI's existing channel to its local daemon
+  // rather than dialed directly. Carries `working_copy_path` so the
+  // daemon can pick the per-mount catalog handle: when the mount has a
+  // remote configured the request flows on to that remote's `cas_ref`/
+  // `get_ref`/`list_refs`; when no remote is configured the daemon
+  // services the request locally via `LocalRefs` (a redb table inside
+  // the per-mount store.redb).
+  //
+  // Why a separate RPC name and not reuse the `RemoteStore` service:
+  // the CLI needs `working_copy_path` routing, the `RemoteStore`
+  // service is already-bound to a single backend per service instance.
+  // Two services on one listener is the existing pattern (M9 §13.6).
+  rpc GetCatalogRef(GetCatalogRefReq) returns (GetCatalogRefReply) {}
+  rpc CasCatalogRef(CasCatalogRefReq) returns (CasCatalogRefReply) {}
+  rpc ListCatalogRefs(ListCatalogRefsReq) returns (ListCatalogRefsReply) {}
+
   // Working copy related calls
   rpc SetCheckoutState(SetCheckoutStateReq) returns (SetCheckoutStateReply) {}
   rpc GetCheckoutState(GetCheckoutStateReq) returns (CheckoutState) {}
@@ -161,6 +179,39 @@ service JujutsuInterface {
   rpc ReadCommit(ReadCommitReq) returns (Commit) {}
 }
 
+
+// M10.5 — per-mount catalog (mutable refs) message envelopes.
+// Same `Option<bytes>` semantics as `CasRefReq`/`GetRefReply` on
+// `service RemoteStore` (proto3 `optional` so absent-vs-empty round
+// trips), but each carries `working_copy_path` so the daemon can
+// route to the right per-mount catalog handle.
+
+message GetCatalogRefReq {
+  string working_copy_path = 1;
+  string name = 2;
+}
+message GetCatalogRefReply {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message CasCatalogRefReq {
+  string working_copy_path = 1;
+  string name = 2;
+  optional bytes expected = 3;
+  optional bytes new = 4;
+}
+message CasCatalogRefReply {
+  bool updated = 1;
+  optional bytes actual = 2;
+}
+
+message ListCatalogRefsReq {
+  string working_copy_path = 1;
+}
+message ListCatalogRefsReply {
+  repeated string names = 1;
+}
 
 message DaemonStatusReq {
 }
