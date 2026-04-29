@@ -17,8 +17,8 @@ use proto::jj_interface::remote_store_server::{
     RemoteStore as RemoteStoreServerTrait, RemoteStoreServer,
 };
 use proto::jj_interface::{
-    BlobKind as ProtoBlobKind, GetBlobReply, GetBlobReq, HasBlobReply, HasBlobReq,
-    PutBlobReply, PutBlobReq,
+    BlobKind as ProtoBlobKind, CasRefReply, CasRefReq, GetBlobReply, GetBlobReq, GetRefReply,
+    GetRefReq, HasBlobReply, HasBlobReq, ListRefsReply, ListRefsReq, PutBlobReply, PutBlobReq,
 };
 use tonic::{Request, Response, Status};
 
@@ -132,6 +132,39 @@ impl RemoteStoreServerTrait for RemoteStoreService {
             .await
             .map_err(|e| Status::internal(format!("backend has_blob: {e:#}")))?;
         Ok(Response::new(HasBlobReply { found }))
+    }
+
+    // M10 ref RPCs — stubbed for the proto-only commit. The next commit
+    // (RemoteStore trait extension + FsRemoteStore impl) replaces these
+    // with real delegations to `self.backend.{get,cas,list}_ref`. Kept
+    // as `unimplemented` rather than `todo!()` so a peer that calls a
+    // ref RPC against an only-blobs server gets a clean wire-side
+    // error rather than a process crash.
+    async fn get_ref(
+        &self,
+        _request: Request<GetRefReq>,
+    ) -> Result<Response<GetRefReply>, Status> {
+        Err(Status::unimplemented(
+            "RemoteStore.GetRef not implemented (M10 in flight)",
+        ))
+    }
+
+    async fn cas_ref(
+        &self,
+        _request: Request<CasRefReq>,
+    ) -> Result<Response<CasRefReply>, Status> {
+        Err(Status::unimplemented(
+            "RemoteStore.CasRef not implemented (M10 in flight)",
+        ))
+    }
+
+    async fn list_refs(
+        &self,
+        _request: Request<ListRefsReq>,
+    ) -> Result<Response<ListRefsReply>, Status> {
+        Err(Status::unimplemented(
+            "RemoteStore.ListRefs not implemented (M10 in flight)",
+        ))
     }
 }
 

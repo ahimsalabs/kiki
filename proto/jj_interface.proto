@@ -2,18 +2,33 @@ syntax = "proto3";
 
 package jj_interface;
 
-// Remote blob CAS (Layer C / M9, PLAN.md §13). Byte-typed: callers pass a
-// (kind, id) and bytes; the remote stores them as opaque blobs. Decoupled
-// from the prost schemas in `JujutsuInterface` so a daemon-to-daemon
-// remote keeps working across schema bumps. Same gRPC listener serves
-// both services — every daemon can act as the remote for another.
+// Remote blob CAS (Layer C / M9, PLAN.md §13) + mutable refs (M10,
+// PLAN.md §10). Byte-typed: callers pass a (kind, id) and bytes; the
+// remote stores them as opaque blobs. Decoupled from the prost schemas
+// in `JujutsuInterface` so a daemon-to-daemon remote keeps working
+// across schema bumps. Same gRPC listener serves both services — every
+// daemon can act as the remote for another.
 //
-// Auth, TLS, retry/backoff, streaming for large blobs are explicitly out
-// of scope for M9; see §13.5/§13.6.
+// Auth, TLS, retry/backoff, streaming for large blobs are explicitly
+// out of scope for M9; see §13.5/§13.6.
+//
+// M10 adds three ref RPCs (GetRef/CasRef/ListRefs) on the same
+// service so the daemon-to-daemon "any peer can be a remote" property
+// extends to the catalog. Refs are the mutable counterpart to blobs:
+// a name → bytes map, arbitrated via compare-and-swap. See PLAN.md
+// §10.1 for why one trait beats sibling traits, and §10.4 for the
+// proto3 `optional` choice on the CAS preconditions.
 service RemoteStore {
   rpc GetBlob(GetBlobReq) returns (GetBlobReply) {}
   rpc PutBlob(PutBlobReq) returns (PutBlobReply) {}
   rpc HasBlob(HasBlobReq) returns (HasBlobReply) {}
+
+  // M10: mutable refs. Names are UTF-8 strings (jj-lib op-store keys
+  // are too); values are arbitrary bytes (typically a 32-byte op id,
+  // but the wire doesn't constrain).
+  rpc GetRef(GetRefReq) returns (GetRefReply) {}
+  rpc CasRef(CasRefReq) returns (CasRefReply) {}
+  rpc ListRefs(ListRefsReq) returns (ListRefsReply) {}
 }
 
 // Which content-addressed table the (id, bytes) pair belongs to. Mirrors
@@ -53,6 +68,51 @@ message HasBlobReq {
 }
 message HasBlobReply {
   bool found = 1;
+}
+
+// M10 — mutable refs (PLAN.md §10.4).
+//
+// Refs are the mutable counterpart to content-addressed blobs. CAS
+// arbitration: callers send the value they expect to currently see;
+// the server applies the swap iff the precondition matches, and
+// returns the actual current value on conflict so the caller can
+// retry against ground truth. proto3 `optional` on `expected`/`new`
+// distinguishes "must not exist" from "must equal empty bytes" and
+// "delete" from "set to empty" — the trait-side analog is
+// `Option<&Bytes>`.
+
+message GetRefReq {
+  // UTF-8 name. Server validates: no NUL, no `/`, no `..` segments
+  // — refs live in a flat namespace under `<remote>/refs/<name>`.
+  string name = 1;
+}
+message GetRefReply {
+  // false = ref does not exist. `value` is meaningless when found=false
+  // and may be empty.
+  bool found = 1;
+  bytes value = 2;
+}
+
+message CasRefReq {
+  string name = 1;
+  // Absent = "must not currently exist" (create-only).
+  // Present (even if empty) = "must equal these bytes".
+  optional bytes expected = 2;
+  // Absent = "delete this ref".
+  // Present (even if empty) = "set ref to these bytes".
+  optional bytes new = 3;
+}
+message CasRefReply {
+  // true = swap applied. false = conflict; `actual` is the value the
+  // server actually saw (absent if the ref does not exist), which the
+  // caller should retry against.
+  bool updated = 1;
+  optional bytes actual = 2;
+}
+
+message ListRefsReq {}
+message ListRefsReply {
+  repeated string names = 1;
 }
 
 service JujutsuInterface {
