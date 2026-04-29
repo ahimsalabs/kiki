@@ -794,28 +794,52 @@ themselves.
   question reduces to mutable-pointer arbitration, which is
   deferred).
 
-### 13.2 Composition: `Store` learns to wrap a `RemoteStore`
+### 13.2 Composition: `service.rs` orchestrates; `Store` stays sync
 
-`Store::open` and `Store::new_in_memory` grow a sibling
-`open_with_remote(path, remote)` /
-`new_in_memory_with_remote(remote)`. Wrap-shape:
+**Decision (2026-04-28):** the integration site is `service.rs`, not
+`Store`. The original spec (a draft of this section) had `Store::
+open_with_remote` wrap a `RemoteStore` directly, but `Store` is
+sync by design (PLAN §12.1 — methods open a redb transaction
+without `.await` so `JjYakFs::snapshot_node` can recurse without
+`Box::pin`). Composing an async `RemoteStore` inside a sync
+`Store` would force one of: (a) make `Store` async (ripples
+through ~10 sync helpers in `vfs/yak_fs.rs` and ~30 call sites);
+(b) hide a dedicated tokio runtime inside `Store` to bridge
+sync→async (adds threads per remote-equipped mount and a non-obvious
+re-entry hazard); (c) push integration up to a layer that's
+already async. Option (c) — service.rs — has the smallest blast
+radius and the cleanest seam; the remote becomes an "RPC layer"
+concern that doesn't touch storage internals. The cost is: the
+FUSE-side store-miss path in `vfs/yak_fs.rs` doesn't get
+read-through automatically (see §13.5 — deferred to M10).
 
-- **write-through.** `write_file/tree/symlink/commit` first commit
-  to local redb, then `put_blob` to the remote. Synchronous push:
-  the RPC blocks until the remote is durable (§13.4). On `put_blob`
-  failure, the local write has already happened — return the error
-  but don't roll back. The next snapshot will reattempt push for
-  every still-locally-resident blob; the daemon doesn't track
-  "already-pushed" state in M9 (idempotent put + has_blob is enough
-  to make this cheap when it matters).
-- **read-through.** `get_*` returns local hit fast. On local miss
-  *and* a remote is configured, `get_blob`, decode, write-back to
-  local redb, return. On local miss with no remote: `Ok(None)` —
-  the existing `StoreMiss` path keeps working.
+`Mount` (in `service.rs`) gains
+`remote: Option<Arc<dyn RemoteStore>>`. RPC handlers do:
+
+- **write-through (in `WriteFile`/`WriteTree`/`WriteSymlink`/
+  `WriteCommit` handlers).** After `store.write_*` succeeds, if
+  `remote` is `Some`, capture the same prost-encoded bytes the
+  local store just wrote and `put_blob` them to the remote.
+  Synchronous: the RPC blocks until durable (§13.4). On `put_blob`
+  failure the local write has already happened; return the error
+  but don't roll back. Idempotent puts + the next snapshot retry
+  cover transient remote failures (M9 doesn't track
+  already-pushed state).
+- **read-through (in `ReadFile`/`ReadTree`/`ReadSymlink`/
+  `ReadCommit` handlers).** Local hit returns fast. On local
+  miss *and* `remote.is_some()`: `get_blob`, decode, persist to
+  local store via `store.write_*` (gives back the same id by
+  construction), return. On local miss with no remote: existing
+  `not_found` path.
+- **post-snapshot push (in `Snapshot` handler).** Blobs written
+  through `JjYakFs::snapshot_node` bypass the RPC handlers, so
+  `service.rs::Snapshot`, after `fs.snapshot().await` returns
+  the new root, walks the tree from that id and pushes every
+  reachable blob whose `has_blob` says the remote doesn't have
+  it. Walk re-uses local `Store::get_*`, so it's cheap.
 - **bytes encoding.** The encoding is exactly what redb stores
-  today: `prost::Message::encode_to_vec()` on the `*::as_proto()`
-  result. Local→remote is a `Bytes::clone` of the same buffer.
-  No re-encoding.
+  today: `prost::Message::encode_to_vec()` on `*::as_proto()`.
+  Push reuses the same buffer (`Bytes::clone`); no re-encoding.
 
 ### 13.3 Backends
 
@@ -875,6 +899,16 @@ inlining them.
   TLS. Land alongside S3 (M11+).
 - **Stable inode ids across restarts (§7 decision 6).** Still
   deferred; lands with the `fuser` migration (§11).
+- **FUSE-side read-through on `StoreMiss`.** The `lookup` /
+  `read` / `readdir` paths in `vfs/yak_fs.rs` continue to map
+  `StoreMiss` to `EIO`. The §13.2 decision (orchestrate at
+  `service.rs`) means yak_fs.rs doesn't see the remote without
+  duplicating fetch logic. The M9 demo — two daemons sharing
+  blobs via the gRPC store RPCs — is fully covered without it.
+  M10 is the right milestone to thread the remote into yak_fs.rs
+  (clone-style workflows where a checked-out tree's blobs aren't
+  all local) once we know whether to take the orchestration cost
+  there or upgrade `Store` to async.
 
 ### 13.6 Wire protocol (gRPC backend)
 
