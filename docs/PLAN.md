@@ -18,7 +18,8 @@ tests + 14/14 cli tests pass; `cargo clippy --workspace
 --all-targets -- -D warnings` is clean. Inode handle stability (§7
 decision 6) is still deferred; the in-memory slab is fine until
 kernel handles need to survive a daemon restart in production.
-Last updated: 2026-04-30
+M10.5 (§10.5) — wiring jj-lib's `OpHeadsStore` to the catalog —
+is in progress. Last updated: 2026-04-29
 
 This document captures the roadmap for getting jj-yak from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -132,11 +133,12 @@ missing FUSE methods between M6 and M7). One-line summaries:
   `get_ref` / `cas_ref` / `list_refs` over the same gRPC service
   any daemon already serves; CAS arbitration matches git's
   ref-update model (§10.1). `dir://` and `grpc://` backends both
-  implement them. Still deferred: **CLI op-store / op-heads-store
-  integration with the catalog** — plumbing the new RPCs into a
-  custom jj-lib `OpHeadsStore` so two CLIs against a shared remote
-  actually serialize op-log advances is its own milestone
-  (M10.5).
+  implement them. **CLI op-heads-store integration with the
+  catalog is M10.5 (§10.5).** Op contents (the actual operation
+  bytes, currently in `.jj/op_store/`) need their own milestone
+  — plumbing them through the remote so a peer daemon can read
+  the bytes of an op another daemon wrote is independent design
+  work; tentatively M10.6.
 - **FUSE-side read-through on `StoreMiss`** — done at M10 §10.6.
   `YakFs` now holds an `Option<Arc<dyn RemoteStore>>`;
   `read_tree`/`read_file`/`read_symlink` are async and fall
@@ -424,14 +426,15 @@ protocol (CAS-arbitrated mutable refs alongside the blob CAS,
 (§10.6). M7 detail in [`PLAN-M7-9.md`](./PLAN-M7-9.md) §10; M10
 detail in §10 above.
 
-**Next: M10.5 — wire jj-lib's op-store / op-heads-store to the
-catalog.** M10 §10.9 lists this as the explicit out-of-scope
-follow-up. The wire is laid (`get_ref`/`cas_ref`/`list_refs`);
-M10.5 plumbs it into a custom CLI store impl so two CLIs against
-a shared remote actually serialize op-log advances. Also still
-open: M11 (auth/TLS/retry/backoff alongside S3), the `fuser`
-migration (§9), inode-id stability across restarts (§7 decision
-6), async background push queue.
+**Next: M10.5 — wire jj-lib's op-heads-store to the catalog.**
+Spec at §10.5. Custom `YakOpHeadsStore` driven by the daemon's
+catalog (CLI talks to local daemon over `JujutsuInterface`, daemon
+delegates to either the configured remote or a per-mount local
+fallback). Single `op_heads` ref, length-prefixed list of op-ids.
+Op-store contents are explicitly out of scope — that's M10.6.
+Also still open: M11 (auth/TLS/retry/backoff alongside S3), the
+`fuser` migration (§9), inode-id stability across restarts (§7
+decision 6), async background push queue.
 
 **Hygiene still pending:**
 
@@ -980,3 +983,218 @@ Test coverage added in M10 (22 tests, total 137/115):
   `fuse_layer_reads_through_remote_on_local_miss`,
   `fuse_layer_store_miss_no_remote_is_failed_precondition`,
   `fuse_layer_read_through_populates_local_cache`.
+
+## 10.5. M10.5 — wire jj-lib's op-heads store to the catalog
+
+M10 (§10) shipped the catalog protocol — `get_ref`/`cas_ref`/
+`list_refs` on `service RemoteStore`, with CAS arbitration matching
+git's ref-update model. Two daemons over a shared `dir://` remote
+can already serialize ref updates against each other. What's still
+missing is the CLI side: jj-lib's `Workspace::init_with_factories`
+in `cli/src/main.rs` still uses `ReadonlyRepo::default_op_heads_store_initializer`,
+which produces a `SimpleOpHeadsStore` — empty files at
+`<repo>/op_heads/heads/<hex(op_id)>`. With M7's pinned-`.jj/`
+subtree those writes go through FUSE into the per-mount `Store`,
+so they're content-addressed but **not** catalog-arbitrated. Two
+CLIs against a shared remote can sync blobs (M9) but silently
+clobber each other's op-log advances.
+
+M10.5's job is plumbing the catalog into jj-lib's `OpHeadsStore`
+trait, so that "advance the latest op_id" goes through `cas_ref`
+instead of the local filesystem.
+
+### 10.5.1 Scope
+
+In:
+
+- Custom `YakOpHeadsStore` impl in `cli/src/op_heads_store.rs`,
+  driven by the daemon's catalog RPCs.
+- `JujutsuInterface` gains the three catalog RPCs (CLI never
+  dials a remote directly — every CLI traffic still goes to the
+  local daemon, which delegates to its `Mount.remote_store` or
+  the local fallback).
+- A per-mount **local-fallback** catalog backed by a refs table
+  inside the existing per-mount redb file. Used when no remote
+  URL is configured, so the catalog API works uniformly. §10.2's
+  "no local-fallback in M10" explicitly anticipated this as the
+  M10.5 follow-up.
+- Two-CLI integration test against a shared `dir://` remote.
+
+Out (deferred):
+
+- **Custom `YakOpStore` (op contents).** The op contents (operations,
+  views) still live in `.jj/op_store/` over FUSE → per-mount Store,
+  not pushed anywhere. So a two-CLI shared op log won't work
+  end-to-end yet — CLI_B can't read the bytes of operations CLI_A
+  wrote. M10.5 closes the **arbitration** story (who-wins on
+  concurrent op-log advance); M10.6 closes the **content** story
+  (CLI_B can actually fetch CLI_A's op bytes). Two milestones
+  because they're independent design problems with their own
+  trade-offs.
+- Auth/TLS/retry. Still M11 alongside S3.
+- Async background push queue.
+- Inode stability across restarts (§7 decision 6).
+
+### 10.5.2 Decisions
+
+1. **Catalog access from CLI: via JujutsuInterface, not direct.**
+   The CLI's `BlockingJujutsuInterfaceClient` already has a
+   single channel to the local daemon for every other RPC (blob
+   IO, snapshot, checkout, status). Adding `GetRef`/`CasRef`/
+   `ListRefs` to `JujutsuInterface` keeps CLI traffic single-
+   handle. The daemon already owns the per-mount `RemoteStore`
+   (and now the local fallback); routing the catalog through it
+   is symmetric with the rest. The alternative — CLI dials the
+   `dir://`/`grpc://` remote directly — would duplicate the URL
+   parser, force the CLI to know about backend authentication
+   later, and split "the daemon is the source of truth for the
+   mount" into "...except for refs."
+
+2. **Local fallback when no remote configured.** Without a
+   fallback, every existing test (which passes `remote = ""`)
+   would break the moment we swap in `YakOpHeadsStore`. With a
+   fallback, `YakOpHeadsStore` is unconditional and the catalog
+   API is uniform. §10.2 said "we'd add an in-memory or
+   redb-backed `RemoteStore` impl and point `mount.remote_store`
+   at it" — that's exactly what M10.5 does, except we keep
+   `mount.remote_store: Option<...>` (so the M9 blob-CAS no-op
+   semantics for "no remote" stay unchanged) and add a separate
+   `mount.local_refs: Arc<LocalRefs>` for the catalog. Routing
+   logic: catalog RPC handlers prefer `mount.remote_store`'s ref
+   methods if Some, otherwise hand off to `mount.local_refs`.
+
+3. **Single 'op_heads' ref, not per-head refs.** One ref keyed
+   `op_heads`, value = concatenated 32-byte (or whatever
+   length) op-id bytes — length-prefixed so we can mix lengths
+   if jj-lib ever changes op-id width. `update_op_heads(old=[…],
+   new=…)` becomes a single CAS read+swap; the loser sees
+   `Conflict { actual: <real heads list> }` and resolves in one
+   round-trip. Per-head refs (one ref per head, mirroring
+   `simple_op_heads_store.rs`'s file-per-head shape) would make
+   `update_op_heads` non-atomic across the multi-step write+
+   delete and force `list_refs` to filter by prefix. Both are
+   safe — `resolve_op_heads` merges divergent heads on next load
+   either way — but single-ref uses CAS the way CAS was meant to
+   be used (the heads-set is the unit of arbitration), and the
+   serialized list is tiny (32B × handful of heads).
+
+4. **Op-heads ref naming: `op_heads` (no workspace suffix).**
+   The jj-lib `OpHeadsStore` trait is repo-scoped, not
+   workspace-scoped (`update_op_heads` takes no workspace
+   argument). Op-heads belong to the repo. If a future repo
+   ever wanted multiple op-head namespaces under one remote,
+   we'd add a prefix; for now, one repo per remote.
+
+5. **Wire format: length-prefixed concat of op-id bytes.**
+   `[u32 len_be][len bytes][u32 len_be][len bytes]…`. Empty
+   value (`Bytes::new()`) means "no heads" — distinct from
+   "ref does not exist" (which is also "no heads" but
+   pre-initialization). Trivially round-trips; ~10 LoC of
+   serialize/parse in `cli/src/op_heads_store.rs`.
+
+6. **Locking.** `OpHeadsStore::lock` returns a no-op token. The
+   trait doc says "the lock is not needed for correctness"; the
+   M10 CAS protocol gives us per-update arbitration without a
+   distinct lock primitive. If we later need a real lock (e.g.
+   to hold ref state across multiple round-trips for a complex
+   resolve), we'd add it as a layer above CAS — not by replacing
+   it. (Same logic as §10.1's "why CAS, not lock-based.")
+
+### 10.5.3 Wire protocol
+
+Add three RPCs to `service JujutsuInterface` in
+`proto/jj_interface.proto`. They are the same shape as the M10
+`RemoteStore` ref RPCs but carry `working_copy_path` so the daemon
+can route to the per-mount catalog handle:
+
+```proto
+service JujutsuInterface {
+  // ... existing RPCs ...
+  rpc GetCatalogRef(GetCatalogRefReq) returns (GetCatalogRefReply) {}
+  rpc CasCatalogRef(CasCatalogRefReq) returns (CasCatalogRefReply) {}
+  rpc ListCatalogRefs(ListCatalogRefsReq) returns (ListCatalogRefsReply) {}
+}
+```
+
+The `GetCatalogRef`/`CasCatalogRef`/`ListCatalogRefs` names disambiguate
+from the `RemoteStore` service's same-named RPCs — proto3 allows
+the conflict (different services) but it's clearer in code-gen
+output.
+
+Same `Option<Bytes>` semantics on `expected`/`new` (proto3
+`optional`) as the M10 `CasRef` — distinguishes absent-vs-empty.
+
+### 10.5.4 Storage layout
+
+`LocalRefs` opens a single redb table `refs_v1` inside the
+per-mount `store.redb` (the same file the per-mount `Store`
+already owns). Key: ref name as `&str`. Value: ref bytes.
+Acquisition: `Store::open` returns the existing `Database`;
+`LocalRefs::new(db.clone())` opens/creates the table on first
+use. CAS atomicity comes from `redb`'s `WriteTransaction`
+serialization — the whole CAS check + apply runs inside one
+transaction.
+
+### 10.5.5 Test strategy
+
+- **`LocalRefs` unit tests** — get/cas/list, conflict path
+  carries actual, create-only against absent succeeds, delete,
+  empty-vs-absent distinction. Mirrors the FsRemoteStore
+  ref-method tests.
+- **Service-level catalog dispatch tests** — drive a service
+  with `remote = ""` (so `Mount.remote_store = None`) and
+  confirm catalog RPCs hit `LocalRefs`; drive a service with
+  `remote = dir:///…` and confirm they hit the FsRemoteStore.
+- **`YakOpHeadsStore` unit tests** — drive against a fake
+  `BlockingJujutsuInterfaceClient` (or a real daemon in
+  test env), exercise update_op_heads/get_op_heads/serialize/
+  deserialize.
+- **Two-CLI acceptance test** — two daemons sharing one
+  `dir:///<tmp>` remote; CLI_A advances op-heads; CLI_B
+  advances op-heads concurrently; one wins, the other sees
+  Conflict and retries; final state has both op-heads merged
+  (or one fast-forwarded). The test validates only the
+  arbitration property (no clobber); reading CLI_A's op
+  contents from CLI_B is M10.6.
+
+### 10.5.6 Commit plan
+
+One commit per logical step:
+
+1. PLAN.md §10.5 (this section). _← in progress_
+2. Daemon: `LocalRefs` per-mount catalog (redb-backed) + unit tests.
+3. Proto + daemon: catalog RPCs on `JujutsuInterface` + dispatch
+   to remote-or-local + service tests.
+4. CLI: `BlockingJujutsuInterfaceClient` gains the three catalog
+   methods + `YakOpHeadsStore` impl + register factory in
+   `Workspace::init_with_factories`.
+5. Two-CLI acceptance test.
+6. PLAN.md §10.5 outcome.
+
+### 10.5.7 Pickup notes
+
+The current M10 description in `service.rs` and `remote/mod.rs`
+already gives us:
+
+- `Mount.remote_store: Option<Arc<dyn RemoteStore>>`. M10.5 keeps
+  the `Option`; the local-fallback work happens via a sibling
+  field, not by always-Some-ing remote_store.
+- `validate_ref_name`. Reuse for all catalog RPC handlers,
+  including the local-fallback path.
+- `CasOutcome { Updated | Conflict { actual: Option<Bytes> } }`.
+  The same enum threads through the new RPCs.
+
+What jj-lib expects from a custom `OpHeadsStore`:
+
+- `name() -> &str` — pick `"yak_op_heads"`.
+- `update_op_heads(old_ids: &[OperationId], new_id: &OperationId)
+   -> Result<(), OpHeadsStoreError>`. CAS read+swap.
+- `get_op_heads() -> Result<Vec<OperationId>, OpHeadsStoreError>`.
+  One get_ref + parse.
+- `lock() -> Result<Box<dyn OpHeadsStoreLock + '_>,
+   OpHeadsStoreError>`. No-op token.
+
+The factory side: `StoreFactories::add_op_heads_store("yak_op_heads", ...)`
+in `create_store_factories`, and replace `default_op_heads_store_initializer()`
+in `Workspace::init_with_factories` with a closure that constructs
+`YakOpHeadsStore`.
