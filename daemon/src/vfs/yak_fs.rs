@@ -564,13 +564,19 @@ impl YakFs {
                 content,
                 executable,
             } => {
-                let id = self.store.write_file(File { content }).map_err(store_err)?;
+                // `write_file` also returns the prost-encoded bytes for
+                // remote-store push (M9), but the snapshot walk runs
+                // bypassing the RPC layer — service.rs walks the rolled-up
+                // tree post-snapshot and pushes any blobs the remote
+                // doesn't have. So we discard the bytes here.
+                let (id, _bytes) =
+                    self.store.write_file(File { content }).map_err(store_err)?;
                 self.slab.replace_node(ino, NodeRef::File { id, executable });
                 Ok(id)
             }
 
             NodeRef::DirtySymlink { target } => {
-                let id = self
+                let (id, _bytes) = self
                     .store
                     .write_symlink(Symlink { target })
                     .map_err(store_err)?;
@@ -620,7 +626,8 @@ impl YakFs {
                     };
                     entries.push(TreeEntryMapping { name, entry });
                 }
-                let id = self.store.write_tree(Tree { entries }).map_err(store_err)?;
+                let (id, _bytes) =
+                    self.store.write_tree(Tree { entries }).map_err(store_err)?;
                 self.slab.replace_node(ino, NodeRef::Tree(id));
                 Ok(id)
             }

@@ -553,10 +553,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<FileId>, Status> {
         let req = request.into_inner();
         let store = store_for(&self.mounts, &req.working_copy_path).await?;
-        let file_id = store
+        let (id, _bytes) = store
             .write_file(ty::File { content: req.data })
-            .map_err(store_status("write_file"))?
-            .into();
+            .map_err(store_status("write_file"))?;
+        let file_id = id.into();
         Ok(Response::new(FileId { file_id }))
     }
 
@@ -585,10 +585,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let req = request.into_inner();
         let store = store_for(&self.mounts, &req.working_copy_path).await?;
         let symlink = ty::Symlink { target: req.target };
-        let symlink_id = store
+        let (id, _bytes) = store
             .write_symlink(symlink)
-            .map_err(store_status("write_symlink"))?
-            .into();
+            .map_err(store_status("write_symlink"))?;
+        let symlink_id = id.into();
         Ok(Response::new(SymlinkId { symlink_id }))
     }
 
@@ -620,10 +620,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .tree
             .ok_or_else(|| Status::invalid_argument("WriteTreeReq.tree is required"))?;
         let tree: ty::Tree = tree_proto.try_into().map_err(decode_status("tree"))?;
-        let tree_id = store
+        let (id, _bytes) = store
             .write_tree(tree)
-            .map_err(store_status("write_tree"))?
-            .into();
+            .map_err(store_status("write_tree"))?;
+        let tree_id = id.into();
         Ok(Response::new(TreeId { tree_id }))
     }
 
@@ -658,10 +658,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             return Err(Status::internal("Cannot write a commit with no parents"));
         }
         let commit: ty::Commit = commit_proto.try_into().map_err(decode_status("commit"))?;
-        let commit_id = store
+        let (id, _bytes) = store
             .write_commit(commit)
-            .map_err(store_status("write_commit"))?
-            .into();
+            .map_err(store_status("write_commit"))?;
+        let commit_id = id.into();
         Ok(Response::new(CommitId { commit_id }))
     }
 

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use prost::Message as _;
 use redb::{Database, ReadableTable, TableDefinition};
 
@@ -112,12 +113,20 @@ impl Store {
         })
     }
 
+    /// Write a tree and return both the content-addressed id and the
+    /// prost-encoded bytes that landed in redb.
+    ///
+    /// The bytes are returned so callers that also need to push to a
+    /// remote ([`crate::remote::RemoteStore`], M9) can reuse the same
+    /// buffer instead of re-encoding. Callers that only want the id
+    /// (e.g. the recursive snapshot walk in `vfs/yak_fs.rs`) can
+    /// destructure with `let (id, _) = ...`.
     #[tracing::instrument(skip(self))]
-    pub fn write_tree(&self, tree: Tree) -> Result<Id> {
+    pub fn write_tree(&self, tree: Tree) -> Result<(Id, Bytes)> {
         let hash = tree.get_hash();
-        let bytes = tree.as_proto().encode_to_vec();
+        let bytes: Bytes = tree.as_proto().encode_to_vec().into();
         self.write_value(TREES, hash, &bytes)?;
-        Ok(hash)
+        Ok((hash, bytes))
     }
 
     pub fn get_file(&self, id: Id) -> Result<Option<File>> {
@@ -128,12 +137,13 @@ impl Store {
         })
     }
 
+    /// See [`Self::write_tree`] for the rationale on returning bytes.
     #[tracing::instrument(skip(self, file), fields(len = file.content.len()))]
-    pub fn write_file(&self, file: File) -> Result<Id> {
+    pub fn write_file(&self, file: File) -> Result<(Id, Bytes)> {
         let hash = file.get_hash();
-        let bytes = file.as_proto().encode_to_vec();
+        let bytes: Bytes = file.as_proto().encode_to_vec().into();
         self.write_value(FILES, hash, &bytes)?;
-        Ok(hash)
+        Ok((hash, bytes))
     }
 
     pub fn get_symlink(&self, id: Id) -> Result<Option<Symlink>> {
@@ -144,12 +154,13 @@ impl Store {
         })
     }
 
+    /// See [`Self::write_tree`] for the rationale on returning bytes.
     #[tracing::instrument(skip(self))]
-    pub fn write_symlink(&self, symlink: Symlink) -> Result<Id> {
+    pub fn write_symlink(&self, symlink: Symlink) -> Result<(Id, Bytes)> {
         let hash = symlink.get_hash();
-        let bytes = symlink.as_proto().encode_to_vec();
+        let bytes: Bytes = symlink.as_proto().encode_to_vec().into();
         self.write_value(SYMLINKS, hash, &bytes)?;
-        Ok(hash)
+        Ok((hash, bytes))
     }
 
     pub fn get_commit(&self, id: Id) -> Result<Option<Commit>> {
@@ -160,12 +171,13 @@ impl Store {
         })
     }
 
+    /// See [`Self::write_tree`] for the rationale on returning bytes.
     #[tracing::instrument(skip(self))]
-    pub fn write_commit(&self, commit: Commit) -> Result<Id> {
+    pub fn write_commit(&self, commit: Commit) -> Result<(Id, Bytes)> {
         let hash = commit.get_hash();
-        let bytes = commit.as_proto().encode_to_vec();
+        let bytes: Bytes = commit.as_proto().encode_to_vec().into();
         self.write_value(COMMITS, hash, &bytes)?;
-        Ok(hash)
+        Ok((hash, bytes))
     }
 
     fn read_value<T>(
@@ -231,13 +243,13 @@ impl StoreTestExt for Store {
             .expect("symlink present in store")
     }
     fn put_tree(&self, tree: Tree) -> Id {
-        self.write_tree(tree).expect("write_tree")
+        self.write_tree(tree).expect("write_tree").0
     }
     fn put_file(&self, file: File) -> Id {
-        self.write_file(file).expect("write_file")
+        self.write_file(file).expect("write_file").0
     }
     fn put_symlink(&self, symlink: Symlink) -> Id {
-        self.write_symlink(symlink).expect("write_symlink")
+        self.write_symlink(symlink).expect("write_symlink").0
     }
 }
 
@@ -262,12 +274,17 @@ mod tests {
         let file = File {
             content: b"hello world".to_vec(),
         };
-        let id = store.write_file(file.clone()).expect("write_file");
+        let (id, bytes) = store.write_file(file.clone()).expect("write_file");
         let got = store
             .get_file(id)
             .expect("get_file")
             .expect("file present");
         assert_eq!(got.content, file.content);
+        // The returned bytes are the prost-encoded proto. Decoding them
+        // round-trips back to the same content.
+        let decoded = proto::jj_interface::File::decode(bytes.as_ref())
+            .expect("decode returned bytes");
+        assert_eq!(decoded.data, file.content);
     }
 
     #[test]
@@ -290,6 +307,7 @@ mod tests {
                     content: b"persistent".to_vec(),
                 })
                 .expect("write_file")
+                .0
         };
 
         let store2 = Store::open(&path).expect("open #2");
