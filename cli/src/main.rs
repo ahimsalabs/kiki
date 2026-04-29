@@ -15,9 +15,12 @@ use jj_lib::{
 
 mod backend;
 mod blocking_client;
+mod op_heads_store;
 mod working_copy;
 
 use backend::YakBackend;
+use blocking_client::BlockingJujutsuInterfaceClient;
+use op_heads_store::YakOpHeadsStore;
 use working_copy::{YakWorkingCopy, YakWorkingCopyFactory};
 
 /// Create a new repo in the given directory
@@ -55,6 +58,9 @@ enum YakSubcommand {
 }
 
 fn create_store_factories() -> StoreFactories {
+    // Start empty: `CliRunner::add_store_factories` merges these on top
+    // of jj-cli's own defaults, and `merge_factories_map` panics on
+    // collisions. We only register the yak-specific factories here.
     let mut store_factories = StoreFactories::empty();
     // Register the backend so it can be loaded when the repo is loaded. The name
     // must match `Backend::name()`.
@@ -71,7 +77,66 @@ fn create_store_factories() -> StoreFactories {
             Ok(Box::new(backend))
         }),
     );
+    // M10.5: register the YakOpHeadsStore factory so subsequent loads
+    // pick up the catalog-driven impl. The corresponding initializer
+    // wired into `Workspace::init_with_factories` writes the
+    // `yak_op_heads` type tag to disk; this loader honors it.
+    //
+    // The `repo_dir` we receive is `<jj_root>/op_heads/`. We need the
+    // workspace path for the daemon RPCs — climb two levels up
+    // (`<wc>/.jj/repo/op_heads/`) to recover it.
+    store_factories.add_op_heads_store(
+        op_heads_store::YakOpHeadsStore::name(),
+        Box::new(|settings, store_path| {
+            let working_copy_path = climb_to_workspace(store_path)
+                .map_err(|e| jj_lib::backend::BackendLoadError(e.into()))?;
+            let client = connect_daemon(settings)
+                .map_err(jj_lib::backend::BackendLoadError)?;
+            Ok(Box::new(YakOpHeadsStore::new(client, working_copy_path)))
+        }),
+    );
     store_factories
+}
+
+/// Resolve the workspace path from an `op_heads` store directory.
+/// The path is `<wc>/.jj/repo/op_heads/`; we climb three components
+/// up to recover `<wc>` and re-canonicalize so the daemon-side
+/// `working_copy_path` lookup matches the one stamped at `Initialize`.
+fn climb_to_workspace(op_heads_path: &std::path::Path) -> std::io::Result<String> {
+    let workspace = op_heads_path
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "op_heads path {} has no .../wc/.jj/repo/op_heads ancestor chain",
+                    op_heads_path.display()
+                ),
+            )
+        })?
+        .canonicalize()?;
+    workspace.into_os_string().into_string().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("workspace path is not valid UTF-8: {e:?}"),
+        )
+    })
+}
+
+/// Connect to the daemon described by user settings. Same shape as
+/// `YakWorkingCopy::connect_client` (cli/src/working_copy.rs:96) — we
+/// duplicate the few lines rather than expose a public helper because
+/// the error types differ (`BackendLoadError` here, `WorkingCopyStateError`
+/// there).
+fn connect_daemon(
+    settings: &jj_lib::settings::UserSettings,
+) -> Result<BlockingJujutsuInterfaceClient, Box<dyn std::error::Error + Send + Sync>> {
+    let grpc_port = settings
+        .get::<usize>("grpc_port")
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 async fn run_yak_command(
@@ -148,6 +213,27 @@ async fn run_yak_command(
             // the daemon returns `transport = None`.
             attach_transport(init_reply.transport, &wc_path)?;
 
+            // M10.5: replace the default `OpHeadsStore` initializer
+            // with one that constructs a `YakOpHeadsStore` driving
+            // the daemon's catalog. The store dir argument is
+            // `<wc>/.jj/repo/op_heads/`; the daemon already routes
+            // by `working_copy_path`, which we have here.
+            let wc_path_for_op_heads = wc_path_str.to_string();
+            let yak_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
+                                                 _store_path: &std::path::Path|
+                  -> Result<
+                Box<dyn jj_lib::op_heads_store::OpHeadsStore>,
+                jj_lib::backend::BackendInitError,
+            > {
+                let client = connect_daemon(settings).map_err(|e| {
+                    jj_lib::backend::BackendInitError(e.to_string().into())
+                })?;
+                Ok(Box::new(YakOpHeadsStore::new(
+                    client,
+                    wc_path_for_op_heads.clone(),
+                )))
+            };
+
             Workspace::init_with_factories(
                 command_helper.settings(),
                 &wc_path,
@@ -158,7 +244,7 @@ async fn run_yak_command(
                 Signer::from_settings(command_helper.settings())
                     .map_err(WorkspaceInitError::SignInit)?,
                 ReadonlyRepo::default_op_store_initializer(),
-                ReadonlyRepo::default_op_heads_store_initializer(),
+                &yak_op_heads_initializer,
                 ReadonlyRepo::default_index_store_initializer(),
                 ReadonlyRepo::default_submodule_store_initializer(),
                 // M2: route Workspace::init_with_factories through

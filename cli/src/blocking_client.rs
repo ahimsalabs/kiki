@@ -188,4 +188,44 @@ impl BlockingJujutsuInterfaceClient {
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.get_empty_tree_id(GetEmptyTreeIdReq { working_copy_path }))
     }
+
+    // ---- M10.5: catalog (mutable refs) ------------------------------
+    //
+    // The CLI talks to the local daemon's `JujutsuInterface` for every
+    // RPC; the daemon dispatches per-mount to either the configured
+    // remote's catalog or the local-fallback `LocalRefs` (PLAN.md
+    // §10.5.2 decision 1). `YakOpHeadsStore` (cli/src/op_heads_store.rs)
+    // is the sole consumer today.
+
+    pub fn get_catalog_ref(
+        &self,
+        request: impl tonic::IntoRequest<GetCatalogRefReq>,
+    ) -> Result<tonic::Response<GetCatalogRefReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.get_catalog_ref(request))
+    }
+
+    pub fn cas_catalog_ref(
+        &self,
+        request: impl tonic::IntoRequest<CasCatalogRefReq>,
+    ) -> Result<tonic::Response<CasCatalogRefReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.cas_catalog_ref(request))
+    }
+
+    // Unused by the only M10.5 consumer (`YakOpHeadsStore`) since the
+    // single-`op_heads`-ref keying doesn't need enumeration. Kept on
+    // the client surface so a future branch-tip / multi-ref consumer
+    // doesn't bounce back through the proto crate to add it.
+    #[allow(dead_code)]
+    pub fn list_catalog_refs(
+        &self,
+        request: impl tonic::IntoRequest<ListCatalogRefsReq>,
+    ) -> Result<tonic::Response<ListCatalogRefsReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.list_catalog_refs(request))
+    }
 }
