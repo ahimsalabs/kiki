@@ -22,6 +22,8 @@ use bytes::Bytes;
 use crate::ty::Id;
 
 pub mod fs;
+pub mod grpc;
+pub mod server;
 
 /// Which content-addressed table the (id, bytes) pair belongs to.
 /// Mirrors the four redb tables in [`crate::store::Store`]
@@ -138,9 +140,19 @@ pub fn parse(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
             Ok(Some(Arc::new(fs::FsRemoteStore::new(rest.into()))
                 as Arc<dyn RemoteStore>))
         }
-        "grpc" => Err(anyhow!(
-            "grpc:// remote not yet implemented (M9 backend #2 — tracked in PLAN.md §13.3)"
-        )),
+        "grpc" => {
+            // `grpc://host:port` — `host:port` only, no path component.
+            // Tonic will reject malformed authorities at first dial; we
+            // also pre-flight here so an obviously-bad URL fails at
+            // `Initialize` time rather than the first `put_blob`.
+            if rest.is_empty() {
+                return Err(anyhow!(
+                    "grpc:// remote requires host:port (got empty endpoint)"
+                ));
+            }
+            Ok(Some(Arc::new(grpc::GrpcRemoteStore::new(rest)?)
+                as Arc<dyn RemoteStore>))
+        }
         other => Err(anyhow!("unsupported remote scheme {other:?}")),
     }
 }
@@ -179,12 +191,25 @@ mod tests {
         assert!(err.to_string().contains("no scheme"), "got: {err}");
     }
 
+    // `connect_lazy` itself just constructs a `Channel` future, but
+    // tonic touches the tokio executor on construction — so the test
+    // needs a runtime even though no RPC fires.
+    #[tokio::test]
+    async fn parse_grpc_returns_some() {
+        // grpc:// is parsed lazily — `connect_lazy` defers the actual
+        // TCP connect to the first RPC, so an unreachable peer here is
+        // not an error at parse time. We just confirm the parser
+        // produces a `Some(...)`.
+        let remote = parse("grpc://127.0.0.1:9999")
+            .unwrap()
+            .expect("grpc:// returns Some");
+        assert!(format!("{remote:?}").contains("GrpcRemoteStore"));
+    }
+
     #[test]
-    fn parse_grpc_rejected_for_now() {
-        // M9 backend #2 lands in a follow-up commit; until then the
-        // parser surfaces a clean error rather than silently dropping.
-        let err = parse("grpc://localhost:9999").unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"));
+    fn parse_grpc_empty_endpoint_rejected() {
+        let err = parse("grpc://").unwrap_err();
+        assert!(err.to_string().contains("host:port"), "got: {err}");
     }
 
     #[test]

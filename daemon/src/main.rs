@@ -1,20 +1,16 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
 use tonic::transport::Server as GrpcServer;
 use tracing::{error, info};
 
+use crate::remote::{fs::FsRemoteStore, server::RemoteStoreService, RemoteStore};
 use crate::service::StorageConfig;
 
 mod hash;
 mod mount_meta;
-// `remote` is exercised entirely by its own #[cfg(test)] tests in this
-// commit; wiring into production (`Store` composition + `Initialize.remote`
-// parse) lands in the next two commits, at which point this allow goes
-// away. Clippy `-D warnings` would otherwise fail on the public surface
-// being "never constructed" by the binary.
-#[allow(dead_code)]
 mod remote;
 mod service;
 mod store;
@@ -109,9 +105,23 @@ async fn run_with_config(config: Config) -> Result<(), anyhow::Error> {
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build()?;
 
+    // M9 §13.6: every daemon also serves the byte-typed `RemoteStore`
+    // service on its existing gRPC listener so peer daemons can use
+    // it as a `grpc://` remote. The backing is an `FsRemoteStore`
+    // rooted at `<storage_dir>/served_blobs/` — kept separate from
+    // per-mount redb stores so cross-mount keyspace isolation (M4) is
+    // preserved on the served side too. Auth/TLS deferred to M11 per
+    // §13.5; same trust model as `JujutsuInterface` (single-user,
+    // localhost).
+    let served_blobs_dir = config.storage_dir.join("served_blobs");
+    let remote_backend: Arc<dyn RemoteStore> =
+        Arc::new(FsRemoteStore::new(served_blobs_dir));
+    let remote_svc = RemoteStoreService::new(remote_backend);
+
     info!("Serving jj gRPC interface");
     let grpc_fut = GrpcServer::builder()
         .add_service(reflection_svc)
+        .add_service(remote_svc.into_server())
         .add_service(svc.into_server())
         .serve(addr);
 

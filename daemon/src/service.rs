@@ -1990,6 +1990,69 @@ mod tests {
         assert_eq!(file_proto.data, b"snapshot-content");
     }
 
+    /// End-to-end M9 §13.7 gRPC analogue: two `JujutsuService`
+    /// instances sharing a `grpc://` remote backed by a third
+    /// `RemoteStoreService` over a real tonic listener. Service A
+    /// writes a file (write-through pushes to the gRPC peer); service
+    /// B issues `read_file` for the same id, hits its empty local
+    /// store, and falls back through the gRPC remote to fetch the
+    /// content. Proves the byte-typed trait is honest under a real
+    /// network transport at the RPC layer above it.
+    #[tokio::test]
+    async fn two_services_share_blobs_via_grpc_remote() {
+        use std::sync::Arc;
+
+        use tokio::net::TcpListener;
+        use tokio_stream::wrappers::TcpListenerStream;
+        use tonic::transport::Server as GrpcServer;
+
+        use crate::remote::fs::FsRemoteStore;
+        use crate::remote::server::RemoteStoreService;
+
+        // Spawn a `RemoteStoreServer` on an ephemeral port, backed by
+        // an FsRemoteStore tempdir so this test doesn't shell out to
+        // anything else.
+        let backing = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn RemoteStore> =
+            Arc::new(FsRemoteStore::new(backing.path().to_owned()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            GrpcServer::builder()
+                .add_service(RemoteStoreService::new(backend).into_server())
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("RemoteStore tonic server")
+        });
+        let remote_url = format!("grpc://{addr}");
+
+        // Service A: writes the blob.
+        let svc_a = JujutsuService::bare();
+        init_mount_with_remote(&svc_a, "/tmp/a", &remote_url).await;
+        let written = svc_a
+            .write_file(Request::new(WriteFileReq {
+                working_copy_path: "/tmp/a".into(),
+                data: b"grpc-shared".to_vec(),
+            }))
+            .await
+            .expect("write_file via grpc remote")
+            .into_inner();
+
+        // Service B: never saw the blob locally, but shares the remote.
+        // ReadFile must round-trip through the gRPC peer.
+        let svc_b = JujutsuService::bare();
+        init_mount_with_remote(&svc_b, "/tmp/b", &remote_url).await;
+        let got = svc_b
+            .read_file(Request::new(ReadFileReq {
+                working_copy_path: "/tmp/b".into(),
+                file_id: written.file_id.clone(),
+            }))
+            .await
+            .expect("read_file via grpc read-through")
+            .into_inner();
+        assert_eq!(got.data, b"grpc-shared");
+    }
+
     /// Snapshot is idempotent across remote pushes: a second snapshot
     /// of an unchanged mount must not error (the walk hits `has_blob`
     /// for every entry and skips the put), and the remote contents
