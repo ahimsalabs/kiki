@@ -81,9 +81,52 @@ impl BlobKind {
     }
 }
 
-/// Content-addressed remote blob store.
+/// Outcome of a [`RemoteStore::cas_ref`] call.
 ///
-/// Implementations must be:
+/// `Updated` — the precondition matched; the swap was applied.
+/// `Conflict { actual }` — the precondition did not match; `actual`
+/// is the value the server saw (`None` if the ref does not exist),
+/// which the caller should retry against rather than re-read via a
+/// follow-up `get_ref` (saves a round-trip on the conflict path).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CasOutcome {
+    Updated,
+    Conflict { actual: Option<Bytes> },
+}
+
+/// Validate a ref name. Refs live in a flat namespace under
+/// `<remote>/refs/<name>`; we forbid characters that would either
+/// escape the directory or break path-style backends.
+///
+/// Rejected: empty, NUL, `/`, exact matches `.` and `..`. The
+/// trailing-`.lock` suffix is *not* reserved — the FS backend uses
+/// a single `.lock` sentinel for the whole namespace, not per-ref
+/// lockfiles, so a ref literally named `something.lock` is fine.
+pub fn validate_ref_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("ref name must not be empty"));
+    }
+    if name.contains('\0') {
+        return Err(anyhow!("ref name {name:?} contains NUL"));
+    }
+    if name.contains('/') {
+        return Err(anyhow!("ref name {name:?} contains '/' (refs are flat)"));
+    }
+    if name == "." || name == ".." {
+        return Err(anyhow!("ref name {name:?} is a reserved path component"));
+    }
+    Ok(())
+}
+
+/// Content-addressed remote blob store + mutable refs catalog.
+///
+/// Two surfaces on one trait so every Arc-wielding consumer holds a
+/// single handle. M10 §10.1 design rationale: backends that ship
+/// (`FsRemoteStore`, `GrpcRemoteStore`) and every plausible future
+/// one (S3, redb-on-shared-NFS) want both surfaces against the same
+/// underlying storage.
+///
+/// Blob implementations must be:
 ///
 /// - **Idempotent on `put_blob`.** Two byte-identical puts under the
 ///   same `(kind, id)` are equivalent to one. Backends that race on
@@ -95,6 +138,21 @@ impl BlobKind {
 ///   to skip a redundant `put_blob` when the remote already has the
 ///   bytes. Backends that can't answer cheaply should still answer
 ///   correctly; "stat-then-write" is fine.
+///
+/// Ref implementations must be:
+///
+/// - **Atomic on `cas_ref`.** Two concurrent CASes against the same
+///   ref must serialize: one wins (`Updated`), the other loses
+///   (`Conflict`). Multi-process backends (`dir://` shared between
+///   daemons) need cross-process arbitration, not just an in-process
+///   mutex; `FsRemoteStore` uses `flock` on a sentinel file for this.
+/// - **Honest about absence on `get_ref`.** `Ok(None)` means "ref
+///   does not exist" — same shape as `get_blob`.
+/// - **Symmetric absent/present semantics.** `expected = None` is
+///   "must not currently exist" (create-only); `new = None` is
+///   "delete the ref". An empty `Bytes` value (`Some(Bytes::new())`)
+///   is a *valid* value distinct from absent — backends must not
+///   conflate them.
 #[async_trait]
 pub trait RemoteStore: Send + Sync + std::fmt::Debug {
     /// Fetch a blob. `Ok(None)` if the remote does not have it.
@@ -108,6 +166,25 @@ pub trait RemoteStore: Send + Sync + std::fmt::Debug {
     /// `get_blob(...).map(|o| o.is_some())` but backends should
     /// implement it without transferring the body when possible.
     async fn has_blob(&self, kind: BlobKind, id: &Id) -> Result<bool>;
+
+    /// Read a ref's current value. `Ok(None)` if the ref does not
+    /// exist. `name` must satisfy [`validate_ref_name`]; backends
+    /// should re-validate defensively.
+    async fn get_ref(&self, name: &str) -> Result<Option<Bytes>>;
+
+    /// Compare-and-swap a ref atomically. See [`CasOutcome`] for the
+    /// return shape and the trait-level docs for the absent/present
+    /// semantics on `expected`/`new`.
+    async fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<&Bytes>,
+        new: Option<&Bytes>,
+    ) -> Result<CasOutcome>;
+
+    /// List every ref name. Non-paginated by design: refs are scarce
+    /// (op heads, branch tips, not arbitrary catalog data).
+    async fn list_refs(&self) -> Result<Vec<String>>;
 }
 
 /// Parse `Initialize.remote` into an optional [`RemoteStore`] handle.
@@ -216,6 +293,52 @@ mod tests {
     fn parse_unknown_scheme_rejected() {
         let err = parse("s3://bucket/prefix").unwrap_err();
         assert!(err.to_string().contains("unsupported"), "got: {err}");
+    }
+
+    #[test]
+    fn ref_name_validation() {
+        // Accepted: arbitrary UTF-8 short names with embedded dots,
+        // including names ending in `.lock` (we use a single
+        // namespace-wide sentinel, not per-ref lockfiles).
+        for name in ["op_heads", "head", "branch.lock", "a.b.c", "🦀"] {
+            validate_ref_name(name).unwrap_or_else(|e| panic!("expected {name:?} ok: {e}"));
+        }
+        for (name, snippet) in [
+            ("", "must not be empty"),
+            ("a/b", "'/'"),
+            ("..", "reserved"),
+            (".", "reserved"),
+            ("a\0b", "NUL"),
+        ] {
+            let err = validate_ref_name(name).expect_err(name);
+            assert!(
+                err.to_string().contains(snippet),
+                "expected {name:?} error to contain {snippet:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cas_outcome_eq() {
+        // Sanity: the helpers in `service.rs` compare CasOutcome via
+        // `==`, so the derived equality must round-trip the
+        // `Conflict { actual: Option<Bytes> }` payload — including
+        // the empty-bytes-vs-absent distinction.
+        assert_eq!(CasOutcome::Updated, CasOutcome::Updated);
+        assert_eq!(
+            CasOutcome::Conflict {
+                actual: Some(Bytes::from_static(b"x")),
+            },
+            CasOutcome::Conflict {
+                actual: Some(Bytes::from_static(b"x")),
+            }
+        );
+        assert_ne!(
+            CasOutcome::Conflict { actual: None },
+            CasOutcome::Conflict {
+                actual: Some(Bytes::new()),
+            }
+        );
     }
 
     #[test]

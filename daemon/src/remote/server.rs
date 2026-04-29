@@ -134,37 +134,76 @@ impl RemoteStoreServerTrait for RemoteStoreService {
         Ok(Response::new(HasBlobReply { found }))
     }
 
-    // M10 ref RPCs — stubbed for the proto-only commit. The next commit
-    // (RemoteStore trait extension + FsRemoteStore impl) replaces these
-    // with real delegations to `self.backend.{get,cas,list}_ref`. Kept
-    // as `unimplemented` rather than `todo!()` so a peer that calls a
-    // ref RPC against an only-blobs server gets a clean wire-side
-    // error rather than a process crash.
+    #[tracing::instrument(skip(self, request), fields(endpoint = "RemoteStore.GetRef"))]
     async fn get_ref(
         &self,
-        _request: Request<GetRefReq>,
+        request: Request<GetRefReq>,
     ) -> Result<Response<GetRefReply>, Status> {
-        Err(Status::unimplemented(
-            "RemoteStore.GetRef not implemented (M10 in flight)",
-        ))
+        let req = request.into_inner();
+        // Defensive validation at the wire boundary even though the
+        // backend re-checks. Keeps the server-side error a clean
+        // `invalid_argument` rather than letting an internal-error
+        // shape leak out for malformed names.
+        super::validate_ref_name(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("ref name: {e:#}")))?;
+        let value = self
+            .backend
+            .get_ref(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("backend get_ref: {e:#}")))?;
+        Ok(Response::new(match value {
+            Some(b) => GetRefReply {
+                found: true,
+                value: b.to_vec(),
+            },
+            None => GetRefReply {
+                found: false,
+                value: Vec::new(),
+            },
+        }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(endpoint = "RemoteStore.CasRef"))]
     async fn cas_ref(
         &self,
-        _request: Request<CasRefReq>,
+        request: Request<CasRefReq>,
     ) -> Result<Response<CasRefReply>, Status> {
-        Err(Status::unimplemented(
-            "RemoteStore.CasRef not implemented (M10 in flight)",
-        ))
+        let req = request.into_inner();
+        super::validate_ref_name(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("ref name: {e:#}")))?;
+        // proto3 `optional bytes` decodes to `Option<Vec<u8>>`; lift to
+        // `Option<Bytes>` so the trait sees the same semantics on both
+        // sides of the wire.
+        let expected = req.expected.map(bytes::Bytes::from);
+        let new = req.new.map(bytes::Bytes::from);
+        let outcome = self
+            .backend
+            .cas_ref(&req.name, expected.as_ref(), new.as_ref())
+            .await
+            .map_err(|e| Status::internal(format!("backend cas_ref: {e:#}")))?;
+        Ok(Response::new(match outcome {
+            super::CasOutcome::Updated => CasRefReply {
+                updated: true,
+                actual: None,
+            },
+            super::CasOutcome::Conflict { actual } => CasRefReply {
+                updated: false,
+                actual: actual.map(|b| b.to_vec()),
+            },
+        }))
     }
 
+    #[tracing::instrument(skip(self, _request), fields(endpoint = "RemoteStore.ListRefs"))]
     async fn list_refs(
         &self,
         _request: Request<ListRefsReq>,
     ) -> Result<Response<ListRefsReply>, Status> {
-        Err(Status::unimplemented(
-            "RemoteStore.ListRefs not implemented (M10 in flight)",
-        ))
+        let names = self
+            .backend
+            .list_refs()
+            .await
+            .map_err(|e| Status::internal(format!("backend list_refs: {e:#}")))?;
+        Ok(Response::new(ListRefsReply { names }))
     }
 }
 
@@ -272,5 +311,145 @@ mod tests {
         .await
         .unwrap();
         assert!(probe().await);
+    }
+
+    // ---- M10: ref RPCs --------------------------------------------------
+
+    #[tokio::test]
+    async fn ref_round_trip() {
+        let (_dir, svc) = service_with_tempdir();
+        // Missing ref → found=false.
+        let resp = svc
+            .get_ref(Request::new(GetRefReq {
+                name: "head".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.found);
+
+        // CAS create-only.
+        let cas = svc
+            .cas_ref(Request::new(CasRefReq {
+                name: "head".into(),
+                expected: None,
+                new: Some(b"v0".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cas.updated);
+        assert!(cas.actual.is_none());
+
+        // GetRef now sees v0.
+        let resp = svc
+            .get_ref(Request::new(GetRefReq {
+                name: "head".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.found);
+        assert_eq!(resp.value, b"v0");
+    }
+
+    #[tokio::test]
+    async fn cas_ref_conflict_carries_actual() {
+        let (_dir, svc) = service_with_tempdir();
+        svc.cas_ref(Request::new(CasRefReq {
+            name: "op_heads".into(),
+            expected: None,
+            new: Some(b"v0".to_vec()),
+        }))
+        .await
+        .unwrap();
+        // Stale precondition: caller expects empty bytes, but server
+        // has v0. The reply must carry v0 so the caller can retry
+        // without a follow-up GetRef round-trip.
+        let cas = svc
+            .cas_ref(Request::new(CasRefReq {
+                name: "op_heads".into(),
+                expected: Some(Vec::new()),
+                new: Some(b"v1".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!cas.updated);
+        assert_eq!(cas.actual.as_deref(), Some(b"v0".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn cas_ref_create_only_against_existing_conflicts() {
+        // proto3 `optional` distinguishes "field absent" from "field
+        // present but empty". The server side must preserve that
+        // distinction: `expected = None` (field absent) must conflict
+        // when the ref exists, even with empty value.
+        let (_dir, svc) = service_with_tempdir();
+        svc.cas_ref(Request::new(CasRefReq {
+            name: "e".into(),
+            expected: None,
+            new: Some(Vec::new()), // present-but-empty value
+        }))
+        .await
+        .unwrap();
+        let cas = svc
+            .cas_ref(Request::new(CasRefReq {
+                name: "e".into(),
+                expected: None, // create-only
+                new: Some(b"x".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!cas.updated);
+        // `actual` is Some(empty bytes) — distinct from None.
+        assert_eq!(cas.actual.as_deref(), Some(b"".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn list_refs_round_trip() {
+        let (_dir, svc) = service_with_tempdir();
+        for name in ["zeta", "alpha", "head"] {
+            svc.cas_ref(Request::new(CasRefReq {
+                name: name.into(),
+                expected: None,
+                new: Some(b"v".to_vec()),
+            }))
+            .await
+            .unwrap();
+        }
+        let resp = svc
+            .list_refs(Request::new(ListRefsReq {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.names, vec!["alpha", "head", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn ref_rpcs_reject_bad_name() {
+        let (_dir, svc) = service_with_tempdir();
+        // The server validates names defensively at the wire boundary
+        // — backends do too, but the wire-side error should be
+        // invalid_argument, not internal.
+        for bad in ["", "a/b", "..", "a\0b"] {
+            let err = svc
+                .get_ref(Request::new(GetRefReq {
+                    name: bad.into(),
+                }))
+                .await
+                .expect_err(bad);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            let err = svc
+                .cas_ref(Request::new(CasRefReq {
+                    name: bad.into(),
+                    expected: None,
+                    new: Some(b"x".to_vec()),
+                }))
+                .await
+                .expect_err(bad);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
     }
 }

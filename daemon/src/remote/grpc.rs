@@ -18,10 +18,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use proto::jj_interface::remote_store_client::RemoteStoreClient;
-use proto::jj_interface::{GetBlobReq, HasBlobReq, PutBlobReq};
+use proto::jj_interface::{
+    CasRefReq, GetBlobReq, GetRefReq, HasBlobReq, ListRefsReq, PutBlobReq,
+};
 use tonic::transport::Channel;
 
-use super::{BlobKind, RemoteStore};
+use super::{BlobKind, CasOutcome, RemoteStore};
 use crate::ty::Id;
 
 /// Tonic-backed `RemoteStore` reachable at `grpc://<endpoint>`.
@@ -107,6 +109,61 @@ impl RemoteStore for GrpcRemoteStore {
             .with_context(|| format!("grpc has_blob {} @ {}", kind.as_str(), self.endpoint))?
             .into_inner();
         Ok(resp.found)
+    }
+
+    async fn get_ref(&self, name: &str) -> Result<Option<Bytes>> {
+        let mut client = self.client.clone();
+        let resp = client
+            .get_ref(GetRefReq {
+                name: name.to_owned(),
+            })
+            .await
+            .with_context(|| format!("grpc get_ref {name:?} @ {}", self.endpoint))?
+            .into_inner();
+        Ok(if resp.found {
+            Some(Bytes::from(resp.value))
+        } else {
+            None
+        })
+    }
+
+    async fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<&Bytes>,
+        new: Option<&Bytes>,
+    ) -> Result<CasOutcome> {
+        let mut client = self.client.clone();
+        // proto3 `optional bytes` is `Option<Vec<u8>>` on the wire;
+        // an explicit `None` round-trips as "field absent" (must-not-
+        // exist / delete), Some(empty) round-trips as "must equal
+        // empty / set to empty".
+        let resp = client
+            .cas_ref(CasRefReq {
+                name: name.to_owned(),
+                expected: expected.map(|b| b.to_vec()),
+                new: new.map(|b| b.to_vec()),
+            })
+            .await
+            .with_context(|| format!("grpc cas_ref {name:?} @ {}", self.endpoint))?
+            .into_inner();
+        Ok(if resp.updated {
+            CasOutcome::Updated
+        } else {
+            CasOutcome::Conflict {
+                actual: resp.actual.map(Bytes::from),
+            }
+        })
+    }
+
+    async fn list_refs(&self) -> Result<Vec<String>> {
+        let mut client = self.client.clone();
+        let resp = client
+            .list_refs(ListRefsReq {})
+            .await
+            .with_context(|| format!("grpc list_refs @ {}", self.endpoint))?
+            .into_inner();
+        Ok(resp.names)
     }
 }
 
@@ -212,6 +269,58 @@ mod tests {
             .unwrap()
             .expect("client B sees blob written by client A");
         assert_eq!(got.as_ref(), b"shared");
+    }
+
+    /// M10: end-to-end ref CAS over the wire. One client advances the
+    /// ref; another observes via get_ref + list_refs. Proves the
+    /// proto3 `optional` semantics survive the gRPC round-trip — the
+    /// only thing this test catches that the server-side unit tests
+    /// don't is mis-encoding `None`-vs-empty across the wire.
+    #[tokio::test]
+    async fn grpc_ref_cas_round_trip() {
+        let (endpoint, _backing) = spawn_server().await;
+        let client_a = GrpcRemoteStore::new(&endpoint).unwrap();
+        let client_b = GrpcRemoteStore::new(&endpoint).unwrap();
+
+        // Initially no refs.
+        assert!(client_a.list_refs().await.unwrap().is_empty());
+
+        // Client A creates `op_heads` → v0.
+        let v0 = Bytes::from_static(b"v0");
+        assert_eq!(
+            client_a.cas_ref("op_heads", None, Some(&v0)).await.unwrap(),
+            CasOutcome::Updated
+        );
+
+        // Client B observes v0 + the new entry in list_refs.
+        assert_eq!(
+            client_b.get_ref("op_heads").await.unwrap(),
+            Some(v0.clone())
+        );
+        assert_eq!(client_b.list_refs().await.unwrap(), vec!["op_heads"]);
+
+        // Client B advances v0 → v1 with correct precondition.
+        let v1 = Bytes::from_static(b"v1");
+        assert_eq!(
+            client_b
+                .cas_ref("op_heads", Some(&v0), Some(&v1))
+                .await
+                .unwrap(),
+            CasOutcome::Updated
+        );
+
+        // Client A's stale CAS (still believes v0) loses, gets v1
+        // back as the actual current value so it can retry.
+        let v2 = Bytes::from_static(b"v2");
+        assert_eq!(
+            client_a
+                .cas_ref("op_heads", Some(&v0), Some(&v2))
+                .await
+                .unwrap(),
+            CasOutcome::Conflict {
+                actual: Some(v1.clone()),
+            }
+        );
     }
 
     /// Sanity: put_blob with a malformed id (≠32 bytes) is rejected on

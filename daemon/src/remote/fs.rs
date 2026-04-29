@@ -14,14 +14,15 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rand::Rng;
 
-use super::{BlobKind, RemoteStore};
+use super::{validate_ref_name, BlobKind, CasOutcome, RemoteStore};
 use crate::ty::Id;
 
 /// Filesystem-backed blob CAS rooted at `root`.
@@ -45,6 +46,69 @@ impl FsRemoteStore {
 
     fn blob_path(&self, kind: BlobKind, id: &Id) -> PathBuf {
         self.kind_dir(kind).join(hex_id(id))
+    }
+
+    /// Where refs live. `<root>/refs/`. The sentinel lockfile
+    /// (`.lock`) lives at the same level as ref files; ref names
+    /// can't start with `/` or contain `..` (validated by
+    /// [`validate_ref_name`]) so collision is impossible.
+    fn refs_dir(&self) -> PathBuf {
+        self.root.join("refs")
+    }
+
+    fn ref_path(&self, name: &str) -> PathBuf {
+        self.refs_dir().join(name)
+    }
+}
+
+/// RAII flock guard. Holds an exclusive advisory lock on the wrapped
+/// file for as long as the guard is alive. Used by `cas_ref` to
+/// arbitrate across multiple processes sharing a `dir://` remote.
+///
+/// The lock is **advisory** — well-behaved peers using the same flock
+/// see the contention; rogue processes that bypass it can still race.
+/// All M10 backends go through this code path, so the contract holds
+/// for the intended use case (multiple `jj-yak` daemons sharing a
+/// remote dir).
+struct RefsLock {
+    file: fs::File,
+}
+
+impl RefsLock {
+    /// Acquire an exclusive flock on `<refs_dir>/.lock`, creating the
+    /// file if needed. Blocks until acquired; localhost contention is
+    /// rare (refs are scarce; CAS holds the lock for one read + one
+    /// rename) so we don't spin or backoff.
+    fn acquire(refs_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(refs_dir)
+            .with_context(|| format!("creating {}", refs_dir.display()))?;
+        let lock_path = refs_dir.join(".lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        // SAFETY: flock with a valid raw fd. LOCK_EX blocks until
+        // exclusive access is acquired; failure (EBADF, EINTR, etc.)
+        // surfaces via `last_os_error`.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("flock LOCK_EX on {}", lock_path.display()));
+        }
+        Ok(RefsLock { file })
+    }
+}
+
+impl Drop for RefsLock {
+    fn drop(&mut self) {
+        // SAFETY: same fd we acquired the lock on; LOCK_UN never fails
+        // in a way we can recover from. Drop releases the lock when
+        // the file handle closes anyway, but explicit unlock makes the
+        // contract auditable.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -146,6 +210,148 @@ impl RemoteStore for FsRemoteStore {
         .await
         .context("spawn_blocking has_blob")??;
         Ok(exists)
+    }
+
+    async fn get_ref(&self, name: &str) -> Result<Option<Bytes>> {
+        validate_ref_name(name)?;
+        let path = self.ref_path(name);
+        // No flock here — readers race with writers but the writer's
+        // tmp+rename is atomic (POSIX rename(2) on the same FS is one
+        // syscall), so a reader either sees the old contents or the
+        // new contents, never a torn write.
+        let bytes = tokio::task::spawn_blocking(move || -> Result<Option<Bytes>> {
+            match fs::read(&path) {
+                Ok(b) => Ok(Some(Bytes::from(b))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("reading ref {}", path.display())),
+            }
+        })
+        .await
+        .context("spawn_blocking get_ref")??;
+        Ok(bytes)
+    }
+
+    async fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<&Bytes>,
+        new: Option<&Bytes>,
+    ) -> Result<CasOutcome> {
+        validate_ref_name(name)?;
+        let refs_dir = self.refs_dir();
+        let ref_path = self.ref_path(name);
+        // Clone the precondition + new value across the spawn_blocking
+        // boundary. `Bytes::clone` is cheap (refcount bump).
+        let expected = expected.cloned();
+        let new = new.cloned();
+        tokio::task::spawn_blocking(move || -> Result<CasOutcome> {
+            // RAII lock arbitrates across processes sharing the dir.
+            // Held across the read + rename so a peer's CAS that
+            // sneaks in between would block here.
+            let _guard = RefsLock::acquire(&refs_dir)?;
+
+            // Read current value (if any).
+            let current = match fs::read(&ref_path) {
+                Ok(b) => Some(Bytes::from(b)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("reading ref {}", ref_path.display()))
+                }
+            };
+
+            // Precondition check. Note: `Bytes::eq` is content
+            // equality, so empty-current vs empty-expected matches as
+            // expected; absent-vs-empty does NOT match (different
+            // arms of the Option).
+            if current != expected {
+                return Ok(CasOutcome::Conflict { actual: current });
+            }
+
+            // Apply the swap.
+            match new {
+                Some(value) => {
+                    let tmp_name = format!(
+                        ".tmp.{:016x}",
+                        rand::thread_rng().gen::<u64>()
+                    );
+                    let tmp_path = refs_dir.join(tmp_name);
+                    {
+                        use std::io::Write;
+                        let mut f = fs::File::create(&tmp_path)
+                            .with_context(|| format!("creating {}", tmp_path.display()))?;
+                        f.write_all(&value)
+                            .with_context(|| format!("writing {}", tmp_path.display()))?;
+                        f.sync_all()
+                            .with_context(|| format!("fsync {}", tmp_path.display()))?;
+                    }
+                    if let Err(e) = fs::rename(&tmp_path, &ref_path) {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Err(e).with_context(|| {
+                            format!(
+                                "renaming {} -> {}",
+                                tmp_path.display(),
+                                ref_path.display()
+                            )
+                        });
+                    }
+                }
+                None => {
+                    // Delete. ENOENT here means we observed `current`
+                    // as None (no precondition mismatch above), so
+                    // there's nothing to remove — treat as success.
+                    if let Err(e) = fs::remove_file(&ref_path) {
+                        if e.kind() != io::ErrorKind::NotFound {
+                            return Err(e).with_context(|| {
+                                format!("removing {}", ref_path.display())
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(CasOutcome::Updated)
+        })
+        .await
+        .context("spawn_blocking cas_ref")?
+    }
+
+    async fn list_refs(&self) -> Result<Vec<String>> {
+        let refs_dir = self.refs_dir();
+        let names = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let read_dir = match fs::read_dir(&refs_dir) {
+                Ok(it) => it,
+                // Refs dir doesn't exist yet — no refs.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("reading {}", refs_dir.display()))
+                }
+            };
+            let mut out = Vec::new();
+            for entry in read_dir {
+                let entry = entry.with_context(|| {
+                    format!("iterating {}", refs_dir.display())
+                })?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    anyhow!("non-UTF-8 ref name in {}", refs_dir.display())
+                })?;
+                // Skip the sentinel lockfile and any in-flight tmp
+                // writes. Both are internal bookkeeping — peers must
+                // not see them as refs.
+                if name == ".lock" || name.starts_with(".tmp.") {
+                    continue;
+                }
+                out.push(name.to_owned());
+            }
+            // Deterministic order so callers can compare results
+            // across runs without re-sorting.
+            out.sort();
+            Ok(out)
+        })
+        .await
+        .context("spawn_blocking list_refs")??;
+        Ok(names)
     }
 }
 
@@ -249,5 +455,191 @@ mod tests {
         assert_eq!(hex_id(&id).len(), 64);
         let id = Id([0xab; 32]);
         assert!(hex_id(&id).chars().all(|c| c == 'a' || c == 'b'));
+    }
+
+    // ---- M10: ref methods ----------------------------------------------
+
+    #[tokio::test]
+    async fn ref_missing_returns_none() {
+        let (_dir, s) = make_store();
+        let got = s.get_ref("op_heads").await.unwrap();
+        assert!(got.is_none(), "missing ref must surface as Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn cas_ref_create_then_read() {
+        let (_dir, s) = make_store();
+        let v = Bytes::from_static(b"value-0");
+        let outcome = s
+            .cas_ref("head", None, Some(&v))
+            .await
+            .expect("cas create");
+        assert_eq!(outcome, CasOutcome::Updated);
+        let got = s.get_ref("head").await.unwrap().expect("ref should exist");
+        assert_eq!(got.as_ref(), v.as_ref());
+    }
+
+    #[tokio::test]
+    async fn cas_ref_create_only_conflicts_when_present() {
+        let (_dir, s) = make_store();
+        let v0 = Bytes::from_static(b"v0");
+        s.cas_ref("head", None, Some(&v0)).await.unwrap();
+        // expected = None means create-only; against an existing ref
+        // the CAS must conflict and return the existing value.
+        let outcome = s
+            .cas_ref("head", None, Some(&Bytes::from_static(b"v1")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CasOutcome::Conflict {
+                actual: Some(v0),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_ref_advance_with_correct_expected() {
+        let (_dir, s) = make_store();
+        let v0 = Bytes::from_static(b"v0");
+        let v1 = Bytes::from_static(b"v1");
+        s.cas_ref("op_heads", None, Some(&v0)).await.unwrap();
+        let outcome = s
+            .cas_ref("op_heads", Some(&v0), Some(&v1))
+            .await
+            .unwrap();
+        assert_eq!(outcome, CasOutcome::Updated);
+        assert_eq!(s.get_ref("op_heads").await.unwrap(), Some(v1));
+    }
+
+    #[tokio::test]
+    async fn cas_ref_stale_expected_returns_actual() {
+        let (_dir, s) = make_store();
+        let v0 = Bytes::from_static(b"v0");
+        let v1 = Bytes::from_static(b"v1");
+        s.cas_ref("head", None, Some(&v0)).await.unwrap();
+        // Stale expected: caller thinks ref is absent, but it's v0.
+        // Conflict reply must carry the actual current value so the
+        // caller can retry without a follow-up get_ref.
+        let stale = Bytes::from_static(b"stale");
+        let outcome = s
+            .cas_ref("head", Some(&stale), Some(&v1))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CasOutcome::Conflict {
+                actual: Some(v0),
+            }
+        );
+        // And the ref didn't get clobbered.
+        assert_eq!(
+            s.get_ref("head").await.unwrap(),
+            Some(Bytes::from_static(b"v0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_ref_delete() {
+        let (_dir, s) = make_store();
+        let v0 = Bytes::from_static(b"v0");
+        s.cas_ref("transient", None, Some(&v0)).await.unwrap();
+        let outcome = s
+            .cas_ref("transient", Some(&v0), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, CasOutcome::Updated);
+        assert_eq!(s.get_ref("transient").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cas_ref_delete_with_stale_expected_conflicts() {
+        let (_dir, s) = make_store();
+        let v0 = Bytes::from_static(b"v0");
+        s.cas_ref("transient", None, Some(&v0)).await.unwrap();
+        // Try to delete with a stale precondition.
+        let stale = Bytes::from_static(b"wrong");
+        let outcome = s
+            .cas_ref("transient", Some(&stale), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CasOutcome::Conflict {
+                actual: Some(v0.clone()),
+            }
+        );
+        // Nothing was deleted.
+        assert_eq!(s.get_ref("transient").await.unwrap(), Some(v0));
+    }
+
+    #[tokio::test]
+    async fn cas_ref_empty_value_distinct_from_absent() {
+        // Critical: the trait's contract says Some(empty) ≠ None.
+        // A backend that conflates them would silently accept a stale
+        // CAS — this test catches the regression.
+        let (_dir, s) = make_store();
+        let empty = Bytes::new();
+        // Set ref to empty bytes.
+        s.cas_ref("e", None, Some(&empty)).await.unwrap();
+        assert_eq!(s.get_ref("e").await.unwrap(), Some(empty.clone()));
+
+        // expected = None should now conflict (ref exists, even though
+        // its value is empty).
+        let outcome = s
+            .cas_ref("e", None, Some(&Bytes::from_static(b"x")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CasOutcome::Conflict {
+                actual: Some(empty.clone()),
+            }
+        );
+        // expected = Some(empty) must succeed.
+        let outcome = s
+            .cas_ref("e", Some(&empty), Some(&Bytes::from_static(b"x")))
+            .await
+            .unwrap();
+        assert_eq!(outcome, CasOutcome::Updated);
+    }
+
+    #[tokio::test]
+    async fn list_refs_returns_sorted_names_and_hides_internals() {
+        let (_dir, s) = make_store();
+        for name in ["zeta", "alpha", "head"] {
+            s.cas_ref(name, None, Some(&Bytes::from_static(b"v")))
+                .await
+                .unwrap();
+        }
+        let names = s.list_refs().await.unwrap();
+        assert_eq!(names, vec!["alpha", "head", "zeta"]);
+
+        // Sentinel lockfile must not leak as a ref.
+        // The flock dance creates `.lock` on first cas_ref, so it's
+        // already there — list_refs above should have skipped it.
+        // Belt-and-braces: drop a fake `.tmp.<rand>` and confirm it's
+        // hidden too.
+        let parent = s.refs_dir();
+        std::fs::write(parent.join(".tmp.1234567890abcdef"), b"x").unwrap();
+        let names_again = s.list_refs().await.unwrap();
+        assert_eq!(names_again, vec!["alpha", "head", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn list_refs_on_empty_store_is_ok() {
+        let (_dir, s) = make_store();
+        // refs_dir doesn't exist yet — list_refs must not error.
+        assert!(s.list_refs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cas_ref_rejects_bad_name() {
+        let (_dir, s) = make_store();
+        let err = s
+            .cas_ref("a/b", None, Some(&Bytes::from_static(b"x")))
+            .await
+            .expect_err("must reject names with '/'");
+        assert!(err.to_string().contains("'/'"), "got: {err}");
     }
 }
