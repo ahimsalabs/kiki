@@ -1,23 +1,30 @@
 # jj-yak: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C). M1–M8
+Status: active. Transport architecture decided (§4.3 Path C). M1–M9
 done — see [`PLAN-M1-6.md`](./PLAN-M1-6.md) for M1–M6 detail, §10
-for M7, and §12 for M8. **Integration tests now run with
-`disable_mount = false`**: `jj yak init` + `jj new` round-trip
+for M7, §12 for M8, and §13 for M9. **Integration tests now run
+with `disable_mount = false`**: `jj yak init` + `jj new` round-trip
 through a real Linux FUSE mount, `.jj/` is excluded from snapshots,
 and the working-copy `@` advances correctly across mutations.
-A post-M7 code audit (§10.3) closed four real bugs and two clippy
-warnings; `cargo clippy --workspace --all-targets -- -D warnings`
-is clean and 99/99 tests pass.
 M8 (Layer B) is done: per-mount `Store` is now backed by a redb
 file under `<storage_dir>/mounts/<hash(wc_path)>/store.redb`, and
 per-mount metadata (`op_id`, `workspace_id`, `root_tree_id`,
 `remote`) persists in `mount.toml`; the daemon rehydrates known
-mounts on startup. **M9 (Layer C — remote blob CAS) is in
-flight**; spec in §13. Inode handle stability (§7 decision 6) is
-still deferred; the in-memory slab is fine until kernel handles
-need to survive a daemon restart in production.
-Last updated: 2026-04-28
+mounts on startup. **M9 (Layer C — remote blob CAS) is done**:
+the per-mount `RemoteStore` (parsed from `Initialize.remote`) is
+wired into `service.rs` for synchronous write-through on every
+write RPC, read-through fall-through on local miss, and a
+post-snapshot reachability walk that pushes any blobs the remote
+doesn't already have. Two backends ship — `FsRemoteStore`
+(`dir://`) and `GrpcRemoteStore` (`grpc://`) — and every daemon
+binary now also serves the matching `RemoteStore` gRPC service on
+its existing listener so peer daemons can use it as a remote.
+`cargo clippy --workspace --all-targets -- -D warnings` is clean;
+115/115 daemon tests + 14/14 cli tests pass. Inode handle
+stability (§7 decision 6) is still deferred; the in-memory slab
+is fine until kernel handles need to survive a daemon restart in
+production.
+Last updated: 2026-04-29
 
 This document captures the roadmap for getting jj-yak from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -111,17 +118,31 @@ After M6 the daemon-side VCS surface is feature-complete.
 
 ## 3. What's deferred
 
-- **Layer C (remote):** `Initialize.remote` is currently a string that's
-  stored on the per-mount `mount.toml` and surfaced via `DaemonStatus`,
-  but otherwise ignored. M9 (§13) wires a byte-typed
-  `RemoteStore` trait + two backends (`dir://`, `grpc://`) into
-  the per-mount `Store` for blob-CAS read-through and write-through.
-  Mutable pointers (op heads) deferred to M10.
+- **Mutable pointers (op heads, ref tips).** Layer C blobs are content-
+  addressed and idempotent across pushes; mutable pointers are not.
+  Two daemons over the same `dir://` blob store can sync content but
+  not op-log linearity. M10 owns the catalog protocol — see §13.5 for
+  the M9 boundary.
+- **FUSE-side read-through on `StoreMiss`.** `vfs/yak_fs.rs`'s
+  `lookup`/`read`/`readdir` paths still map `StoreMiss` to `EIO`. M9
+  integrated at `service.rs` rather than `Store` (§13.2 decision), so
+  yak_fs.rs doesn't see the remote without the orchestration cost
+  duplicated there or `Store` upgraded to async. Lands at M10
+  alongside clone-style workflows where the remote actually has blobs
+  the kernel might ask for through the mount.
 - **Inode handle stability across restarts (§7 decision 6):** the
   in-memory slab still uses monotonic `next_id`. Layer B persists the
   Store but kernel handles still don't survive a daemon restart;
   applications keeping fds open across the restart will see ESTALE.
   Land alongside the `fuser` migration (§11) when perf matters.
+- **Auth, TLS, retry/backoff for `grpc://` remotes.** Localhost-only,
+  single-user, no TLS. M11 alongside S3.
+- **Async background push queue.** M9's `Snapshot` blocks until every
+  newly-written blob lands on the remote (§13.4). Fine for `dir://` and
+  localhost gRPC, will hurt with a real network remote. The current
+  sync code path is the right shape for the queue: `Store::write_*`
+  returns the same `(Id, Bytes)` either way; the queue just batches
+  `put_blob` instead of inlining them. M10/M11.
 - **Sparse patterns:** `set_sparse_patterns` can stay `todo!` until there's
   a real reason. Most yak users probably don't want sparse if the FS is
   already lazy.
@@ -375,24 +396,26 @@ Worth doing in passing, not blocking:
 
 ## 8. Recommended starting point
 
-**M1–M8 are done.** Integration tests run with `disable_mount = false`:
+**M1–M9 are done.** Integration tests run with `disable_mount = false`:
 `jj yak init`, `jj new`, `jj log`, `jj op log`, and the
 `test_nested_tree_round_trips` / `test_symlink_tree_round_trips`
-end-to-end paths succeed on a real Linux FUSE mount, and the
-per-mount Store is now durable across daemon restarts (M8 detail in
-§12). M7 detail in §10.
+end-to-end paths succeed on a real Linux FUSE mount, the per-mount
+Store is durable across daemon restarts (M8 in §12), and Layer C
+remote blob CAS rides on every write/read RPC + post-snapshot walk
+(M9 in §13). M7 detail in §10.
 
-**Next: M9 — Layer C: remote blob CAS.** Spec in §13.
-`Initialize.remote` currently round-trips through `mount.toml` and
-`DaemonStatus` but is otherwise a string the daemon ignores. M9
-wires a byte-typed `RemoteStore` trait (`get_blob`/`put_blob`/
-`has_blob`) with two backends — `dir://` (filesystem fake, also a
-permanent test fixture) and `grpc://` (peer daemon over the
-existing tonic listener) — into the per-mount `Store` for
-synchronous write-through on `Snapshot` and read-through fetch on
-local miss. Mutable pointers (op heads, ref tips) and multi-mount
-concurrency arbitration are out of scope for M9 and tracked for
-M10.
+**Next: M10 — mutable pointers + concurrency arbitration.**
+Two daemons sharing a Layer C blob store today can sync content but
+not op-log linearity (§13.5). M10 owns the catalog protocol: how is
+"the latest op_id for this remote" stored, how do two daemons race
+to advance it, what happens on conflict. Likely shape: small
+mutable-pointers RPC alongside the existing `RemoteStore` service,
+with an arbitration story closer to git's ref locking than to CAS.
+Spec to be written; the M9 read/write/snapshot path provides the
+content layer it needs to ride on top of. FUSE-side read-through on
+`StoreMiss` (§13.5) lands at the same milestone — clone-style flows
+where the kernel asks the FS for content the local store doesn't
+have are exactly the case the catalog protocol unblocks.
 
 **Hygiene still pending:**
 
@@ -746,14 +769,15 @@ Deleted the empty `server/` workspace member (3-line
 `Hello, world!` `main.rs`, no dependencies, never wired up). PLAN.md
 §3 had flagged it for deletion since M1.
 
-## 13. M9 — Layer C: remote blob CAS (in flight)
+## 13. M9 — Layer C: remote blob CAS (done)
 
 M9 wires `Initialize.remote` from a passive string on `mount.toml`
 into a real outbound + read-through path. Scope is deliberately
 narrow: **content-addressed blobs only**. Mutable pointers (op
 heads, ref tips) are explicitly out of scope — they ride on
 top of CAS but need their own arbitration story (§13.5) and that
-story doesn't fit cleanly inside one milestone.
+story doesn't fit cleanly inside one milestone. M9 outcome in
+§13.9.
 
 ### 13.1 Trait shape
 
@@ -951,13 +975,141 @@ the default 4 MiB tonic message cap.
 
 ### 13.8 Commit plan
 
-One commit per task:
+One commit per task — actual landings:
 
-1. PLAN.md §13 (this section).
-2. Proto: `service RemoteStore` + bindings.
-3. `RemoteStore` trait + `FsRemoteStore` + URL parser + unit tests.
-4. `Store` composition (read-through + write-through) + unit tests.
-5. `Initialize.remote` URL parse → per-mount RemoteStore.
-6. `GrpcRemoteStore` + daemon-side server impl + integration test.
-7. End-to-end fs-fake test (two services, shared `dir://` remote).
-8. PLAN.md M9 outcome (§13.9).
+1. PLAN.md §13 (this section). ✅
+2. Proto: `service RemoteStore` + bindings. ✅
+3. `RemoteStore` trait + `FsRemoteStore` + URL parser + unit tests. ✅
+4. PLAN.md §13.2 amendment — composition site moved from `Store` to
+   `service.rs`. ✅ (extra commit; rationale in §13.2)
+5. `Store::write_*` → `(Id, Bytes)` so the service handlers can reuse
+   the buffer for remote push. ✅ (split out of #6 for cleanliness;
+   one mechanical refactor commit, no behaviour change)
+6. Service-layer composition: `Mount.remote_store` field + write-
+   through, read-through, post-snapshot push + `Initialize.remote`
+   URL parse + unit tests + the §13.7 fs-fake integration test
+   (two services sharing a `dir://` remote). ✅ (steps 4+5+7 from
+   the original draft, combined since the wiring is mutually
+   coupled)
+7. `GrpcRemoteStore` client + `RemoteStoreService` daemon-side server
+   + always-on peer service in `main.rs` + tonic integration tests
+   (in-process server over `127.0.0.1:0`) + the §13.7 gRPC analogue
+   test (two services sharing a `grpc://` remote). ✅
+8. PLAN.md M9 outcome (§13.9). ✅ (this commit)
+
+### 13.9 M9 outcome
+
+Eight commits across the M9 sequence (numbered above), including
+the §13.2 amendment. 115/115 daemon tests + 14/14 cli tests pass;
+`cargo clippy --workspace --all-targets -- -D warnings` is clean.
+
+Decisions made on the way:
+
+- **Composition at `service.rs`, not `Store` (§13.2 amendment).** The
+  draft originally had `Store::open_with_remote` wrap a `RemoteStore`
+  directly, but `Store` is sync by design (PLAN §12.1 — methods open
+  a redb txn without `.await` so `JjYakFs::snapshot_node` can recurse
+  without `Box::pin`). Composing an async `RemoteStore` inside a sync
+  `Store` would force one of: make `Store` async (ripples through
+  ~10 sync helpers + ~30 call sites), hide a tokio runtime inside
+  `Store` (re-entry hazard, threads-per-mount), or push integration
+  up. The third option won — the remote becomes an "RPC layer"
+  concern that doesn't touch storage internals. The cost: FUSE-side
+  read-through on `StoreMiss` doesn't get the remote automatically
+  (deferred to M10).
+
+- **`Store::write_*` returns `(Id, Bytes)`.** PLAN §13.2 calls for
+  buffer reuse on push ("Push reuses the same buffer (`Bytes::clone`);
+  no re-encoding"). Three mechanical options to make that work:
+  expose pre-encoded bytes externally, take pre-encoded bytes
+  externally, or return them from the existing call. The third is
+  smallest-diff: snapshot_node ignores the bytes (`let (id, _) =
+  ...`), service handlers reuse them. Re-decoding on the reverse
+  read-through path is allowed (the cold path), avoided on the hot
+  push path.
+
+- **Pre-encoded bytes on the post-snapshot walk too.** Added
+  `Store::get_*_bytes(id) -> Result<Option<Bytes>>` for tree, file,
+  symlink, commit. The walk runs `has_blob` per reachable blob and,
+  on miss, reads raw bytes from redb (no decode) and `put_blob`s
+  them. Walking the entire reachable tree on every snapshot is
+  wasteful but correct — `has_blob` short-circuits unchanged
+  subtrees on the second-and-later snapshot. The async background
+  queue (M10/M11) would batch these.
+
+- **`verify_round_trip` on read-through.** When the remote returns
+  bytes, we re-hash them locally before persisting. A hash mismatch
+  surfaces as `Status::data_loss` rather than silently poisoning the
+  local store. Cheap (already computing hash to write locally) and
+  closes a real corrupt-peer attack surface.
+
+- **`grpc://` server is always-on, backed by
+  `<storage_dir>/served_blobs/`.** Every daemon registers
+  `RemoteStoreService` on its existing tonic listener (§13.6's
+  "any daemon can act as the remote for another"). The served-blobs
+  dir is separate from per-mount redb stores so M4's cross-mount
+  keyspace isolation invariants hold on the served side too. No
+  config knob — auth/TLS would need one, but those are M11.
+
+- **`connect_lazy` for the `grpc://` client.** Keeps `remote::parse`
+  synchronous and defers transport failures to the first RPC (where
+  there's a real tracing context). A `parse_grpc_returns_some` test
+  needs `#[tokio::test]` even though no RPC fires — tonic touches
+  the executor on `Channel` construction.
+
+- **`BlobKind::Unspecified` rejected on the wire.** protobuf3 enums
+  always admit zero; `BLOB_KIND_UNSPECIFIED` represents
+  "missing/unset" rather than a partition. The server's `decode_kind`
+  surfaces it as `invalid_argument` so a peer sending the zero
+  value gets a clean error rather than a silent route to a "default"
+  table that doesn't exist.
+
+- **Pre-M9 placeholder strings break the parse.** Existing CLI
+  tests + service tests passed `remote: "localhost"` as a free-form
+  label. M9's strict `dir://…|grpc://…|""` parse rejects that. CLI
+  tests switched to `""` (back-compat path); service tests use a
+  real `dir://<tempdir>` URL where they exercise the rehydrate
+  round-trip. The `yak status` formatter now drops `- <remote>`
+  when `remote` is empty (was `path - ` with trailing whitespace).
+
+What this milestone explicitly does **not** do (preserved from
+§13.5, repeated here so it's findable in the outcome):
+
+- Mutable pointers (op heads, ref tips). Two daemons over the same
+  blob store can sync content but not op-log linearity. M10.
+- Concurrency arbitration across mounts (§7 #8). Single-mount-per-
+  remote remains the documented assumption.
+- Auth, TLS, retry/backoff. M11 alongside S3.
+- Stable inode ids across restarts (§7 decision 6). With the
+  `fuser` migration (§11).
+- FUSE-side read-through on `StoreMiss`. The §13.2 decision means
+  yak_fs.rs doesn't see the remote without duplicating the
+  orchestration cost. M10 is the right milestone to thread it
+  through (clone-style flows are when the kernel actually asks for
+  blobs the local store doesn't have).
+
+Test coverage added in M9:
+
+- `daemon::remote::tests` (parser): empty/dir/relative/no-scheme/
+  grpc-empty/grpc/unknown-scheme + BlobKind proto round-trip.
+- `daemon::remote::fs::tests`: every method + idempotent put +
+  per-kind keyspace partition + lazy root creation.
+- `daemon::remote::server::tests`: round-trip put→get + missing
+  blob → `found=false` + unspecified kind rejected + short id
+  rejected + has_blob tracks state.
+- `daemon::remote::grpc::tests`: end-to-end against a real tonic
+  listener over `127.0.0.1:0` — round-trips every BlobKind, two
+  clients sharing a server see each other's blobs, server rejects
+  short id even when the client happens to bypass its own
+  validation.
+- `daemon::service::tests` M9 cases:
+  `initialize_rejects_unparseable_remote`,
+  `write_file_pushes_to_dir_remote`,
+  `read_file_falls_back_to_remote_on_local_miss`,
+  `read_file_local_miss_no_remote_is_not_found`,
+  `snapshot_pushes_reachable_blobs_to_remote`,
+  `snapshot_is_idempotent_against_remote`,
+  `two_services_share_blobs_via_grpc_remote`.
+- `persisted_mount_rehydrates_after_restart` upgraded to use a
+  real `dir://<tempdir>` URL so rehydrate exercises the
+  `remote::parse` → `Mount.remote_store` round-trip too.
