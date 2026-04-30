@@ -101,7 +101,7 @@ async fn fetch_bytes(
     kind: BlobKind,
     id: ty::Id,
 ) -> Result<Bytes, FetchError> {
-    match remote.get_blob(kind, &id).await {
+    match remote.get_blob(kind, &id.0).await {
         Ok(Some(b)) => Ok(b),
         Ok(None) => Err(FetchError::NotFound { kind, id }),
         Err(source) => Err(FetchError::Remote { kind, source }),

@@ -19,27 +19,32 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::ty::Id;
-
 pub mod fetch;
 pub mod fs;
 pub mod grpc;
 pub mod server;
 
 /// Which content-addressed table the (id, bytes) pair belongs to.
-/// Mirrors the four redb tables in [`crate::store::Store`]
-/// (`commits_v1`, `files_v1`, `symlinks_v1`, `trees_v1`).
+/// Mirrors the redb tables in [`crate::store::Store`]
+/// (`commits_v1`, `files_v1`, `symlinks_v1`, `trees_v1`,
+/// `views_v1`, `operations_v1`).
 ///
 /// Carrying the kind through the trait — not implicit in the bytes —
 /// lets backends route by table the same way redb does locally and
 /// avoids confusing-but-benign content-hash collisions across kinds
-/// (two different blob types happening to hash to the same `Id`).
+/// (two different blob types happening to hash to the same id).
+///
+/// M10.6: `View` and `Operation` added for op-store data. These use
+/// 64-byte BLAKE2b-512 ids (vs 32-byte BLAKE3 for the others); the
+/// trait's blob methods accept `&[u8]` to accommodate both.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BlobKind {
     Tree,
     File,
     Symlink,
     Commit,
+    View,
+    Operation,
 }
 
 impl BlobKind {
@@ -52,6 +57,8 @@ impl BlobKind {
             BlobKind::File => "file",
             BlobKind::Symlink => "symlink",
             BlobKind::Commit => "commit",
+            BlobKind::View => "view",
+            BlobKind::Operation => "operation",
         }
     }
 
@@ -63,6 +70,8 @@ impl BlobKind {
             BlobKind::File => proto::jj_interface::BlobKind::File,
             BlobKind::Symlink => proto::jj_interface::BlobKind::Symlink,
             BlobKind::Commit => proto::jj_interface::BlobKind::Commit,
+            BlobKind::View => proto::jj_interface::BlobKind::View,
+            BlobKind::Operation => proto::jj_interface::BlobKind::Operation,
         }
     }
 
@@ -78,6 +87,8 @@ impl BlobKind {
             P::File => Some(BlobKind::File),
             P::Symlink => Some(BlobKind::Symlink),
             P::Commit => Some(BlobKind::Commit),
+            P::View => Some(BlobKind::View),
+            P::Operation => Some(BlobKind::Operation),
         }
     }
 }
@@ -157,16 +168,20 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
 #[async_trait]
 pub trait RemoteStore: Send + Sync + std::fmt::Debug {
     /// Fetch a blob. `Ok(None)` if the remote does not have it.
-    async fn get_blob(&self, kind: BlobKind, id: &Id) -> Result<Option<Bytes>>;
+    ///
+    /// `id` is variable-length: 32 bytes for tree/file/symlink/commit
+    /// (BLAKE3), 64 bytes for view/operation (BLAKE2b-512). Backends
+    /// must not assume a fixed id length.
+    async fn get_blob(&self, kind: BlobKind, id: &[u8]) -> Result<Option<Bytes>>;
 
     /// Push a blob. Idempotent: byte-identical puts under the same
     /// `(kind, id)` are no-ops on the remote.
-    async fn put_blob(&self, kind: BlobKind, id: &Id, bytes: Bytes) -> Result<()>;
+    async fn put_blob(&self, kind: BlobKind, id: &[u8], bytes: Bytes) -> Result<()>;
 
     /// Cheap existence probe. Equivalent in semantics to
     /// `get_blob(...).map(|o| o.is_some())` but backends should
     /// implement it without transferring the body when possible.
-    async fn has_blob(&self, kind: BlobKind, id: &Id) -> Result<bool>;
+    async fn has_blob(&self, kind: BlobKind, id: &[u8]) -> Result<bool>;
 
     /// Read a ref's current value. `Ok(None)` if the ref does not
     /// exist. `name` must satisfy [`validate_ref_name`]; backends
@@ -251,7 +266,7 @@ mod tests {
         let remote = parse(&url).unwrap().expect("dir:// returns Some");
         // Smoke test: a freshly-rooted remote answers `has_blob` with
         // `false` and not an error.
-        let id = Id([0u8; 32]);
+        let id = [0u8; 32];
         let rt = tokio::runtime::Runtime::new().unwrap();
         let has = rt.block_on(remote.has_blob(BlobKind::Tree, &id)).unwrap();
         assert!(!has);
@@ -349,6 +364,8 @@ mod tests {
             BlobKind::File,
             BlobKind::Symlink,
             BlobKind::Commit,
+            BlobKind::View,
+            BlobKind::Operation,
         ] {
             assert_eq!(BlobKind::from_proto(k.as_proto()), Some(k));
         }

@@ -24,7 +24,6 @@ use proto::jj_interface::{
 use tonic::transport::Channel;
 
 use super::{BlobKind, CasOutcome, RemoteStore};
-use crate::ty::Id;
 
 /// Tonic-backed `RemoteStore` reachable at `grpc://<endpoint>`.
 ///
@@ -66,12 +65,12 @@ impl GrpcRemoteStore {
 
 #[async_trait]
 impl RemoteStore for GrpcRemoteStore {
-    async fn get_blob(&self, kind: BlobKind, id: &Id) -> Result<Option<Bytes>> {
+    async fn get_blob(&self, kind: BlobKind, id: &[u8]) -> Result<Option<Bytes>> {
         let mut client = self.client.clone();
         let resp = client
             .get_blob(GetBlobReq {
                 kind: kind.as_proto() as i32,
-                id: id.0.to_vec(),
+                id: id.to_vec(),
             })
             .await
             .with_context(|| format!("grpc get_blob {} @ {}", kind.as_str(), self.endpoint))?
@@ -85,12 +84,12 @@ impl RemoteStore for GrpcRemoteStore {
         })
     }
 
-    async fn put_blob(&self, kind: BlobKind, id: &Id, bytes: Bytes) -> Result<()> {
+    async fn put_blob(&self, kind: BlobKind, id: &[u8], bytes: Bytes) -> Result<()> {
         let mut client = self.client.clone();
         client
             .put_blob(PutBlobReq {
                 kind: kind.as_proto() as i32,
-                id: id.0.to_vec(),
+                id: id.to_vec(),
                 bytes: bytes.to_vec(),
             })
             .await
@@ -98,12 +97,12 @@ impl RemoteStore for GrpcRemoteStore {
         Ok(())
     }
 
-    async fn has_blob(&self, kind: BlobKind, id: &Id) -> Result<bool> {
+    async fn has_blob(&self, kind: BlobKind, id: &[u8]) -> Result<bool> {
         let mut client = self.client.clone();
         let resp = client
             .has_blob(HasBlobReq {
                 kind: kind.as_proto() as i32,
-                id: id.0.to_vec(),
+                id: id.to_vec(),
             })
             .await
             .with_context(|| format!("grpc has_blob {} @ {}", kind.as_str(), self.endpoint))?
@@ -214,7 +213,7 @@ mod tests {
         let (endpoint, _backing) = spawn_server().await;
         let client = GrpcRemoteStore::new(&endpoint).expect("connect_lazy");
 
-        let id = Id([0xab; 32]);
+        let id = [0xab_u8; 32];
         // put_blob across all kinds to confirm the BlobKind enum
         // round-trips through the wire correctly.
         for (kind, payload) in [
@@ -239,13 +238,32 @@ mod tests {
             assert_eq!(got.as_ref(), payload, "kind {kind:?}");
         }
 
+        // M10.6: 64-byte View/Operation ids also round-trip.
+        let long_id = [0xef_u8; 64];
+        for (kind, payload) in [
+            (BlobKind::View, b"view-bytes".as_ref()),
+            (BlobKind::Operation, b"operation-bytes".as_ref()),
+        ] {
+            client
+                .put_blob(kind, &long_id, Bytes::copy_from_slice(payload))
+                .await
+                .unwrap_or_else(|e| panic!("put_blob {kind:?}: {e:#}"));
+            let got = client
+                .get_blob(kind, &long_id)
+                .await
+                .unwrap_or_else(|e| panic!("get_blob {kind:?}: {e:#}"))
+                .expect("blob present");
+            assert_eq!(got.as_ref(), payload, "kind {kind:?}");
+        }
+
         // Missing blob → Ok(None), not an error.
+        let missing_id = [0_u8; 32];
         let missing = client
-            .get_blob(BlobKind::Tree, &Id([0; 32]))
+            .get_blob(BlobKind::Tree, &missing_id)
             .await
             .expect("get_blob (missing)");
         assert!(missing.is_none());
-        assert!(!client.has_blob(BlobKind::Tree, &Id([0; 32])).await.unwrap());
+        assert!(!client.has_blob(BlobKind::Tree, &missing_id).await.unwrap());
     }
 
     /// Two `JujutsuService`-style users sharing a `grpc://` remote.
@@ -258,7 +276,7 @@ mod tests {
         let client_a = GrpcRemoteStore::new(&endpoint).unwrap();
         let client_b = GrpcRemoteStore::new(&endpoint).unwrap();
 
-        let id = Id([0x77; 32]);
+        let id = [0x77_u8; 32];
         client_a
             .put_blob(BlobKind::File, &id, Bytes::from_static(b"shared"))
             .await
@@ -323,24 +341,21 @@ mod tests {
         );
     }
 
-    /// Sanity: put_blob with a malformed id (≠32 bytes) is rejected on
-    /// the server side, surfaced to the client as an `Err` rather than
-    /// silently accepted. Catches a regression where the server forgets
-    /// to validate id length.
+    /// Sanity: put_blob with an empty id is rejected on the server side,
+    /// surfaced to the client as an `Err` rather than silently accepted.
     #[tokio::test]
-    async fn server_rejects_short_id() {
+    async fn server_rejects_empty_id() {
         let (endpoint, _backing) = spawn_server().await;
-        // Bypass the wrapper to send a hand-crafted bad request.
         let client = GrpcRemoteStore::new(&endpoint).unwrap();
         let mut raw = client.client.clone();
         let err = raw
             .put_blob(PutBlobReq {
                 kind: BlobKind::File.as_proto() as i32,
-                id: vec![0u8; 16], // wrong length
+                id: vec![],
                 bytes: vec![],
             })
             .await
-            .expect_err("server must reject short id");
+            .expect_err("server must reject empty id");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

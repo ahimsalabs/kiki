@@ -687,7 +687,7 @@ async fn push_blob_if_missing(
     kind: BlobKind,
     id: ty::Id,
 ) -> anyhow::Result<()> {
-    if remote.has_blob(kind, &id).await? {
+    if remote.has_blob(kind, &id.0).await? {
         return Ok(());
     }
     let bytes: Bytes = match kind {
@@ -695,6 +695,9 @@ async fn push_blob_if_missing(
         BlobKind::File => store.get_file_bytes(id)?,
         BlobKind::Symlink => store.get_symlink_bytes(id)?,
         BlobKind::Commit => store.get_commit_bytes(id)?,
+        BlobKind::View | BlobKind::Operation => {
+            unreachable!("push_reachable_blobs only walks tree/file/symlink/commit")
+        }
     }
     .ok_or_else(|| {
         anyhow!(
@@ -703,7 +706,7 @@ async fn push_blob_if_missing(
             hex(&id)
         )
     })?;
-    remote.put_blob(kind, &id, bytes).await?;
+    remote.put_blob(kind, &id.0, bytes).await?;
     Ok(())
 }
 
@@ -943,7 +946,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // snapshot's walk cover transient remote failures.
         if let Some(remote) = remote {
             remote
-                .put_blob(BlobKind::File, &id, bytes)
+                .put_blob(BlobKind::File, &id.0, bytes)
                 .await
                 .map_err(remote_status("remote put_blob (file)"))?;
         }
@@ -981,7 +984,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(store_status("write_symlink"))?;
         if let Some(remote) = remote {
             remote
-                .put_blob(BlobKind::Symlink, &id, bytes)
+                .put_blob(BlobKind::Symlink, &id.0, bytes)
                 .await
                 .map_err(remote_status("remote put_blob (symlink)"))?;
         }
@@ -1025,7 +1028,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(store_status("write_tree"))?;
         if let Some(remote) = remote {
             remote
-                .put_blob(BlobKind::Tree, &id, bytes)
+                .put_blob(BlobKind::Tree, &id.0, bytes)
                 .await
                 .map_err(remote_status("remote put_blob (tree)"))?;
         }
@@ -1069,7 +1072,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(store_status("write_commit"))?;
         if let Some(remote) = remote {
             remote
-                .put_blob(BlobKind::Commit, &id, bytes)
+                .put_blob(BlobKind::Commit, &id.0, bytes)
                 .await
                 .map_err(remote_status("remote put_blob (commit)"))?;
         }
@@ -1095,6 +1098,45 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             None => fetch_commit_through_remote(&store, remote.as_deref(), commit_id).await?,
         };
         Ok(Response::new(commit.as_proto()))
+    }
+
+    // ---- M10.6: op-store RPCs (stubs, real handlers in next commit) ----
+
+    async fn write_view(
+        &self,
+        _request: Request<WriteViewReq>,
+    ) -> Result<Response<WriteViewReply>, Status> {
+        Err(Status::unimplemented("WriteView: M10.6 in progress"))
+    }
+
+    async fn read_view(
+        &self,
+        _request: Request<ReadViewReq>,
+    ) -> Result<Response<ReadViewReply>, Status> {
+        Err(Status::unimplemented("ReadView: M10.6 in progress"))
+    }
+
+    async fn write_operation(
+        &self,
+        _request: Request<WriteOperationReq>,
+    ) -> Result<Response<WriteOperationReply>, Status> {
+        Err(Status::unimplemented("WriteOperation: M10.6 in progress"))
+    }
+
+    async fn read_operation(
+        &self,
+        _request: Request<ReadOperationReq>,
+    ) -> Result<Response<ReadOperationReply>, Status> {
+        Err(Status::unimplemented("ReadOperation: M10.6 in progress"))
+    }
+
+    async fn resolve_operation_id_prefix(
+        &self,
+        _request: Request<ResolveOperationIdPrefixReq>,
+    ) -> Result<Response<ResolveOperationIdPrefixReply>, Status> {
+        Err(Status::unimplemented(
+            "ResolveOperationIdPrefix: M10.6 in progress",
+        ))
     }
 
     #[tracing::instrument(skip(self))]

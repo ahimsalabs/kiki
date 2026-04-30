@@ -23,7 +23,6 @@ use proto::jj_interface::{
 use tonic::{Request, Response, Status};
 
 use super::{BlobKind, RemoteStore};
-use crate::ty::Id;
 
 /// Adapter from the `proto::remote_store_server::RemoteStore` trait to
 /// any [`crate::remote::RemoteStore`] backend.
@@ -68,10 +67,16 @@ fn decode_kind(kind: i32) -> Result<BlobKind, Status> {
     })
 }
 
+/// Validate that a blob id is non-empty. Variable-length: 32 bytes for
+/// tree/file/symlink/commit (BLAKE3), 64 bytes for view/operation
+/// (BLAKE2b-512). We don't enforce a specific length — the remote
+/// stores bytes opaquely and the caller handles content hashing.
 #[allow(clippy::result_large_err)]
-fn decode_id(id: Vec<u8>) -> Result<Id, Status> {
-    id.try_into()
-        .map_err(|e| Status::invalid_argument(format!("blob id: {e:#}")))
+fn validate_id(id: &[u8]) -> Result<(), Status> {
+    if id.is_empty() {
+        return Err(Status::invalid_argument("blob id must not be empty"));
+    }
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -83,10 +88,10 @@ impl RemoteStoreServerTrait for RemoteStoreService {
     ) -> Result<Response<GetBlobReply>, Status> {
         let req = request.into_inner();
         let kind = decode_kind(req.kind)?;
-        let id = decode_id(req.id)?;
+        validate_id(&req.id)?;
         let bytes = self
             .backend
-            .get_blob(kind, &id)
+            .get_blob(kind, &req.id)
             .await
             .map_err(|e| Status::internal(format!("backend get_blob: {e:#}")))?;
         // `found` distinguishes "remote doesn't have it" from "remote
@@ -110,9 +115,9 @@ impl RemoteStoreServerTrait for RemoteStoreService {
     ) -> Result<Response<PutBlobReply>, Status> {
         let req = request.into_inner();
         let kind = decode_kind(req.kind)?;
-        let id = decode_id(req.id)?;
+        validate_id(&req.id)?;
         self.backend
-            .put_blob(kind, &id, bytes::Bytes::from(req.bytes))
+            .put_blob(kind, &req.id, bytes::Bytes::from(req.bytes))
             .await
             .map_err(|e| Status::internal(format!("backend put_blob: {e:#}")))?;
         Ok(Response::new(PutBlobReply {}))
@@ -125,10 +130,10 @@ impl RemoteStoreServerTrait for RemoteStoreService {
     ) -> Result<Response<HasBlobReply>, Status> {
         let req = request.into_inner();
         let kind = decode_kind(req.kind)?;
-        let id = decode_id(req.id)?;
+        validate_id(&req.id)?;
         let found = self
             .backend
-            .has_blob(kind, &id)
+            .has_blob(kind, &req.id)
             .await
             .map_err(|e| Status::internal(format!("backend has_blob: {e:#}")))?;
         Ok(Response::new(HasBlobReply { found }))
@@ -213,8 +218,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    fn id_of(b: u8) -> Id {
-        Id([b; 32])
+    fn id_of(b: u8) -> Vec<u8> {
+        vec![b; 32]
     }
 
     fn service_with_tempdir() -> (tempfile::TempDir, RemoteStoreService) {
@@ -229,7 +234,7 @@ mod tests {
         let id = id_of(0x42);
         svc.put_blob(Request::new(PutBlobReq {
             kind: ProtoBlobKind::File as i32,
-            id: id.0.to_vec(),
+            id: id.clone(),
             bytes: b"server-side-hello".to_vec(),
         }))
         .await
@@ -238,7 +243,7 @@ mod tests {
         let resp = svc
             .get_blob(Request::new(GetBlobReq {
                 kind: ProtoBlobKind::File as i32,
-                id: id.0.to_vec(),
+                id: id.clone(),
             }))
             .await
             .expect("get_blob")
@@ -253,7 +258,7 @@ mod tests {
         let resp = svc
             .get_blob(Request::new(GetBlobReq {
                 kind: ProtoBlobKind::Tree as i32,
-                id: id_of(0).0.to_vec(),
+                id: id_of(0),
             }))
             .await
             .expect("get_blob")
@@ -268,7 +273,7 @@ mod tests {
         let err = svc
             .get_blob(Request::new(GetBlobReq {
                 kind: ProtoBlobKind::Unspecified as i32,
-                id: id_of(1).0.to_vec(),
+                id: id_of(1),
             }))
             .await
             .expect_err("unspecified kind must error");
@@ -276,15 +281,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_id_rejected() {
+    async fn empty_id_rejected() {
         let (_dir, svc) = service_with_tempdir();
         let err = svc
             .has_blob(Request::new(HasBlobReq {
                 kind: ProtoBlobKind::Tree as i32,
-                id: vec![0u8; 16], // wrong length
+                id: vec![], // empty
             }))
             .await
-            .expect_err("short id must error");
+            .expect_err("empty id must error");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
@@ -292,25 +297,31 @@ mod tests {
     async fn has_blob_tracks_state() {
         let (_dir, svc) = service_with_tempdir();
         let id = id_of(7);
-        let probe = || async {
-            svc.has_blob(Request::new(HasBlobReq {
+        let resp = svc
+            .has_blob(Request::new(HasBlobReq {
                 kind: ProtoBlobKind::Symlink as i32,
-                id: id.0.to_vec(),
+                id: id.clone(),
             }))
             .await
             .unwrap()
-            .into_inner()
-            .found
-        };
-        assert!(!probe().await);
+            .into_inner();
+        assert!(!resp.found);
         svc.put_blob(Request::new(PutBlobReq {
             kind: ProtoBlobKind::Symlink as i32,
-            id: id.0.to_vec(),
+            id: id.clone(),
             bytes: Bytes::from_static(b"x").to_vec(),
         }))
         .await
         .unwrap();
-        assert!(probe().await);
+        let resp = svc
+            .has_blob(Request::new(HasBlobReq {
+                kind: ProtoBlobKind::Symlink as i32,
+                id: id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.found);
     }
 
     // ---- M10: ref RPCs --------------------------------------------------

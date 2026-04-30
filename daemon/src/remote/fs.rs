@@ -23,7 +23,6 @@ use bytes::Bytes;
 use rand::Rng;
 
 use super::{validate_ref_name, BlobKind, CasOutcome, RemoteStore};
-use crate::ty::Id;
 
 /// Filesystem-backed blob CAS rooted at `root`.
 ///
@@ -44,8 +43,8 @@ impl FsRemoteStore {
         self.root.join(kind.as_str())
     }
 
-    fn blob_path(&self, kind: BlobKind, id: &Id) -> PathBuf {
-        self.kind_dir(kind).join(hex_id(id))
+    fn blob_path(&self, kind: BlobKind, id: &[u8]) -> PathBuf {
+        self.kind_dir(kind).join(hex_bytes(id))
     }
 
     /// Where refs live. `<root>/refs/`. The sentinel lockfile
@@ -112,12 +111,13 @@ impl Drop for RefsLock {
     }
 }
 
-/// Hex-encode a 32-byte id without pulling in a hex crate dep. Lower
-/// case, no separators, matches what the rest of the daemon prints in
-/// `tracing::info!` lines so blob paths are greppable.
-fn hex_id(id: &Id) -> String {
-    let mut s = String::with_capacity(64);
-    for b in id.0 {
+/// Hex-encode arbitrary bytes without pulling in a hex crate dep.
+/// Lower case, no separators, matches what the rest of the daemon
+/// prints in `tracing::info!` lines so blob paths are greppable.
+/// Works for both 32-byte BLAKE3 and 64-byte BLAKE2b-512 ids.
+fn hex_bytes(id: &[u8]) -> String {
+    let mut s = String::with_capacity(id.len() * 2);
+    for b in id {
         use std::fmt::Write;
         let _ = write!(&mut s, "{b:02x}");
     }
@@ -126,7 +126,7 @@ fn hex_id(id: &Id) -> String {
 
 #[async_trait]
 impl RemoteStore for FsRemoteStore {
-    async fn get_blob(&self, kind: BlobKind, id: &Id) -> Result<Option<Bytes>> {
+    async fn get_blob(&self, kind: BlobKind, id: &[u8]) -> Result<Option<Bytes>> {
         let path = self.blob_path(kind, id);
         // Sync I/O on a tokio task. The daemon serves a single FS-rooted
         // remote per mount and blobs are small (jj commits/trees);
@@ -143,9 +143,9 @@ impl RemoteStore for FsRemoteStore {
         Ok(bytes)
     }
 
-    async fn put_blob(&self, kind: BlobKind, id: &Id, bytes: Bytes) -> Result<()> {
+    async fn put_blob(&self, kind: BlobKind, id: &[u8], bytes: Bytes) -> Result<()> {
         let dir = self.kind_dir(kind);
-        let final_path = dir.join(hex_id(id));
+        let final_path = dir.join(hex_bytes(id));
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Idempotency fast path: if the bytes are already there,
             // skip the tmp+fsync+rename dance. Saves an inode churn
@@ -198,7 +198,7 @@ impl RemoteStore for FsRemoteStore {
         Ok(())
     }
 
-    async fn has_blob(&self, kind: BlobKind, id: &Id) -> Result<bool> {
+    async fn has_blob(&self, kind: BlobKind, id: &[u8]) -> Result<bool> {
         let path = self.blob_path(kind, id);
         let exists = tokio::task::spawn_blocking(move || -> Result<bool> {
             match fs::metadata(&path) {
@@ -359,8 +359,8 @@ impl RemoteStore for FsRemoteStore {
 mod tests {
     use super::*;
 
-    fn id_of(byte: u8) -> Id {
-        Id([byte; 32])
+    fn id_of(byte: u8) -> [u8; 32] {
+        [byte; 32]
     }
 
     fn make_store() -> (tempfile::TempDir, FsRemoteStore) {
@@ -444,17 +444,32 @@ mod tests {
             .await
             .expect("put creates root + kind dir");
         assert!(
-            root.join("file").join(hex_id(&id)).exists(),
+            root.join("file").join(hex_bytes(&id)).exists(),
             "blob should be at <root>/<kind>/<hex>"
         );
     }
 
     #[test]
-    fn hex_id_round_trip_format() {
-        let id = Id([0; 32]);
-        assert_eq!(hex_id(&id).len(), 64);
-        let id = Id([0xab; 32]);
-        assert!(hex_id(&id).chars().all(|c| c == 'a' || c == 'b'));
+    fn hex_bytes_round_trip_format() {
+        let id = [0u8; 32];
+        assert_eq!(hex_bytes(&id).len(), 64);
+        let id = [0xab; 32];
+        assert!(hex_bytes(&id).chars().all(|c| c == 'a' || c == 'b'));
+    }
+
+    // M10.6: 64-byte ids round-trip through the blob CAS.
+    #[tokio::test]
+    async fn put_then_get_64_byte_id_view() {
+        let (_dir, s) = make_store();
+        let id = [0xcd; 64];
+        let data = Bytes::from_static(b"view-data");
+        s.put_blob(BlobKind::View, &id, data.clone()).await.unwrap();
+        let got = s.get_blob(BlobKind::View, &id).await.unwrap();
+        assert_eq!(got.as_deref(), Some(data.as_ref()));
+        // has_blob agrees.
+        assert!(s.has_blob(BlobKind::View, &id).await.unwrap());
+        // Different kind, same id bytes: distinct keyspace.
+        assert!(!s.has_blob(BlobKind::Operation, &id).await.unwrap());
     }
 
     // ---- M10: ref methods ----------------------------------------------
