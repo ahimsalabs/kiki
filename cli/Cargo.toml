@@ -19,6 +19,7 @@ tracing.workspace = true
 itertools.workspace = true
 clap.workspace = true
 futures.workspace = true
+pollster.workspace = true
 
 [[test]]
 name = "runner"

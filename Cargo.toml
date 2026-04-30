@@ -36,6 +36,7 @@ libc = "0.2"
 jj-lib-proc-macros = {version = "0.40", default-features = true}
 nfsserve = "0.10"
 parking_lot = "0.12.3"
+pollster = "0.4"
 prost = "0.12"
 proto = { path = "./proto" }
 rand = "0.8.5"

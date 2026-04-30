@@ -228,4 +228,54 @@ impl BlockingJujutsuInterfaceClient {
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.list_catalog_refs(request))
     }
+
+    // ---- M10.6: op-store RPCs -----------------------------------------
+    //
+    // The daemon stores/forwards opaque bytes; serialization and content
+    // hashing happen on the CLI side (YakOpStore in op_store.rs).
+
+    pub fn write_view(
+        &self,
+        request: impl tonic::IntoRequest<WriteViewReq>,
+    ) -> Result<tonic::Response<WriteViewReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.write_view(request))
+    }
+
+    pub fn read_view(
+        &self,
+        request: impl tonic::IntoRequest<ReadViewReq>,
+    ) -> Result<tonic::Response<ReadViewReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.read_view(request))
+    }
+
+    pub fn write_operation(
+        &self,
+        request: impl tonic::IntoRequest<WriteOperationReq>,
+    ) -> Result<tonic::Response<WriteOperationReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.write_operation(request))
+    }
+
+    pub fn read_operation(
+        &self,
+        request: impl tonic::IntoRequest<ReadOperationReq>,
+    ) -> Result<tonic::Response<ReadOperationReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.read_operation(request))
+    }
+
+    pub fn resolve_operation_id_prefix(
+        &self,
+        request: impl tonic::IntoRequest<ResolveOperationIdPrefixReq>,
+    ) -> Result<tonic::Response<ResolveOperationIdPrefixReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.resolve_operation_id_prefix(request))
+    }
 }

@@ -535,6 +535,7 @@ dependencies = [
  "itertools 0.12.1",
  "jj-cli",
  "jj-lib",
+ "pollster",
  "prost 0.12.6",
  "proto",
  "rand 0.8.5",

@@ -16,6 +16,7 @@ use jj_lib::{
 mod backend;
 mod blocking_client;
 mod op_heads_store;
+mod op_store;
 mod working_copy;
 
 use backend::YakBackend;
@@ -93,6 +94,24 @@ fn create_store_factories() -> StoreFactories {
             let client = connect_daemon(settings)
                 .map_err(jj_lib::backend::BackendLoadError)?;
             Ok(Box::new(YakOpHeadsStore::new(client, working_copy_path)))
+        }),
+    );
+    // M10.6: register the YakOpStore factory so subsequent loads
+    // pick up the daemon-routed impl. The `store_path` is
+    // `<wc>/.jj/repo/op_store/`; climb 3 levels to recover `<wc>`.
+    store_factories.add_op_store(
+        op_store::YakOpStore::name(),
+        Box::new(|settings, store_path, root_data| {
+            let working_copy_path = climb_to_workspace(store_path)
+                .map_err(|e| jj_lib::backend::BackendLoadError(e.into()))?;
+            let client = connect_daemon(settings)
+                .map_err(jj_lib::backend::BackendLoadError)?;
+            Ok(Box::new(op_store::YakOpStore::load(
+                store_path,
+                root_data,
+                client,
+                working_copy_path,
+            )))
         }),
     );
     store_factories
@@ -234,6 +253,30 @@ async fn run_yak_command(
                 )))
             };
 
+            // M10.6: replace the default `OpStore` initializer with
+            // one that constructs a `YakOpStore` routing through the
+            // daemon (write-through to remote, read-through on miss).
+            let wc_path_for_op_store = wc_path_str.to_string();
+            let yak_op_store_initializer = move |settings: &jj_lib::settings::UserSettings,
+                                                 store_path: &std::path::Path,
+                                                 root_data: jj_lib::op_store::RootOperationData|
+                  -> Result<
+                Box<dyn jj_lib::op_store::OpStore>,
+                jj_lib::backend::BackendInitError,
+            > {
+                let client = connect_daemon(settings).map_err(|e| {
+                    jj_lib::backend::BackendInitError(e.to_string().into())
+                })?;
+                let store = op_store::YakOpStore::init(
+                    store_path,
+                    root_data,
+                    client,
+                    wc_path_for_op_store.clone(),
+                )
+                .map_err(|e| jj_lib::backend::BackendInitError(e.into()))?;
+                Ok(Box::new(store))
+            };
+
             Workspace::init_with_factories(
                 command_helper.settings(),
                 &wc_path,
@@ -243,7 +286,7 @@ async fn run_yak_command(
                 },
                 Signer::from_settings(command_helper.settings())
                     .map_err(WorkspaceInitError::SignInit)?,
-                ReadonlyRepo::default_op_store_initializer(),
+                &yak_op_store_initializer,
                 &yak_op_heads_initializer,
                 ReadonlyRepo::default_index_store_initializer(),
                 ReadonlyRepo::default_submodule_store_initializer(),
