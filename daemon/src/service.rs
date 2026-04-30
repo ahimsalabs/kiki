@@ -1100,43 +1100,175 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         Ok(Response::new(commit.as_proto()))
     }
 
-    // ---- M10.6: op-store RPCs (stubs, real handlers in next commit) ----
+    // ---- M10.6: op-store RPCs ----------------------------------------
+    //
+    // The daemon stores and forwards opaque bytes; serialization and
+    // content-hashing happen on the CLI side (YakOpStore). Write-
+    // through pushes to the remote inline; read-through falls back to
+    // the remote on local miss (same shape as the blob handlers above).
 
+    #[tracing::instrument(skip(self))]
     async fn write_view(
         &self,
-        _request: Request<WriteViewReq>,
+        request: Request<WriteViewReq>,
     ) -> Result<Response<WriteViewReply>, Status> {
-        Err(Status::unimplemented("WriteView: M10.6 in progress"))
+        let req = request.into_inner();
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        if req.view_id.is_empty() {
+            return Err(Status::invalid_argument("view_id must not be empty"));
+        }
+        store
+            .write_view_bytes(&req.view_id, &req.data)
+            .map_err(store_status("write_view"))?;
+        if let Some(remote) = remote {
+            remote
+                .put_blob(BlobKind::View, &req.view_id, Bytes::from(req.data))
+                .await
+                .map_err(remote_status("remote put_blob (view)"))?;
+        }
+        Ok(Response::new(WriteViewReply {}))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn read_view(
         &self,
-        _request: Request<ReadViewReq>,
+        request: Request<ReadViewReq>,
     ) -> Result<Response<ReadViewReply>, Status> {
-        Err(Status::unimplemented("ReadView: M10.6 in progress"))
+        let req = request.into_inner();
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        if req.view_id.is_empty() {
+            return Err(Status::invalid_argument("view_id must not be empty"));
+        }
+        // Local hit.
+        if let Some(bytes) = store
+            .get_view_bytes(&req.view_id)
+            .map_err(store_status("get_view"))?
+        {
+            return Ok(Response::new(ReadViewReply {
+                found: true,
+                data: bytes.to_vec(),
+            }));
+        }
+        // Read-through from remote.
+        if let Some(remote) = remote {
+            if let Some(bytes) = remote
+                .get_blob(BlobKind::View, &req.view_id)
+                .await
+                .map_err(remote_status("remote get_blob (view)"))?
+            {
+                // Populate local cache.
+                store
+                    .write_view_bytes(&req.view_id, &bytes)
+                    .map_err(store_status("cache write_view"))?;
+                return Ok(Response::new(ReadViewReply {
+                    found: true,
+                    data: bytes.to_vec(),
+                }));
+            }
+        }
+        Ok(Response::new(ReadViewReply {
+            found: false,
+            data: Vec::new(),
+        }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn write_operation(
         &self,
-        _request: Request<WriteOperationReq>,
+        request: Request<WriteOperationReq>,
     ) -> Result<Response<WriteOperationReply>, Status> {
-        Err(Status::unimplemented("WriteOperation: M10.6 in progress"))
+        let req = request.into_inner();
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        if req.operation_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "operation_id must not be empty",
+            ));
+        }
+        store
+            .write_operation_bytes(&req.operation_id, &req.data)
+            .map_err(store_status("write_operation"))?;
+        if let Some(remote) = remote {
+            remote
+                .put_blob(
+                    BlobKind::Operation,
+                    &req.operation_id,
+                    Bytes::from(req.data),
+                )
+                .await
+                .map_err(remote_status("remote put_blob (operation)"))?;
+        }
+        Ok(Response::new(WriteOperationReply {}))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn read_operation(
         &self,
-        _request: Request<ReadOperationReq>,
+        request: Request<ReadOperationReq>,
     ) -> Result<Response<ReadOperationReply>, Status> {
-        Err(Status::unimplemented("ReadOperation: M10.6 in progress"))
+        let req = request.into_inner();
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        if req.operation_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "operation_id must not be empty",
+            ));
+        }
+        // Local hit.
+        if let Some(bytes) = store
+            .get_operation_bytes(&req.operation_id)
+            .map_err(store_status("get_operation"))?
+        {
+            return Ok(Response::new(ReadOperationReply {
+                found: true,
+                data: bytes.to_vec(),
+            }));
+        }
+        // Read-through from remote.
+        if let Some(remote) = remote {
+            if let Some(bytes) = remote
+                .get_blob(BlobKind::Operation, &req.operation_id)
+                .await
+                .map_err(remote_status("remote get_blob (operation)"))?
+            {
+                store
+                    .write_operation_bytes(&req.operation_id, &bytes)
+                    .map_err(store_status("cache write_operation"))?;
+                return Ok(Response::new(ReadOperationReply {
+                    found: true,
+                    data: bytes.to_vec(),
+                }));
+            }
+        }
+        Ok(Response::new(ReadOperationReply {
+            found: false,
+            data: Vec::new(),
+        }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn resolve_operation_id_prefix(
         &self,
-        _request: Request<ResolveOperationIdPrefixReq>,
+        request: Request<ResolveOperationIdPrefixReq>,
     ) -> Result<Response<ResolveOperationIdPrefixReply>, Status> {
-        Err(Status::unimplemented(
-            "ResolveOperationIdPrefix: M10.6 in progress",
-        ))
+        let req = request.into_inner();
+        let (store, _remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let result = store
+            .operation_ids_matching_prefix(&req.hex_prefix)
+            .map_err(store_status("operation_ids_matching_prefix"))?;
+        use crate::store::OpPrefixResult;
+        Ok(Response::new(match result {
+            OpPrefixResult::None => ResolveOperationIdPrefixReply {
+                resolution: 0,
+                full_id: Vec::new(),
+            },
+            OpPrefixResult::Single(id) => ResolveOperationIdPrefixReply {
+                resolution: 1,
+                full_id: id,
+            },
+            OpPrefixResult::Ambiguous => ResolveOperationIdPrefixReply {
+                resolution: 2,
+                full_id: Vec::new(),
+            },
+        }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -2631,5 +2763,175 @@ mod tests {
             .await
             .expect_err("must error");
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    // ---- M10.6: op-store RPCs -----------------------------------------
+
+    #[tokio::test]
+    async fn write_view_pushes_to_dir_remote() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let svc = JujutsuService::bare();
+        let path = "/tmp/m106a".to_string();
+        init_mount_with_remote(
+            &svc,
+            &path,
+            &format!("dir://{}", remote_dir.path().display()),
+        )
+        .await;
+
+        let view_id = vec![0xab; 64];
+        let view_data = b"view-proto-bytes".to_vec();
+        svc.write_view(Request::new(WriteViewReq {
+            working_copy_path: path.clone(),
+            view_id: view_id.clone(),
+            data: view_data.clone(),
+        }))
+        .await
+        .expect("write_view");
+
+        // Confirm blob landed on the remote.
+        let mut hex = String::with_capacity(128);
+        for b in &view_id {
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{b:02x}");
+        }
+        let blob_path = remote_dir.path().join("view").join(&hex);
+        let remote_bytes = std::fs::read(&blob_path).expect("view blob on remote");
+        assert_eq!(remote_bytes, view_data);
+    }
+
+    #[tokio::test]
+    async fn read_view_falls_back_to_remote_on_local_miss() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+
+        // Service A writes a view.
+        let svc_a = JujutsuService::bare();
+        init_mount_with_remote(&svc_a, "/tmp/m106b_a", &remote_url).await;
+        let view_id = vec![0xcd; 64];
+        let view_data = b"shared-view".to_vec();
+        svc_a
+            .write_view(Request::new(WriteViewReq {
+                working_copy_path: "/tmp/m106b_a".into(),
+                view_id: view_id.clone(),
+                data: view_data.clone(),
+            }))
+            .await
+            .expect("write_view");
+
+        // Service B's local store is empty — read should fall through
+        // to the shared remote.
+        let svc_b = JujutsuService::bare();
+        init_mount_with_remote(&svc_b, "/tmp/m106b_b", &remote_url).await;
+        let got = svc_b
+            .read_view(Request::new(ReadViewReq {
+                working_copy_path: "/tmp/m106b_b".into(),
+                view_id: view_id.clone(),
+            }))
+            .await
+            .expect("read_view via remote")
+            .into_inner();
+        assert!(got.found);
+        assert_eq!(got.data, view_data);
+
+        // Confirm local cache was populated.
+        let (store_b, _) = mount_handles(&svc_b.mounts, "/tmp/m106b_b")
+            .await
+            .unwrap();
+        let cached = store_b
+            .get_view_bytes(&view_id)
+            .expect("get_view (after read-through)");
+        assert!(cached.is_some(), "read-through should populate local cache");
+    }
+
+    #[tokio::test]
+    async fn read_view_no_remote_miss_returns_not_found() {
+        let svc = JujutsuService::bare();
+        init_mount(&svc, "/tmp/m106c").await;
+        let got = svc
+            .read_view(Request::new(ReadViewReq {
+                working_copy_path: "/tmp/m106c".into(),
+                view_id: vec![0xee; 64],
+            }))
+            .await
+            .expect("read_view (miss)")
+            .into_inner();
+        assert!(!got.found);
+    }
+
+    #[tokio::test]
+    async fn write_operation_pushes_and_read_through_works() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+
+        // A writes an operation.
+        let svc_a = JujutsuService::bare();
+        init_mount_with_remote(&svc_a, "/tmp/m106d_a", &remote_url).await;
+        let op_id = vec![0x11; 64];
+        let op_data = b"operation-bytes".to_vec();
+        svc_a
+            .write_operation(Request::new(WriteOperationReq {
+                working_copy_path: "/tmp/m106d_a".into(),
+                operation_id: op_id.clone(),
+                data: op_data.clone(),
+            }))
+            .await
+            .expect("write_operation");
+
+        // B reads it through the remote.
+        let svc_b = JujutsuService::bare();
+        init_mount_with_remote(&svc_b, "/tmp/m106d_b", &remote_url).await;
+        let got = svc_b
+            .read_operation(Request::new(ReadOperationReq {
+                working_copy_path: "/tmp/m106d_b".into(),
+                operation_id: op_id.clone(),
+            }))
+            .await
+            .expect("read_operation via remote")
+            .into_inner();
+        assert!(got.found);
+        assert_eq!(got.data, op_data);
+    }
+
+    #[tokio::test]
+    async fn resolve_operation_id_prefix_works() {
+        let svc = JujutsuService::bare();
+        init_mount(&svc, "/tmp/m106e").await;
+
+        let op_id = vec![0xab; 64];
+        svc.write_operation(Request::new(WriteOperationReq {
+            working_copy_path: "/tmp/m106e".into(),
+            operation_id: op_id.clone(),
+            data: b"op-data".to_vec(),
+        }))
+        .await
+        .expect("write_operation");
+
+        // Prefix "abab" should match.
+        let got = svc
+            .resolve_operation_id_prefix(Request::new(
+                ResolveOperationIdPrefixReq {
+                    working_copy_path: "/tmp/m106e".into(),
+                    hex_prefix: "abab".into(),
+                },
+            ))
+            .await
+            .expect("resolve prefix")
+            .into_inner();
+        assert_eq!(got.resolution, 1); // single match
+        assert_eq!(got.full_id, op_id);
+
+        // Bogus prefix should not match.
+        let got = svc
+            .resolve_operation_id_prefix(Request::new(
+                ResolveOperationIdPrefixReq {
+                    working_copy_path: "/tmp/m106e".into(),
+                    hex_prefix: "ff00".into(),
+                },
+            ))
+            .await
+            .expect("resolve prefix (miss)")
+            .into_inner();
+        assert_eq!(got.resolution, 0); // no match
     }
 }

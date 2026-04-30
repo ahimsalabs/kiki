@@ -20,6 +20,31 @@ const COMMITS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("commits
 const FILES: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("files_v1");
 const SYMLINKS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("symlinks_v1");
 const TREES: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("trees_v1");
+// M10.6: op-store tables. Variable-length keys (&[u8]) because
+// jj-lib's OperationId/ViewId use 64-byte BLAKE2b-512 hashes (not
+// the 32-byte BLAKE3 used for tree/file/symlink/commit). The daemon
+// stores and forwards opaque bytes; it never decodes op-store data.
+const VIEWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("views_v1");
+const OPERATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("operations_v1");
+
+/// Result of a prefix scan against the operations table.
+/// Same shape as jj-lib's `PrefixResolution`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OpPrefixResult {
+    None,
+    Single(Vec<u8>),
+    Ambiguous,
+}
+
+/// Hex-encode arbitrary bytes. Used by prefix-match scanning.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
 
 /// Stores mount-agnostic information like Trees or Commits. Unaware of
 /// filesystem information.
@@ -80,6 +105,10 @@ impl Store {
                 .open_table(SYMLINKS)
                 .context("open symlinks table")?;
             let mut trees = txn.open_table(TREES).context("open trees table")?;
+            let mut views = txn.open_table(VIEWS).context("open views table")?;
+            let mut operations = txn
+                .open_table(OPERATIONS)
+                .context("open operations table")?;
             if trees
                 .get(&empty_tree_id.0)
                 .context("read empty tree")?
@@ -91,7 +120,7 @@ impl Store {
             }
             // Suppress "unused" warnings — the open_table calls above have
             // the side effect of materializing each table.
-            let _ = (&mut commits, &mut files, &mut symlinks);
+            let _ = (&mut commits, &mut files, &mut symlinks, &mut views, &mut operations);
         }
         txn.commit().context("redb commit (seed empty tree)")?;
 
@@ -210,6 +239,78 @@ impl Store {
         let bytes: Bytes = commit.as_proto().encode_to_vec().into();
         self.write_value(COMMITS, hash, &bytes)?;
         Ok((hash, bytes))
+    }
+
+    // ---- M10.6: op-store tables (raw bytes, variable-length keys) ----
+
+    /// Read a view blob by its raw id bytes.
+    pub fn get_view_bytes(&self, id: &[u8]) -> Result<Option<Bytes>> {
+        self.read_raw_varkey(VIEWS, id)
+    }
+
+    /// Write a view blob at the caller-provided id.
+    pub fn write_view_bytes(&self, id: &[u8], bytes: &[u8]) -> Result<()> {
+        self.write_raw_varkey(VIEWS, id, bytes)
+    }
+
+    /// Read an operation blob by its raw id bytes.
+    pub fn get_operation_bytes(&self, id: &[u8]) -> Result<Option<Bytes>> {
+        self.read_raw_varkey(OPERATIONS, id)
+    }
+
+    /// Write an operation blob at the caller-provided id.
+    pub fn write_operation_bytes(&self, id: &[u8], bytes: &[u8]) -> Result<()> {
+        self.write_raw_varkey(OPERATIONS, id, bytes)
+    }
+
+    /// Prefix scan over the operations table. Returns `NoMatch`,
+    /// `SingleMatch(full_id)`, or `AmbiguousMatch` — same shape as
+    /// jj-lib's `PrefixResolution`.
+    pub fn operation_ids_matching_prefix(&self, hex_prefix: &str) -> Result<OpPrefixResult> {
+        let txn = self.db.begin_read().context("redb begin_read")?;
+        let tbl = txn.open_table(OPERATIONS).context("open operations table")?;
+        let mut matched: Option<Vec<u8>> = None;
+        for entry in tbl.iter().context("iterate operations table")? {
+            let (key, _value) = entry.context("operations table entry")?;
+            let key_bytes = key.value();
+            let key_hex = hex_encode(key_bytes);
+            if key_hex.starts_with(hex_prefix) {
+                if matched.is_some() {
+                    return Ok(OpPrefixResult::Ambiguous);
+                }
+                matched = Some(key_bytes.to_vec());
+            }
+        }
+        Ok(match matched {
+            Some(id) => OpPrefixResult::Single(id),
+            None => OpPrefixResult::None,
+        })
+    }
+
+    fn read_raw_varkey(
+        &self,
+        table: TableDefinition<'_, &'static [u8], &'static [u8]>,
+        id: &[u8],
+    ) -> Result<Option<Bytes>> {
+        let txn = self.db.begin_read().context("redb begin_read")?;
+        let tbl = txn.open_table(table).context("open table for read")?;
+        let raw = tbl.get(id).context("redb get")?;
+        Ok(raw.map(|slot| Bytes::copy_from_slice(slot.value())))
+    }
+
+    fn write_raw_varkey(
+        &self,
+        table: TableDefinition<'_, &'static [u8], &'static [u8]>,
+        id: &[u8],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let txn = self.db.begin_write().context("redb begin_write")?;
+        {
+            let mut tbl = txn.open_table(table).context("open table for write")?;
+            tbl.insert(id, bytes).context("redb insert")?;
+        }
+        txn.commit().context("redb commit")?;
+        Ok(())
     }
 
     fn read_value<T>(
@@ -340,6 +441,91 @@ mod tests {
         let bogus = Id([0xff; 32]);
         let got = store.get_tree(bogus).expect("get_tree (missing)");
         assert!(got.is_none(), "non-existent tree should be None");
+    }
+
+    // ---- M10.6: op-store table tests ----
+
+    #[test]
+    fn view_write_then_read_round_trips() {
+        let store = Store::new_in_memory();
+        let id = [0xab; 64]; // 64-byte BLAKE2b-512 id
+        let data = b"view-proto-bytes";
+        store.write_view_bytes(&id, data).expect("write_view");
+        let got = store
+            .get_view_bytes(&id)
+            .expect("get_view")
+            .expect("view present");
+        assert_eq!(got.as_ref(), data);
+    }
+
+    #[test]
+    fn operation_write_then_read_round_trips() {
+        let store = Store::new_in_memory();
+        let id = [0xcd; 64];
+        let data = b"operation-proto-bytes";
+        store.write_operation_bytes(&id, data).expect("write_op");
+        let got = store
+            .get_operation_bytes(&id)
+            .expect("get_op")
+            .expect("op present");
+        assert_eq!(got.as_ref(), data);
+    }
+
+    #[test]
+    fn missing_view_returns_none() {
+        let store = Store::new_in_memory();
+        let bogus = [0xff; 64];
+        let got = store.get_view_bytes(&bogus).expect("get_view (missing)");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn operation_prefix_no_match() {
+        let store = Store::new_in_memory();
+        let result = store
+            .operation_ids_matching_prefix("deadbeef")
+            .expect("prefix scan");
+        assert_eq!(result, OpPrefixResult::None);
+    }
+
+    #[test]
+    fn operation_prefix_single_match() {
+        let store = Store::new_in_memory();
+        let id = [0xab; 64];
+        store.write_operation_bytes(&id, b"data").expect("write");
+        // Full hex of [0xab; 64] starts with "abab..."
+        let result = store
+            .operation_ids_matching_prefix("abab")
+            .expect("prefix scan");
+        assert_eq!(result, OpPrefixResult::Single(id.to_vec()));
+    }
+
+    #[test]
+    fn operation_prefix_ambiguous_match() {
+        let store = Store::new_in_memory();
+        let mut id1 = [0xab; 64];
+        let mut id2 = [0xab; 64];
+        // Make them differ only in the last byte so "abab" prefix matches both
+        id1[63] = 0x01;
+        id2[63] = 0x02;
+        store.write_operation_bytes(&id1, b"op1").expect("write");
+        store.write_operation_bytes(&id2, b"op2").expect("write");
+        let result = store
+            .operation_ids_matching_prefix("abab")
+            .expect("prefix scan");
+        assert_eq!(result, OpPrefixResult::Ambiguous);
+    }
+
+    #[test]
+    fn operation_prefix_full_length_match() {
+        let store = Store::new_in_memory();
+        let id = [0xcd; 64];
+        store.write_operation_bytes(&id, b"data").expect("write");
+        let full_hex = hex_encode(&id);
+        let result = store
+            .operation_ids_matching_prefix(&full_hex)
+            .expect("prefix scan");
+        assert_eq!(result, OpPrefixResult::Single(id.to_vec()));
     }
 
     #[test]
