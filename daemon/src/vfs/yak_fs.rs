@@ -1287,6 +1287,14 @@ impl JjYakFs for YakFs {
             // invariants are broken.
             return Err(FsError::AlreadyExists);
         }
+        // Update the child's parent/name so that subsequent
+        // `ensure_dirty_tree` ancestor-walks propagate through the
+        // *new* parent chain. Without this, writes to the renamed
+        // file after a snapshot would dirty the old parent's
+        // ancestors instead of the new parent's, and snapshot would
+        // miss the modification.
+        self.slab
+            .reparent(src_inode_id, new_parent, new_name.to_owned());
         Ok(())
     }
 
@@ -1984,5 +1992,598 @@ mod tests {
             }
             other => panic!("expected clean File after snapshot, got {other:?}"),
         }
+    }
+
+    // ----- Regression tests for e2e bugs (2026-05-01) ----------------------
+
+    /// Regression test for Bug 2: ancestor-dirty propagation.
+    ///
+    /// After `snapshot` cleans the tree, a subsequent write deep in the
+    /// tree must dirty all ancestor directories so the next `snapshot`
+    /// can discover the mutation. Before the fix, `snapshot` would
+    /// short-circuit on the clean root and return the stale tree id.
+    #[tokio::test]
+    async fn write_after_snapshot_deep_in_tree_is_visible() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        // Build /dir/subdir/file with initial content.
+        let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
+        let (subdir_ino, _) = fs.mkdir(dir_ino, "subdir").await.unwrap();
+        let (file_ino, _) = fs
+            .create_file(subdir_ino, "file", false)
+            .await
+            .unwrap();
+        fs.write(file_ino, 0, b"original").await.unwrap();
+
+        // First snapshot — cleans the entire tree.
+        let snap1 = fs.snapshot().await.unwrap();
+        assert_ne!(snap1, store.get_empty_tree_id());
+
+        // Modify the deep file after snapshot has cleaned everything.
+        // This is the exact scenario Bug 2 broke: the root is clean
+        // Tree, and the write needs to dirty root → dir → subdir.
+        fs.write(file_ino, 0, b"modified").await.unwrap();
+
+        // Second snapshot must pick up the modification.
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1, "snapshot must detect the deep write");
+
+        // Walk the tree to verify the content is "modified".
+        let root_tree = store.read_tree(snap2);
+        let dir_entry = root_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "dir")
+            .expect("dir entry");
+        let dir_id = match &dir_entry.entry {
+            TreeEntry::TreeId(id) => *id,
+            other => panic!("expected TreeId, got {other:?}"),
+        };
+        let dir_tree = store.read_tree(dir_id);
+        let subdir_entry = dir_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "subdir")
+            .expect("subdir entry");
+        let subdir_id = match &subdir_entry.entry {
+            TreeEntry::TreeId(id) => *id,
+            other => panic!("expected TreeId, got {other:?}"),
+        };
+        let subdir_tree = store.read_tree(subdir_id);
+        let file_entry = subdir_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "file")
+            .expect("file entry");
+        let file_id = match &file_entry.entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        let f = store.read_file(file_id);
+        assert_eq!(f.content, b"modified");
+    }
+
+    /// Regression test for Bug 2 (variant): `remove` after snapshot.
+    ///
+    /// Same root cause — `remove` calls `ensure_dirty_tree` on the
+    /// parent, which must propagate up to all ancestors. Without
+    /// propagation, the removal is invisible to the next snapshot.
+    #[tokio::test]
+    async fn remove_after_snapshot_deep_in_tree_is_visible() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
+        let (file_ino, _) = fs.create_file(dir_ino, "inner", false).await.unwrap();
+        fs.write(file_ino, 0, b"data").await.unwrap();
+
+        let snap1 = fs.snapshot().await.unwrap();
+
+        // Remove the file after snapshot cleaned everything.
+        fs.remove(dir_ino, "inner").await.unwrap();
+
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1, "snapshot must detect the removal");
+
+        // The dir tree should now be empty.
+        let root_tree = store.read_tree(snap2);
+        let dir_entry = root_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "dir")
+            .expect("dir entry");
+        let dir_id = match &dir_entry.entry {
+            TreeEntry::TreeId(id) => *id,
+            other => panic!("expected TreeId, got {other:?}"),
+        };
+        let dir_tree = store.read_tree(dir_id);
+        assert!(
+            dir_tree.entries.is_empty(),
+            "dir should be empty after removing its only child"
+        );
+    }
+
+    /// Regression test for Bug 2 (variant): `setattr` (truncate) after
+    /// snapshot must also propagate dirty state to ancestors.
+    #[tokio::test]
+    async fn setattr_after_snapshot_is_visible() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
+        let (file_ino, _) = fs.create_file(dir_ino, "f", false).await.unwrap();
+        fs.write(file_ino, 0, b"hello").await.unwrap();
+
+        let snap1 = fs.snapshot().await.unwrap();
+
+        // Truncate the file after snapshot.
+        fs.setattr(file_ino, Some(0), None).await.unwrap();
+
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1, "snapshot must detect the truncation");
+
+        // Verify the file is now empty.
+        let root_tree = store.read_tree(snap2);
+        let dir_entry = root_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "dir")
+            .expect("dir entry");
+        let dir_id = match &dir_entry.entry {
+            TreeEntry::TreeId(id) => *id,
+            other => panic!("expected TreeId, got {other:?}"),
+        };
+        let dir_tree = store.read_tree(dir_id);
+        let file_entry = dir_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "f")
+            .expect("file entry");
+        let file_id = match &file_entry.entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        let f = store.read_file(file_id);
+        assert!(f.content.is_empty());
+    }
+
+    /// Regression test for Bug 3: writing to a child of an existing
+    /// (store-backed) tree, then snapshotting, must capture the write.
+    ///
+    /// The write calls `ensure_dirty_file(ino)` (promoting the clean
+    /// `File` to `DirtyFile`) and then `ensure_dirty_tree(parent)`
+    /// (materializing the parent). Before the fix, materialization
+    /// would refresh *all* existing children from the store, clobbering
+    /// the just-promoted DirtyFile with its clean predecessor.
+    #[tokio::test]
+    async fn write_to_existing_tree_child_survives_materialization() {
+        let (store, root_id) = build_synthetic_tree();
+        let fs = YakFs::new(store.clone(), root_id, None);
+
+        // Look up the existing "hello.txt" (clean File from the store).
+        let hello_ino = fs.lookup(fs.root(), "hello.txt").await.unwrap();
+
+        // Write new content. Internally this does:
+        //   ensure_dirty_file(hello_ino) → DirtyFile
+        //   ensure_dirty_tree(root)      → materialize root
+        // Before the fix, materializing root would overwrite hello_ino
+        // back to its clean File variant.
+        fs.write(hello_ino, 0, b"new content").await.unwrap();
+
+        // Read back — must see the new content, not the original "hi\n".
+        let (data, _) = fs.read(hello_ino, 0, 1024).await.unwrap();
+        assert_eq!(data, b"new content");
+
+        // Snapshot must capture the modified content.
+        let snap = fs.snapshot().await.unwrap();
+        assert_ne!(snap, root_id);
+        let root_tree = store.read_tree(snap);
+        let entry = root_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "hello.txt")
+            .expect("hello.txt entry");
+        let file_id = match &entry.entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        let f = store.read_file(file_id);
+        assert_eq!(f.content, b"new content");
+    }
+
+    // ----- Editor atomic-save pattern test ---------------------------------
+
+    /// Editors typically save via write(tmp) → rename(tmp, real). This
+    /// exercises that pattern: create "foo.rs" with original content,
+    /// snapshot, then simulate an editor save by writing to "foo.rs.tmp"
+    /// and renaming over "foo.rs". The final snapshot must contain only
+    /// "foo.rs" with the new content.
+    #[tokio::test]
+    async fn rename_atomic_save_pattern() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        // Original file.
+        let (orig_ino, _) = fs.create_file(fs.root(), "foo.rs", false).await.unwrap();
+        fs.write(orig_ino, 0, b"fn main() {}").await.unwrap();
+        let snap1 = fs.snapshot().await.unwrap();
+
+        // Editor writes to a tmp file.
+        let (tmp_ino, _) = fs
+            .create_file(fs.root(), "foo.rs.tmp", false)
+            .await
+            .unwrap();
+        fs.write(tmp_ino, 0, b"fn main() { println!(\"hello\"); }")
+            .await
+            .unwrap();
+
+        // Atomic rename: foo.rs.tmp → foo.rs (overwrites original).
+        fs.rename(fs.root(), "foo.rs.tmp", fs.root(), "foo.rs")
+            .await
+            .unwrap();
+
+        // "foo.rs.tmp" should be gone.
+        let err = fs.lookup(fs.root(), "foo.rs.tmp").await.unwrap_err();
+        assert_eq!(err, FsError::NotFound);
+
+        // "foo.rs" should have the new content.
+        let new_ino = fs.lookup(fs.root(), "foo.rs").await.unwrap();
+        let (data, _) = fs.read(new_ino, 0, 4096).await.unwrap();
+        assert_eq!(data, b"fn main() { println!(\"hello\"); }");
+
+        // Snapshot captures the rename.
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1);
+        let tree = store.read_tree(snap2);
+        // Only "foo.rs" should be present (no "foo.rs.tmp").
+        let names: Vec<&str> = tree.entries.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["foo.rs"]);
+        let file_id = match &tree.entries[0].entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        let f = store.read_file(file_id);
+        assert_eq!(f.content, b"fn main() { println!(\"hello\"); }");
+    }
+
+    /// Bug: rename doesn't update the child inode's `parent` pointer.
+    ///
+    /// After renaming `/a/file` to `/b/file`, the file's `Inode.parent`
+    /// still points at `/a/`. A subsequent write after snapshot dirties
+    /// the wrong ancestor chain (through `/a/` instead of `/b/`), so
+    /// snapshot misses the modification.
+    #[tokio::test]
+    async fn write_to_cross_dir_renamed_file_after_snapshot() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        // Create /a/file and /b/.
+        let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
+        let (b_ino, _) = fs.mkdir(fs.root(), "b").await.unwrap();
+        let (file_ino, _) = fs.create_file(a_ino, "file", false).await.unwrap();
+        fs.write(file_ino, 0, b"v1").await.unwrap();
+
+        // Snapshot — cleans everything.
+        let snap1 = fs.snapshot().await.unwrap();
+
+        // Rename /a/file → /b/file.
+        fs.rename(a_ino, "file", b_ino, "file").await.unwrap();
+
+        // Snapshot — captures the rename.
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1);
+
+        // Now write to the renamed file. This is the bug trigger:
+        // write() reads inode.parent to dirty ancestors. If parent
+        // still points at /a/ (stale), the dirty propagation goes
+        // up through /a/ instead of /b/, and /b/ stays clean.
+        fs.write(file_ino, 0, b"v2").await.unwrap();
+
+        let snap3 = fs.snapshot().await.unwrap();
+        assert_ne!(snap3, snap2, "snapshot must detect write to renamed file");
+
+        // Verify /b/file has "v2".
+        let root_tree = store.read_tree(snap3);
+        let b_entry = root_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "b")
+            .expect("b entry");
+        let b_id = match &b_entry.entry {
+            TreeEntry::TreeId(id) => *id,
+            other => panic!("expected TreeId, got {other:?}"),
+        };
+        let b_tree = store.read_tree(b_id);
+        let file_entry = b_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "file")
+            .expect("file entry in /b/");
+        let file_id = match &file_entry.entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        let f = store.read_file(file_id);
+        assert_eq!(f.content, b"v2");
+    }
+
+    /// After a cross-directory rename, creating a new file at the old
+    /// name must succeed and must not reuse the moved inode. This
+    /// verifies that the `by_parent` reverse map is correctly cleaned
+    /// after rename (detach_child removes the old entry).
+    #[tokio::test]
+    async fn create_at_old_name_after_rename() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
+        let (b_ino, _) = fs.mkdir(fs.root(), "b").await.unwrap();
+        let (old_file, _) = fs.create_file(a_ino, "f", false).await.unwrap();
+        fs.write(old_file, 0, b"old").await.unwrap();
+
+        // Rename /a/f → /b/f.
+        fs.rename(a_ino, "f", b_ino, "f").await.unwrap();
+
+        // Create a new file at the old name /a/f.
+        let (new_file, _) = fs.create_file(a_ino, "f", false).await.unwrap();
+        assert_ne!(
+            new_file, old_file,
+            "new file must get a distinct inode from the renamed one"
+        );
+        fs.write(new_file, 0, b"new").await.unwrap();
+
+        // Both files should be readable with correct content.
+        let (data, _) = fs.read(old_file, 0, 1024).await.unwrap();
+        assert_eq!(data, b"old");
+        let (data, _) = fs.read(new_file, 0, 1024).await.unwrap();
+        assert_eq!(data, b"new");
+
+        // Snapshot should capture both.
+        let snap = fs.snapshot().await.unwrap();
+        let root_tree = store.read_tree(snap);
+        assert_eq!(root_tree.entries.len(), 2, "root should have a/ and b/");
+    }
+
+    /// Same-directory rename (the common editor case) followed by write.
+    /// Even though old_parent == new_parent, the child's name field
+    /// should be updated so that readdir/debug output stays consistent.
+    #[tokio::test]
+    async fn same_dir_rename_then_write() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        let (file_ino, _) = fs.create_file(fs.root(), "old_name", false).await.unwrap();
+        fs.write(file_ino, 0, b"content").await.unwrap();
+        let snap1 = fs.snapshot().await.unwrap();
+
+        // Rename in the same directory.
+        fs.rename(fs.root(), "old_name", fs.root(), "new_name")
+            .await
+            .unwrap();
+
+        // Write to the renamed file.
+        fs.write(file_ino, 0, b"updated").await.unwrap();
+
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1);
+
+        let tree = store.read_tree(snap2);
+        let names: Vec<&str> = tree.entries.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["new_name"]);
+        let file_id = match &tree.entries[0].entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        let f = store.read_file(file_id);
+        assert_eq!(f.content, b"updated");
+    }
+
+    /// Variant: editor atomic-save inside a subdirectory. Exercises the
+    /// ancestor-dirty propagation together with rename.
+    #[tokio::test]
+    async fn rename_atomic_save_in_subdirectory() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        let (src_ino, _) = fs.mkdir(fs.root(), "src").await.unwrap();
+        let (orig_ino, _) = fs.create_file(src_ino, "lib.rs", false).await.unwrap();
+        fs.write(orig_ino, 0, b"// v1").await.unwrap();
+        let snap1 = fs.snapshot().await.unwrap();
+
+        // Editor writes tmp and renames inside the subdirectory.
+        let (tmp_ino, _) = fs.create_file(src_ino, ".lib.rs.swp", false).await.unwrap();
+        fs.write(tmp_ino, 0, b"// v2").await.unwrap();
+        fs.rename(src_ino, ".lib.rs.swp", src_ino, "lib.rs")
+            .await
+            .unwrap();
+
+        // Snapshot must pick up the change despite the root being clean
+        // after snap1.
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1, "rename in subdir must dirty ancestors");
+
+        // Walk tree: root → src → lib.rs
+        let root_tree = store.read_tree(snap2);
+        let src_entry = root_tree
+            .entries
+            .iter()
+            .find(|m| m.name == "src")
+            .expect("src entry");
+        let src_id = match &src_entry.entry {
+            TreeEntry::TreeId(id) => *id,
+            other => panic!("expected TreeId, got {other:?}"),
+        };
+        let src_tree = store.read_tree(src_id);
+        let names: Vec<&str> = src_tree.entries.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["lib.rs"], "swap file should not persist");
+        let file_id = match &src_tree.entries[0].entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        let f = store.read_file(file_id);
+        assert_eq!(f.content, b"// v2");
+    }
+
+    // ----- Multi-cycle and check_out tests ---------------------------------
+
+    /// Three snapshot cycles with modifications between each.
+    /// Verifies the snapshot→clean→modify→snapshot cycle is reliable
+    /// when repeated.
+    #[tokio::test]
+    async fn three_snapshot_cycles() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        let (file_ino, _) = fs.create_file(fs.root(), "counter", false).await.unwrap();
+        fs.write(file_ino, 0, b"1").await.unwrap();
+        let snap1 = fs.snapshot().await.unwrap();
+
+        fs.write(file_ino, 0, b"2").await.unwrap();
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, snap1);
+
+        fs.write(file_ino, 0, b"3").await.unwrap();
+        let snap3 = fs.snapshot().await.unwrap();
+        assert_ne!(snap3, snap2);
+        assert_ne!(snap3, snap1);
+
+        // All three snapshots should have distinct content.
+        let tree3 = store.read_tree(snap3);
+        let entry = tree3.entries.iter().find(|m| m.name == "counter").unwrap();
+        let fid = match &entry.entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        assert_eq!(store.read_file(fid).content, b"3");
+    }
+
+    /// Modify a file, check_out to a different tree, then modify
+    /// again. The second modification must be against the new tree,
+    /// not the old one.
+    #[tokio::test]
+    async fn modify_after_check_out_to_different_tree() {
+        let store = Arc::new(Store::new_in_memory());
+        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+
+        // Build tree A: /file with "aaa".
+        let (file_ino, _) = fs.create_file(fs.root(), "file", false).await.unwrap();
+        fs.write(file_ino, 0, b"aaa").await.unwrap();
+        let _tree_a = fs.snapshot().await.unwrap();
+
+        // Build tree B externally: /file with "bbb", /extra with "xxx".
+        let file_b_id = store.put_file(crate::ty::File {
+            content: b"bbb".to_vec(),
+        });
+        let extra_id = store.put_file(crate::ty::File {
+            content: b"xxx".to_vec(),
+        });
+        let tree_b_id = store.put_tree(crate::ty::Tree {
+            entries: vec![
+                TreeEntryMapping {
+                    name: "extra".into(),
+                    entry: TreeEntry::File {
+                        id: extra_id,
+                        executable: false,
+                        copy_id: Vec::new(),
+                    },
+                },
+                TreeEntryMapping {
+                    name: "file".into(),
+                    entry: TreeEntry::File {
+                        id: file_b_id,
+                        executable: false,
+                        copy_id: Vec::new(),
+                    },
+                },
+            ],
+        });
+
+        // Check out to tree B.
+        fs.check_out(tree_b_id).await.unwrap();
+
+        // The old file_ino is orphaned — look up fresh.
+        let new_file_ino = fs.lookup(fs.root(), "file").await.unwrap();
+        let (data, _) = fs.read(new_file_ino, 0, 1024).await.unwrap();
+        assert_eq!(data, b"bbb");
+
+        // extra should be visible.
+        let extra_ino = fs.lookup(fs.root(), "extra").await.unwrap();
+        let (data, _) = fs.read(extra_ino, 0, 1024).await.unwrap();
+        assert_eq!(data, b"xxx");
+
+        // Modify /file after check_out.
+        fs.write(new_file_ino, 0, b"ccc").await.unwrap();
+        let snap = fs.snapshot().await.unwrap();
+        assert_ne!(snap, tree_b_id);
+
+        // Snapshot should have /file="ccc" and /extra="xxx".
+        let tree = store.read_tree(snap);
+        assert_eq!(tree.entries.len(), 2);
+        let file_entry = tree.entries.iter().find(|m| m.name == "file").unwrap();
+        let fid = match &file_entry.entry {
+            TreeEntry::File { id, .. } => *id,
+            other => panic!("expected File, got {other:?}"),
+        };
+        assert_eq!(store.read_file(fid).content, b"ccc");
+    }
+
+    /// Create a file inside a subdirectory of a pre-existing tree.
+    /// This exercises materialization of a clean subtree for mutation.
+    #[tokio::test]
+    async fn create_file_in_existing_subdirectory() {
+        let (store, root_id) = build_synthetic_tree();
+        let fs = YakFs::new(store.clone(), root_id, None);
+
+        // Look up the existing "bin/" directory.
+        let bin_ino = fs.lookup(fs.root(), "bin").await.unwrap();
+
+        // Create a new file inside bin/ alongside the existing "tool".
+        let (new_file, _) = fs
+            .create_file(bin_ino, "helper", false)
+            .await
+            .unwrap();
+        fs.write(new_file, 0, b"helper script").await.unwrap();
+
+        // Existing "tool" should still be readable.
+        let tool_ino = fs.lookup(bin_ino, "tool").await.unwrap();
+        let (data, _) = fs.read(tool_ino, 0, 1024).await.unwrap();
+        assert_eq!(data, b"x");
+
+        // Snapshot should capture the new file alongside the old one.
+        let snap = fs.snapshot().await.unwrap();
+        assert_ne!(snap, root_id);
+        let root_tree = store.read_tree(snap);
+        let bin_entry = root_tree.entries.iter().find(|m| m.name == "bin").unwrap();
+        let bin_id = match &bin_entry.entry {
+            TreeEntry::TreeId(id) => *id,
+            other => panic!("expected TreeId, got {other:?}"),
+        };
+        let bin_tree = store.read_tree(bin_id);
+        let names: Vec<&str> = bin_tree.entries.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["helper", "tool"]);
+    }
+
+    /// Delete a file from a pre-existing (store-backed) subtree after
+    /// snapshot. Verifies ancestor-dirty propagation through
+    /// materialized trees.
+    #[tokio::test]
+    async fn delete_from_existing_subtree_after_snapshot() {
+        let (store, root_id) = build_synthetic_tree();
+        let fs = YakFs::new(store.clone(), root_id, None);
+
+        // Snapshot should be a no-op on a clean tree.
+        let snap1 = fs.snapshot().await.unwrap();
+        assert_eq!(snap1, root_id);
+
+        // Delete "hello.txt" from the root.
+        fs.remove(fs.root(), "hello.txt").await.unwrap();
+
+        let snap2 = fs.snapshot().await.unwrap();
+        assert_ne!(snap2, root_id, "snapshot must detect deletion");
+
+        let tree = store.read_tree(snap2);
+        let names: Vec<&str> = tree.entries.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["bin", "link"], "hello.txt should be gone");
     }
 }

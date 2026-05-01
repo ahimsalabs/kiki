@@ -79,6 +79,12 @@ impl WorkingCopyFactory for YakWorkingCopyFactory {
     }
 }
 
+/// The "all files" sparse pattern. Yak doesn't support sparse
+/// checkouts — the daemon always materializes the full tree — so
+/// this is the only pattern we ever return.
+static FULL_SPARSE: std::sync::LazyLock<Vec<RepoPathBuf>> =
+    std::sync::LazyLock::new(|| vec![RepoPathBuf::root()]);
+
 pub struct YakWorkingCopy {
     store: Arc<Store>,
     working_copy_path: PathBuf,
@@ -277,7 +283,7 @@ impl WorkingCopy for YakWorkingCopy {
     }
 
     fn sparse_patterns(&self) -> Result<&[RepoPathBuf], WorkingCopyStateError> {
-        todo!()
+        Ok(&FULL_SPARSE)
     }
 
     fn start_mutation(&self) -> Result<Box<dyn LockedWorkingCopy>, WorkingCopyStateError> {
@@ -324,8 +330,11 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
             .expect("old_tree called before tree was loaded in start_mutation")
     }
 
-    async fn recover(&mut self, _commit: &Commit) -> Result<(), ResetError> {
-        todo!()
+    async fn recover(&mut self, commit: &Commit) -> Result<(), ResetError> {
+        // Recovery re-roots the working copy at the given commit,
+        // same as reset. The daemon doesn't distinguish between the
+        // two operations.
+        self.reset(commit).await
     }
 
     async fn snapshot(
@@ -385,19 +394,53 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
         todo!()
     }
 
-    async fn reset(&mut self, _commit: &Commit) -> Result<(), ResetError> {
-        todo!()
+    async fn reset(&mut self, commit: &Commit) -> Result<(), ResetError> {
+        // `reset` re-roots the working copy at the given commit's tree,
+        // discarding any pending mutations. For yak this is the same
+        // operation as `check_out`: tell the daemon to swap the VFS
+        // root tree.
+        let new_tree = commit.tree();
+        let resolved_tree_id = new_tree.tree_ids().as_resolved().ok_or_else(|| {
+            ResetError::Other {
+                message: "yak: resetting to a conflicted tree is not yet supported".into(),
+                err: std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "conflicted MergedTree",
+                )
+                .into(),
+            }
+        })?;
+        let path_str = path_to_str(&self.wc.working_copy_path)?.to_string();
+        self.wc
+            .client
+            .check_out(CheckOutReq {
+                working_copy_path: path_str,
+                new_tree_id: resolved_tree_id.to_bytes(),
+            })
+            .map_err(|e| ResetError::Other {
+                message: "daemon CheckOut RPC failed during reset".into(),
+                err: e.into(),
+            })?;
+        self.wc.tree_state = OnceCell::new();
+        Ok(())
     }
 
     fn sparse_patterns(&self) -> Result<&[RepoPathBuf], WorkingCopyStateError> {
-        todo!()
+        Ok(&FULL_SPARSE)
     }
 
     async fn set_sparse_patterns(
         &mut self,
         _new_sparse_patterns: Vec<RepoPathBuf>,
     ) -> Result<CheckoutStats, CheckoutError> {
-        todo!()
+        Err(CheckoutError::Other {
+            message: "yak: sparse checkouts are not supported".into(),
+            err: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "sparse patterns",
+            )
+            .into(),
+        })
     }
 
     async fn finish(

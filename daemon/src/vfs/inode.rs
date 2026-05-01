@@ -370,6 +370,21 @@ impl InodeSlab {
         true
     }
 
+    /// Update the `parent` and `name` fields of an existing inode.
+    /// Used by `rename` to keep the ancestor-walk in
+    /// `ensure_dirty_tree` correct after a cross-directory move.
+    /// Returns `false` if `child` isn't in the slab.
+    pub fn reparent(&self, child: InodeId, new_parent: InodeId, new_name: String) -> bool {
+        let mut inner = self.inner.lock();
+        if let Some(inode) = inner.inodes.get_mut(&child) {
+            inode.parent = new_parent;
+            inode.name = new_name;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Remove a child from a `DirtyTree` parent. Returns the detached
     /// child id on success; `None` if the parent isn't a `DirtyTree` or
     /// the name doesn't exist.
@@ -612,6 +627,81 @@ mod tests {
         assert!(
             !slab.attach_child(ROOT_INODE, "x.txt".to_owned(), dup),
             "duplicate attach must fail"
+        );
+    }
+
+    /// Regression test for Bug 3 (dirty nodes clobbered by materialization).
+    ///
+    /// If a child has already been promoted to a dirty variant
+    /// (e.g. `DirtyFile` via a prior `write`), re-materializing the
+    /// parent must NOT overwrite that child's `NodeRef` with the clean
+    /// version from the stored tree. Before the fix, the second
+    /// `materialize_dir_for_mutation` would unconditionally refresh
+    /// every existing child's `NodeRef`, silently discarding writes.
+    #[test]
+    fn materialize_preserves_dirty_children() {
+        let slab = InodeSlab::new(id(1));
+
+        // Step 1: intern "a" as a clean File — simulates lookup of an
+        // existing tree entry that the kernel has cached.
+        let child_a = slab.intern_child(ROOT_INODE, "a", || NodeRef::File {
+            id: id(0x10),
+            executable: false,
+        });
+
+        // Step 2: promote "a" to DirtyFile — simulates `ensure_dirty_file`
+        // after a `write()` call.
+        slab.replace_node(
+            child_a,
+            NodeRef::DirtyFile {
+                content: b"modified".to_vec(),
+                executable: false,
+            },
+        );
+
+        // Step 3: materialize the parent. The loader provides the
+        // original clean entry for "a" (as the store would). The fix
+        // skips the refresh for "a" because it's already dirty.
+        let children = slab
+            .materialize_dir_for_mutation(ROOT_INODE, || {
+                vec![
+                    (
+                        "a".to_owned(),
+                        NodeRef::File {
+                            id: id(0x10),
+                            executable: false,
+                        },
+                    ),
+                    (
+                        "b".to_owned(),
+                        NodeRef::File {
+                            id: id(0x20),
+                            executable: false,
+                        },
+                    ),
+                ]
+            })
+            .expect("materialize");
+
+        // "a" should still use the same inode id.
+        assert_eq!(children["a"], child_a, "must reuse the kernel-known id");
+
+        // Crucially: "a" must still be DirtyFile with the modified content,
+        // not reverted to the clean File{id: 0x10}.
+        let inode_a = slab.get(child_a).expect("child a present");
+        assert!(
+            matches!(inode_a.node, NodeRef::DirtyFile { ref content, .. } if content == b"modified"),
+            "dirty child must survive materialization, got {:?}",
+            inode_a.node,
+        );
+
+        // "b" should be the clean version from the loader.
+        let child_b = children["b"];
+        let inode_b = slab.get(child_b).expect("child b present");
+        let expected_b = id(0x20);
+        assert!(
+            matches!(inode_b.node, NodeRef::File { id: file_id, .. } if file_id == expected_b),
+            "clean child should be refreshed normally",
         );
     }
 }
