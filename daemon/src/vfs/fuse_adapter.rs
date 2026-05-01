@@ -650,7 +650,7 @@ impl Filesystem for FuseAdapter {
         let remaining: Vec<FuseResult<DirectoryEntryPlus>> = out.into_iter().skip(skip).collect();
 
         Ok(ReplyDirectoryPlus {
-            entries: stream::iter(remaining.into_iter()),
+            entries: stream::iter(remaining),
         })
     }
 }

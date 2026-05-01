@@ -1,6 +1,6 @@
 [package]
 name = "cli"
-edition = "2021"
+edition = "2024"
 authors.workspace = true
 description.workspace = true
 version.workspace = true
@@ -29,7 +29,6 @@ assert_cmd.workspace = true
 assert_matches.workspace = true
 regex.workspace = true
 chrono.workspace = true
-tempdir = "0.3.7"
 tempfile = "3.14.0"
 insta = "1.41.1"
 rand.workspace = true

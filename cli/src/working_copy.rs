@@ -167,8 +167,6 @@ struct CheckoutState {
 
 impl YakWorkingCopy {
     fn get_tree(&self) -> Result<&MergedTree, WorkingCopyStateError> {
-        // `OnceCell::get_or_try_init` is unstable, so we manually populate the
-        // cell. Single-threaded, so no race window.
         if self.tree_state.get().is_none() {
             let path_str = path_to_str(&self.working_copy_path)?.to_string();
             let tree_state = self
@@ -180,9 +178,6 @@ impl YakWorkingCopy {
                 .into_inner();
             let tree =
                 MergedTree::resolved(self.store.clone(), TreeId::new(tree_state.tree_id));
-            // Discard the Err that would mean another caller raced us; can't
-            // happen here (single-threaded), but it would be harmless either
-            // way (both load identical state).
             let _ = self.tree_state.set(tree);
         }
         Ok(self

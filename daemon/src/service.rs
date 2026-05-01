@@ -186,14 +186,14 @@ impl Mount {
     /// the RPC. Hard failures will resurface on the next restart's
     /// rehydrate scan.
     fn persist_metadata(&self) {
-        if let Some(path) = &self.meta_path {
-            if let Err(e) = self.metadata().write_to(path) {
-                tracing::error!(
-                    path = %path.display(),
-                    error = %format!("{e:#}"),
-                    "failed to persist mount metadata"
-                );
-            }
+        if let Some(path) = &self.meta_path
+            && let Err(e) = self.metadata().write_to(path)
+        {
+            tracing::error!(
+                path = %path.display(),
+                error = %format!("{e:#}"),
+                "failed to persist mount metadata"
+            );
         }
     }
 }
@@ -1150,21 +1150,20 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             }));
         }
         // Read-through from remote.
-        if let Some(remote) = remote {
-            if let Some(bytes) = remote
+        if let Some(remote) = remote
+            && let Some(bytes) = remote
                 .get_blob(BlobKind::View, &req.view_id)
                 .await
                 .map_err(remote_status("remote get_blob (view)"))?
-            {
-                // Populate local cache.
-                store
-                    .write_view_bytes(&req.view_id, &bytes)
-                    .map_err(store_status("cache write_view"))?;
-                return Ok(Response::new(ReadViewReply {
-                    found: true,
-                    data: bytes.to_vec(),
-                }));
-            }
+        {
+            // Populate local cache.
+            store
+                .write_view_bytes(&req.view_id, &bytes)
+                .map_err(store_status("cache write_view"))?;
+            return Ok(Response::new(ReadViewReply {
+                found: true,
+                data: bytes.to_vec(),
+            }));
         }
         Ok(Response::new(ReadViewReply {
             found: false,
@@ -1223,20 +1222,19 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             }));
         }
         // Read-through from remote.
-        if let Some(remote) = remote {
-            if let Some(bytes) = remote
+        if let Some(remote) = remote
+            && let Some(bytes) = remote
                 .get_blob(BlobKind::Operation, &req.operation_id)
                 .await
                 .map_err(remote_status("remote get_blob (operation)"))?
-            {
-                store
-                    .write_operation_bytes(&req.operation_id, &bytes)
-                    .map_err(store_status("cache write_operation"))?;
-                return Ok(Response::new(ReadOperationReply {
-                    found: true,
-                    data: bytes.to_vec(),
-                }));
-            }
+        {
+            store
+                .write_operation_bytes(&req.operation_id, &bytes)
+                .map_err(store_status("cache write_operation"))?;
+            return Ok(Response::new(ReadOperationReply {
+                found: true,
+                data: bytes.to_vec(),
+            }));
         }
         Ok(Response::new(ReadOperationReply {
             found: false,

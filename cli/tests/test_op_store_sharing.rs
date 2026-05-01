@@ -19,7 +19,7 @@ use crate::common::TestEnvironment;
 #[test]
 fn cli_reads_own_ops_via_yak_op_store() {
     let env = TestEnvironment::default();
-    let remote_tmp = tempdir::TempDir::new("yak-op-store-test").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("yak-op-store-test").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 
@@ -49,7 +49,7 @@ fn two_clis_share_op_contents_via_remote() {
     let env_b = TestEnvironment::default();
     env_b.advance_test_rng_seed_to_multiple_of(1_000_000);
 
-    let remote_tmp = tempdir::TempDir::new("yak-op-store-sharing").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("yak-op-store-sharing").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 

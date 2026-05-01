@@ -19,9 +19,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use regex::{Captures, Regex};
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 pub struct TestEnvironment {
     _temp_dir: TempDir,
@@ -55,7 +55,7 @@ impl Drop for TestEnvironment {
 
 impl Default for TestEnvironment {
     fn default() -> Self {
-        let tmp_dir = TempDir::new("jj-test").unwrap();
+        let tmp_dir = TempDir::with_prefix("jj-test").unwrap();
         let env_root = tmp_dir.path().canonicalize().unwrap();
 
         let home_dir = env_root.join("home");
@@ -68,7 +68,7 @@ impl Default for TestEnvironment {
 
         // Initialize a isolated daemon for this env
         let daemon_config = config_dir.join("daemon.toml");
-        let daemon_port: usize = thread_rng().gen_range(11000..21000);
+        let daemon_port: usize = rng().gen_range(11000..21000);
         // disable_mount=false routes `.jj/` and user content through the
         // daemon's FUSE adapter — the production-equivalent path that
         // exercises M7.1 (split `.jj/` from the user tree) and M7.2

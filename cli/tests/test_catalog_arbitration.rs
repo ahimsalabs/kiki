@@ -77,7 +77,7 @@ fn two_clis_serialize_op_heads_via_shared_dir_remote() {
     // Shared remote dir lives outside either env so neither's `Drop`
     // tears it down prematurely. Canonicalize so the daemon's
     // `working_copy_path` lookup matches across the two daemons.
-    let remote_tmp = tempdir::TempDir::new("yak-shared-remote").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("yak-shared-remote").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 
@@ -141,7 +141,7 @@ fn two_clis_serialize_op_heads_via_shared_dir_remote() {
 #[test]
 fn one_cli_writes_op_heads_to_shared_dir_remote() {
     let env = TestEnvironment::default();
-    let remote_tmp = tempdir::TempDir::new("yak-shared-remote-single").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("yak-shared-remote-single").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 

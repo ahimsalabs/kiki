@@ -158,7 +158,7 @@ impl RemoteStore for FsRemoteStore {
 
             let tmp_name = format!(
                 ".tmp.{:016x}",
-                rand::thread_rng().gen::<u64>()
+                rand::rng().random::<u64>()
             );
             let tmp_path = dir.join(tmp_name);
 
@@ -273,7 +273,7 @@ impl RemoteStore for FsRemoteStore {
                 Some(value) => {
                     let tmp_name = format!(
                         ".tmp.{:016x}",
-                        rand::thread_rng().gen::<u64>()
+                        rand::rng().random::<u64>()
                     );
                     let tmp_path = refs_dir.join(tmp_name);
                     {
@@ -300,12 +300,12 @@ impl RemoteStore for FsRemoteStore {
                     // Delete. ENOENT here means we observed `current`
                     // as None (no precondition mismatch above), so
                     // there's nothing to remove — treat as success.
-                    if let Err(e) = fs::remove_file(&ref_path) {
-                        if e.kind() != io::ErrorKind::NotFound {
-                            return Err(e).with_context(|| {
-                                format!("removing {}", ref_path.display())
-                            });
-                        }
+                    if let Err(e) = fs::remove_file(&ref_path)
+                        && e.kind() != io::ErrorKind::NotFound
+                    {
+                        return Err(e).with_context(|| {
+                            format!("removing {}", ref_path.display())
+                        });
                     }
                 }
             }

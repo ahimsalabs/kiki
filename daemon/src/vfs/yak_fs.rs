@@ -778,10 +778,10 @@ impl JjYakFs for YakFs {
         // name. If unpinned we fall through; legacy trees that contain
         // a real `.jj` entry (snapshots taken before M7) still resolve
         // until something writes through the daemon and pins it.
-        if self.is_jj_root(parent, name) {
-            if let Some(jj_ino) = self.jj_subtree() {
-                return Ok(jj_ino);
-            }
+        if self.is_jj_root(parent, name)
+            && let Some(jj_ino) = self.jj_subtree()
+        {
+            return Ok(jj_ino);
         }
         let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
         match parent_inode.node {
