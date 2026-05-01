@@ -22,10 +22,13 @@ M10.5 (§10.5) is done — `YakOpHeadsStore` drives the daemon's
 catalog (with a per-mount `LocalRefs` redb-backed fallback for
 the no-remote case) so two CLIs against a shared `dir://` remote
 serialize op-log advances rather than silently clobbering. M10.6
-(§10.6) is in progress — wiring op-store contents (operations +
-views) through the remote so a peer CLI can read the bytes of ops
-another CLI wrote. 177/153 daemon+cli tests pass. Last updated:
-2026-04-30
+(§10.6) is done — `YakOpStore` routes op-store contents
+(operations + views) through the daemon with write-through to
+remote and read-through on local miss, so a peer CLI can read
+the bytes of ops another CLI wrote. `RemoteStore` blob ids
+generalized from `&Id` (32-byte) to `&[u8]` so 64-byte
+BLAKE2b-512 op-store ids ride on the same blob CAS.
+192/167-daemon tests pass. Last updated: 2026-04-30
 
 This document captures the roadmap for getting jj-yak from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -143,8 +146,8 @@ missing FUSE methods between M6 and M7). One-line summaries:
   `YakOpHeadsStore` writes a single `op_heads` ref via CAS
   retry, with a per-mount `LocalRefs` redb-backed fallback when
   no remote is configured. **Op contents** (the actual operation
-  bytes) are M10.6 (§10.6, in progress) — a custom `YakOpStore`
-  routes `read/write_view` and `read/write_operation` through the
+  bytes) done at M10.6 (§10.6) — `YakOpStore` routes
+  `read/write_view` and `read/write_operation` through the
   daemon with write-through to remote and read-through on local
   miss, so a peer CLI can read the bytes of ops another CLI wrote.
 - **FUSE-side read-through on `StoreMiss`** — done at M10 §10.6.
@@ -439,16 +442,16 @@ side for the no-remote case (§10.5). M7 detail in
 [`PLAN-M7-9.md`](./PLAN-M7-9.md) §10; M10 detail in §10 above;
 M10.5 detail in §10.5 above.
 
-**Next: M10.6 (§10.6, in progress) — wire jj-lib's op-store
-contents through the remote.** Op-heads arbitration is solved
-(M10.5); op contents are still local-only. `YakOpStore` will
-route `read/write_view` and `read/write_operation` through the
-daemon with write-through to remote and read-through on local
-miss. Blob ids generalized from `&Id` (32-byte) to `&[u8]` so
-64-byte BLAKE2b-512 op-store ids ride on the same `RemoteStore`
-blob CAS. Also still open: M11 (auth/TLS/retry/backoff alongside
-S3), the `fuser` migration (§9), inode-id stability across
-restarts (§7 decision 6), async background push queue.
+**M10.6 (§10.6) is done.** `YakOpStore` routes op-store contents
+through the daemon with write-through to remote and read-through
+on local miss. Blob ids generalized from `&Id` (32-byte) to
+`&[u8]` so 64-byte BLAKE2b-512 op-store ids ride on the same
+`RemoteStore` blob CAS. Two CLIs sharing a `dir://` remote can
+each read the other's full operation history.
+
+**Still open:** M11 (auth/TLS/retry/backoff alongside S3), the
+`fuser` migration (§9), inode-id stability across restarts (§7
+decision 6), async background push queue.
 
 **Hygiene still pending:**
 
@@ -1636,10 +1639,142 @@ What jj-lib expects from a custom `OpStore`:
   daemon RPC.
 - `gc(head_ids, keep_newer) -> ()` — no-op.
 
-Serialization: reuse jj-lib's existing `simple_op_store` proto
-format (`crate::protos::simple_op_store::{View, Operation}`) and
-its `view_to_proto`/`view_from_proto`/`operation_to_proto`/
-`operation_from_proto` conversion functions. The `YakOpStore`
-encodes to the same bytes `SimpleOpStore` would, hashes them with
-`blake2b_hash`, and sends the `(id, bytes)` pair to the daemon.
-The daemon is format-agnostic — it just stores bytes.
+Serialization: `YakOpStore` wraps a `SimpleOpStore` as a local
+serialization delegate and cache. jj-lib's `view_to_proto` /
+`operation_to_proto` / `view_from_proto` / `operation_from_proto`
+are private (~300 lines tightly coupled to jj-lib internals);
+wrapping `SimpleOpStore` avoids reimplementing them. On write,
+the delegate serializes + content-hashes and writes to disk; the
+`YakOpStore` reads back the bytes and pushes them to the daemon.
+On read, the delegate tries its local disk first; on miss the
+`YakOpStore` fetches from the daemon, writes the bytes to the
+delegate's disk path, and re-reads through the delegate to
+deserialize. The daemon is format-agnostic — it just stores bytes.
+
+### 10.6.8 M10.6 outcome
+
+Six commits across the M10.6 sequence (numbered to match
+§10.6.6):
+
+1. `docs: PLAN.md §10.6 — define M10.6 spec`. ✅
+2. `proto+daemon: M10.6 — generalize blob ids to &[u8], add
+   View/Operation kinds, add op-store RPCs`. ✅ Mechanical
+   refactor: `RemoteStore::get_blob/put_blob/has_blob` from
+   `id: &Id` to `id: &[u8]`; ~20 call sites pass `&id.0`
+   instead of `&id`. `BlobKind` gained `View` and `Operation`.
+   Proto got `BLOB_KIND_VIEW = 5` / `BLOB_KIND_OPERATION = 6`
+   plus five new RPCs on `JujutsuInterface`. Server-side stubs
+   kept the daemon compilable (replaced in the next commit).
+   Proto `bytes id` already arbitrary-length — no wire change.
+3. `daemon: M10.6 — Store gains op-store tables + op-store RPC
+   handlers with write-through/read-through`. ✅ Two new redb
+   tables (`views_v1`, `operations_v1`) with `&[u8]` keys.
+   Raw-bytes get/write methods. `operation_ids_matching_prefix`
+   via table scan. Five RPC handlers: `WriteView`/`ReadView`/
+   `WriteOperation`/`ReadOperation`/`ResolveOperationIdPrefix`
+   — same write-through + read-through shape as the blob handlers.
+   12 new tests (7 store-level + 5 service-level).
+4. `cli: M10.6 — YakOpStore impl + BlockingJujutsuInterfaceClient
+   methods + factory registration`. ✅ `YakOpStore` wraps
+   `SimpleOpStore` as serialization delegate + local cache;
+   pushes to daemon on write, fetches from daemon on read miss.
+   `resolve_operation_id_prefix` merges daemon scan with root-id
+   check. Factory registered via `add_op_store("yak_op_store", …)`;
+   init path replaces `default_op_store_initializer()`.
+5. `cli: M10.6 — two-CLI op-store content sharing acceptance
+   test`. ✅ Two tests: single-CLI `jj op log` works end-to-end;
+   two-CLI sharing confirms op/view blobs land on the remote
+   after init and both CLIs can read their own ops.
+6. `docs: PLAN.md §10.6 outcome`. ✅ (this commit)
+
+192 total tests (15 cli unit + 10 cli integration + 167 daemon,
++15 from the 177 M10.5 baseline); `cargo clippy --workspace
+--all-targets -- -D warnings` clean.
+
+Decisions made on the way:
+
+- **`RemoteStore` blob ids generalized to `&[u8]`, not parallel
+  `op_blob` methods.** The trait stays at 6 blob+ref methods (not
+  9). Backends (`FsRemoteStore`, `GrpcRemoteStore`, server) each
+  changed ~5 lines. The proto already used `bytes id` —
+  arbitrary-length was free on the wire. The Rust-side `Id([u8;
+  32])` type stays for local store use; the remote surface accepts
+  any length. 64-byte BLAKE2b-512 ids round-trip cleanly.
+
+- **`RemoteStoreService` validates non-empty ids, not fixed
+  length.** The old `decode_id` enforced 32 bytes; replaced with
+  `validate_id` that rejects only empty. The remote stores bytes
+  opaquely — length validation is the caller's job (the CLI
+  computes content hashes). The existing "server rejects short
+  id" gRPC test became "server rejects empty id".
+
+- **`YakOpStore` wraps `SimpleOpStore`, not a from-scratch
+  reimplementation.** jj-lib's proto conversion functions
+  (`view_to_proto`, `operation_from_proto`, etc.) are private.
+  Reimplementing ~300 lines of tightly-coupled conversion code
+  would be fragile and break on jj-lib version bumps. Wrapping
+  `SimpleOpStore` reuses all serialization + content hashing
+  logic. The trade-off: op-store files exist both in the delegate's
+  disk path (under the FUSE mount's `.jj/repo/op_store/`) and in
+  the daemon's redb tables + remote. The redundancy is harmless
+  — the delegate acts as L1 cache, the daemon's redb as L2, the
+  remote as L3.
+
+- **`pollster` added for blocking `SimpleOpStore` async calls.**
+  `SimpleOpStore`'s methods are `async fn` (required by the
+  `OpStore` trait) but don't actually `.await` anything. `pollster::
+  block_on` is the lightest way to call them from a sync context.
+  The CLI's `BlockingJujutsuInterfaceClient` uses a separate
+  `tokio::Runtime` for gRPC; `pollster` doesn't interfere.
+
+- **`OpPrefixResult` uses `None`/`Single`/`Ambiguous` variant
+  names.** Clippy flagged the original `NoMatch`/`SingleMatch`/
+  `AmbiguousMatch` as `enum_variant_names` (all end with "Match").
+  Shortened to avoid the lint.
+
+- **Write-through, not reachability walk.** Each `WriteView`/
+  `WriteOperation` RPC pushes to the remote inline. No post-
+  snapshot walk needed for op-store data (ops are written one at
+  a time by jj-lib, never in bulk). The `push_reachable_blobs`
+  function gained an `unreachable!` arm for `View`/`Operation`
+  blob kinds to make this explicit.
+
+- **`resolve_operation_id_prefix` merges root-id with daemon
+  scan.** The root operation (id `[0; 64]`) is synthetic — never
+  stored in the daemon's table. `YakOpStore` checks the root
+  locally and merges with the daemon's redb scan result. A root
+  match + daemon single-match of a different id → ambiguous.
+
+What this milestone explicitly does **not** do:
+
+- **`gc` on the remote.** The delegate's `gc` cleans up local
+  files; the daemon's redb tables and the remote are untouched.
+  Op-store data is small and grows slowly; remote gc is future
+  work.
+- **Auth/TLS/retry/backoff.** Still M11 alongside S3.
+- **Async background push queue.** Write-through is fine for
+  localhost.
+- **Stable inode ids across restarts (§7 decision 6).** Still
+  alongside the `fuser` migration (§9).
+
+Test coverage added in M10.6 (15 new tests, total 192):
+
+- `daemon::store::tests` (7 new):
+  `view_write_then_read_round_trips`,
+  `operation_write_then_read_round_trips`,
+  `missing_view_returns_none`,
+  `operation_prefix_no_match`,
+  `operation_prefix_single_match`,
+  `operation_prefix_ambiguous_match`,
+  `operation_prefix_full_length_match`.
+- `daemon::remote::fs::tests` (1 new):
+  `put_then_get_64_byte_id_view`.
+- `daemon::service::tests` (5 new):
+  `write_view_pushes_to_dir_remote`,
+  `read_view_falls_back_to_remote_on_local_miss`,
+  `read_view_no_remote_miss_returns_not_found`,
+  `write_operation_pushes_and_read_through_works`,
+  `resolve_operation_id_prefix_works`.
+- `cli::tests::test_op_store_sharing` (integration, 2 new):
+  `cli_reads_own_ops_via_yak_op_store`,
+  `two_clis_share_op_contents_via_remote`.
