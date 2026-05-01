@@ -158,10 +158,7 @@ impl Backend for YakBackend {
             })
             .map_err(|e| read_file_err(path, id, e))?
             .into_inner();
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(proto.data.as_slice(), &mut decoded)
-            .map_err(|e| read_file_err(path, id, e))?;
-        Ok(Box::pin(Cursor::new(decoded)))
+        Ok(Box::pin(Cursor::new(proto.data)))
     }
 
     async fn write_file(
@@ -174,14 +171,11 @@ impl Backend for YakBackend {
             .read_to_end(&mut buf)
             .await
             .map_err(|e| write_err("file", e))?;
-        let mut encoded = Vec::new();
-        zstd::stream::copy_encode(buf.as_slice(), &mut encoded, 0)
-            .map_err(|e| write_err("file", e))?;
         let id = self
             .client
             .write_file(proto::jj_interface::WriteFileReq {
                 working_copy_path: self.working_copy_path(),
-                data: encoded,
+                data: buf,
             })
             .map_err(|e| write_err("file", e))?
             .into_inner();

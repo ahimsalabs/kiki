@@ -440,13 +440,80 @@ impl YakFs {
         }
     }
 
-    /// Promote `parent` from clean `Tree` into `DirtyTree`. Idempotent —
-    /// already-dirty parents are left as-is.
+    /// Promote `dir` from clean `Tree` into `DirtyTree`, then walk up
+    /// through parent pointers and dirty every ancestor directory too.
+    ///
+    /// The ancestor walk is necessary so that `snapshot` — which
+    /// short-circuits on clean `Tree` nodes — can discover that a
+    /// descendant was mutated. Without it, a mutation deep in the
+    /// tree after a snapshot has cleaned the root would be invisible
+    /// to the next snapshot.
+    ///
+    /// The walk stops early when it reaches a node that is already
+    /// `DirtyTree` (all its ancestors must also be dirty from when
+    /// it was first dirtied). It also stops at the `.jj` boundary:
+    /// mutations inside the pinned `.jj/` subtree should not dirty
+    /// the user tree root (`.jj` is excluded from `snapshot`).
+    ///
+    /// Idempotent: calling on an already-dirty tree is a no-op.
     ///
     /// Async since M10 §10.6 (see [`Self::dir_tree`]).
-    async fn ensure_dirty_tree(&self, parent: InodeId) -> Result<(), FsError> {
-        let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
-        match parent_inode.node {
+    async fn ensure_dirty_tree(&self, dir: InodeId) -> Result<(), FsError> {
+        // Check if `dir` is inside the pinned `.jj/` subtree.
+        // If so, materialize just `dir` itself (for local mutations
+        // like creating op-store files) but don't propagate upward.
+        let inside_jj = if let Some(jj_ino) = self.jj_subtree() {
+            let mut probe = dir;
+            loop {
+                if probe == jj_ino {
+                    break true;
+                }
+                let inode = self.slab.get(probe).ok_or(FsError::NotFound)?;
+                if inode.parent == probe {
+                    break false; // reached root without hitting .jj
+                }
+                probe = inode.parent;
+            }
+        } else {
+            false
+        };
+
+        // Materialize `dir` itself.
+        self.materialize_single_tree(dir).await?;
+
+        if inside_jj {
+            return Ok(());
+        }
+
+        // Walk up through parent pointers, dirtying each ancestor.
+        // Stop when we reach an already-dirty node (its ancestors
+        // are guaranteed dirty from the last time it was materialized)
+        // or when we reach the root.
+        let mut current = dir;
+        loop {
+            let inode = self.slab.get(current).ok_or(FsError::NotFound)?;
+            let parent = inode.parent;
+            if parent == current {
+                // Root is its own parent — done.
+                break;
+            }
+            let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
+            if matches!(parent_inode.node, NodeRef::DirtyTree { .. }) {
+                break; // already dirty — all ancestors above are too
+            }
+            drop(parent_inode);
+            self.materialize_single_tree(parent).await?;
+            current = parent;
+        }
+        Ok(())
+    }
+
+    /// Promote a single directory inode from clean `Tree` to
+    /// `DirtyTree`. Does NOT propagate to ancestors; that's
+    /// `ensure_dirty_tree`'s job. Idempotent on `DirtyTree`.
+    async fn materialize_single_tree(&self, dir: InodeId) -> Result<(), FsError> {
+        let inode = self.slab.get(dir).ok_or(FsError::NotFound)?;
+        match inode.node {
             NodeRef::DirtyTree { .. } => Ok(()),
             NodeRef::Tree(id) => {
                 let tree = self.read_tree(id).await?;
@@ -455,11 +522,8 @@ impl YakFs {
                     .into_iter()
                     .map(|m| (m.name, Self::entry_to_node(&m.entry)))
                     .collect();
-                // `materialize_dir_for_mutation` runs the loader closure
-                // under the slab lock; pre-resolve the tree above so the
-                // closure stays trivial.
                 self.slab
-                    .materialize_dir_for_mutation(parent, move || entries.into_iter())
+                    .materialize_dir_for_mutation(dir, move || entries.into_iter())
                     .ok_or(FsError::NotADirectory)?;
                 Ok(())
             }
@@ -973,6 +1037,10 @@ impl JjYakFs for YakFs {
 
     async fn write(&self, ino: InodeId, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         self.ensure_dirty_file(ino).await?;
+        // Dirty the file's parent and ancestors so snapshot can
+        // discover the modification (ensure_dirty_tree propagates).
+        let parent = self.slab.get(ino).ok_or(FsError::NotFound)?.parent;
+        self.ensure_dirty_tree(parent).await?;
         let mut inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
         let NodeRef::DirtyFile {
             ref mut content,
@@ -1006,9 +1074,13 @@ impl JjYakFs for YakFs {
         executable: Option<bool>,
     ) -> Result<Attr, FsError> {
         // Both fields touch a file — make sure we're working with a
-        // dirty buffer.
+        // dirty buffer, and dirty ancestors so snapshot can find us.
         if size.is_some() || executable.is_some() {
             self.ensure_dirty_file(ino).await?;
+            // Dirty the file's parent and ancestors so snapshot can
+            // discover the modification.
+            let parent = self.slab.get(ino).ok_or(FsError::NotFound)?.parent;
+            self.ensure_dirty_tree(parent).await?;
         } else {
             // No-op setattr (e.g. atime-only) just returns current attrs.
             return self.attr_for(ino).await;

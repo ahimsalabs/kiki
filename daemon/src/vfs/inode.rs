@@ -299,11 +299,22 @@ impl InodeSlab {
                 for (name, child_node) in load_entries() {
                     let key = (dir, name.clone());
                     let child_id = if let Some(&existing) = inner.by_parent.get(&key) {
-                        // Refresh the child's NodeRef from the tree; the
-                        // existing entry might have a stale ref from a
-                        // previous tree.
+                        // Refresh the child's NodeRef from the tree —
+                        // unless the child has already been promoted to a
+                        // dirty variant (DirtyFile, DirtyTree,
+                        // DirtySymlink). Overwriting a dirty node with
+                        // the clean version from the stored tree would
+                        // silently discard in-flight writes.
                         if let Some(c) = inner.inodes.get_mut(&existing) {
-                            c.node = child_node;
+                            let already_dirty = matches!(
+                                c.node,
+                                NodeRef::DirtyFile { .. }
+                                    | NodeRef::DirtyTree { .. }
+                                    | NodeRef::DirtySymlink { .. }
+                            );
+                            if !already_dirty {
+                                c.node = child_node;
+                            }
                         }
                         existing
                     } else {
