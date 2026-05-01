@@ -240,6 +240,69 @@ put/get. The daemon could generate pack files locally and upload them
 as single S3 objects. This is optional — per-object CAS works
 correctly and is simpler to implement first.
 
+### Deployment topologies unlocked by git convergence
+
+Git-convergent storage does more than simplify encoding. It also keeps
+jj-yak open to several deployment shapes without introducing a format
+boundary between them.
+
+#### Local-only daemon
+
+The simplest case remains a single user's daemon with no shared remote,
+or with a lightweight `dir://` remote for durability. This is today's
+development and testing model.
+
+#### Peer daemons
+
+Two or more developers can point at the same `grpc://` or `dir://`
+remote and share content plus mutable refs. This is the direct
+"daemon-to-daemon sync" model the current architecture already grows
+toward.
+
+#### Central team daemon with GitHub as upstream mirror
+
+A more interesting model becomes possible after convergence:
+
+- A central yak daemon or small yak service acts as the team's
+  low-latency workspace/cache layer.
+- Developers and agents create live workspaces against that central
+  service rather than talking to GitHub directly for every operation.
+- The central service periodically fetches from and pushes to GitHub,
+  or does so on explicit workflow boundaries.
+
+In that model:
+
+- **Yak is the live workspace backend.**
+- **GitHub is the publication/exchange remote.**
+- **Both store the same git objects.**
+
+That means the central service can provide:
+
+- Cheap workspace creation for humans and agents.
+- Shared hot caches for trees/blobs/commits across the team.
+- Faster steady-state operation than repeatedly talking to a git forge.
+- A place to centralize prefetch, workspace, and policy decisions.
+
+This is intentionally different from "mount GitHub itself as a live
+filesystem backend." GitHub speaks git's fetch/push protocols and is a
+good upstream/downstream synchronization point, but it is not a
+low-latency object-by-object workspace server.
+
+What git convergence guarantees is that the central yak service and
+GitHub can exchange content with zero translation. What it does **not**
+solve by itself is the operational side of running yak as a shared
+service:
+
+- multi-user auth and permissions
+- audit and policy
+- service-grade ref arbitration
+- quotas, garbage collection, and backup/recovery
+- observability and admin tooling
+
+Those are service-layer concerns, not reasons to avoid convergence.
+The important architectural point is that nothing in the git-convergent
+design blocks this topology later.
+
 ## Detailed design
 
 ### Daemon-side storage
@@ -626,6 +689,75 @@ require real-time object graph translation on every pack negotiation —
 effectively impossible at interactive speeds for non-trivial repos.
 With git objects as the store, the bare repo is already a git server
 waiting to be exposed.
+
+### Stock tool read-only interop
+
+The daemon controls the VFS — it already synthesizes `.jj/` at the
+workspace root (`YakFs::jj_subtree`, M7). After convergence, the
+backing store is a real bare git repo. The daemon could additionally
+synthesize a `.git` gitdir file pointing at it:
+
+```
+# synthesized by the VFS at the workspace root
+.git        →  gitdir: <storage_dir>/mounts/<hash>/git/
+.jj/        →  (already pinned, yak CLI metadata)
+src/
+README.md
+```
+
+This makes **read-only stock tooling** work against any yak mount
+without special setup:
+
+- `git log`, `git diff`, `git blame` — read the real git ODB
+- `jj log` (with appropriate repo config) — read the real git backend
+- editors, language servers, `grep -r` — just files on a mount
+
+#### What works
+
+Read operations that go through the git ODB are safe. The bare repo
+is a standard git repo with standard objects. `gix` and `libgit2`
+can read it concurrently with the daemon — gix's ODB uses lock-free
+reads by design (see "Concurrent VFS reads" above).
+
+#### What doesn't
+
+**Write operations from stock tools conflict with the daemon.** The
+daemon owns the `GitBackend` — it manages ODB writes, the extras
+table, refs, and the op store. Stock `git commit` or `jj new`
+writing to the same bare repo concurrently would corrupt state.
+
+Specific conflicts:
+
+- **Op store ownership.** Yak's `YakOpStore` and `YakOpHeadsStore`
+  route through gRPC with remote sync and CAS arbitration. Stock
+  `jj` would try to read/write op store files directly on disk.
+  Two code paths managing the same op state is a conflict.
+- **Extras table.** `GitBackend`'s extras (change-id, predecessors)
+  are managed by the daemon's wrapper. Stock `jj` opening the same
+  extras table concurrently risks corrupting the stacked-table
+  segments.
+- **Ref management.** The daemon manages refs in the bare repo for
+  sync and push/fetch. Stock `git` updating refs independently
+  breaks the daemon's view.
+
+#### Possible future path
+
+A read-only interop mode is nearly free after convergence — the VFS
+synthesizes the gitdir pointer, stock tools read real git objects,
+writes are rejected or redirected. A full read-write mode would
+require either:
+
+- Exclusive access arbitration (daemon yields the git repo to stock
+  tools, then re-acquires), or
+- A proxy `Backend` that stock `jj` uses to talk to the daemon via
+  gRPC instead of touching the git repo directly (which is what the
+  yak CLI already does via `YakBackend`).
+
+Neither is planned for the convergence milestone. The read-only
+interop is a natural consequence of the content store being real git
+objects and is worth noting as a benefit, but full stock tool
+compatibility is a separate design problem (see
+[`WORKSPACES.md`](./WORKSPACES.md) §Stock tool compatibility).
 
 ## Migration
 
