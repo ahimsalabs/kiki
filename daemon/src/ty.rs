@@ -470,3 +470,302 @@ mod tests {
         assert!(err.to_string().contains("foo"), "got: {err}");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use jj_lib::content_hash::ContentHash;
+    use proptest::prelude::*;
+
+    // ---- Arbitrary strategies ----
+
+    fn arb_id() -> impl Strategy<Value = Id> {
+        any::<[u8; 32]>().prop_map(Id)
+    }
+
+    fn arb_file() -> impl Strategy<Value = File> {
+        any::<Vec<u8>>().prop_map(|content| File { content })
+    }
+
+    fn arb_symlink() -> impl Strategy<Value = Symlink> {
+        any::<String>().prop_map(|target| Symlink { target })
+    }
+
+    fn arb_tree_entry() -> impl Strategy<Value = TreeEntry> {
+        prop_oneof![
+            (arb_id(), any::<bool>(), any::<Vec<u8>>()).prop_map(|(id, executable, copy_id)| {
+                TreeEntry::File {
+                    id,
+                    executable,
+                    copy_id,
+                }
+            }),
+            arb_id().prop_map(TreeEntry::TreeId),
+            arb_id().prop_map(TreeEntry::SymlinkId),
+            arb_id().prop_map(TreeEntry::ConflictId),
+        ]
+    }
+
+    fn arb_tree_entry_mapping() -> impl Strategy<Value = TreeEntryMapping> {
+        ("[a-z]{1,8}", arb_tree_entry()).prop_map(|(name, entry)| TreeEntryMapping { name, entry })
+    }
+
+    fn arb_tree() -> impl Strategy<Value = Tree> {
+        prop::collection::vec(arb_tree_entry_mapping(), 0..8)
+            .prop_map(|entries| Tree { entries })
+    }
+
+    fn arb_commit_timestamp() -> impl Strategy<Value = CommitTimestamp> {
+        (any::<i64>(), any::<i32>()).prop_map(|(millis_since_epoch, tz_offset)| CommitTimestamp {
+            millis_since_epoch,
+            tz_offset,
+        })
+    }
+
+    fn arb_commit_signature() -> impl Strategy<Value = CommitSignature> {
+        (".*", ".*", arb_commit_timestamp()).prop_map(|(name, email, timestamp)| {
+            CommitSignature {
+                name,
+                email,
+                timestamp,
+            }
+        })
+    }
+
+    fn arb_commit() -> impl Strategy<Value = Commit> {
+        (
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..64), 0..4),
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..64), 0..4),
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..64), 0..4),
+            prop::collection::vec(".*", 0..4),
+            any::<bool>(),
+            prop::collection::vec(any::<u8>(), 0..64),
+            ".*",
+            prop::option::of(arb_commit_signature()),
+            prop::option::of(arb_commit_signature()),
+        )
+            .prop_map(
+                |(
+                    parents,
+                    predecessors,
+                    root_tree,
+                    conflict_labels,
+                    uses_tree_conflict_format,
+                    change_id,
+                    description,
+                    author,
+                    committer,
+                )| {
+                    Commit {
+                        parents,
+                        predecessors,
+                        root_tree,
+                        conflict_labels,
+                        uses_tree_conflict_format,
+                        change_id,
+                        description,
+                        author,
+                        committer,
+                    }
+                },
+            )
+    }
+
+    // ---- Id invariants ----
+
+    proptest! {
+        #[test]
+        fn id_try_from_rejects_wrong_length(len in 0..128usize) {
+            prop_assume!(len != 32);
+            let v = vec![0u8; len];
+            prop_assert!(Id::try_from(v).is_err());
+        }
+
+        #[test]
+        fn id_try_from_accepts_32_bytes(bytes in any::<[u8; 32]>()) {
+            let v = bytes.to_vec();
+            let id = Id::try_from(v).unwrap();
+            prop_assert_eq!(id.0, bytes);
+        }
+
+        #[test]
+        fn id_display_is_64_hex_chars(id in arb_id()) {
+            let s = format!("{id}");
+            prop_assert_eq!(s.len(), 64);
+            prop_assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        #[test]
+        fn id_vec_u8_roundtrip(bytes in any::<[u8; 32]>()) {
+            let id = Id(bytes);
+            let v: Vec<u8> = id.into();
+            let id2 = Id::try_from(v).unwrap();
+            prop_assert_eq!(id, id2);
+        }
+    }
+
+    // ---- File round-trip ----
+
+    proptest! {
+        #[test]
+        fn file_proto_roundtrip(file in arb_file()) {
+            let proto = file.as_proto();
+            let back = File::from(proto);
+            prop_assert_eq!(file.content, back.content);
+        }
+
+        #[test]
+        fn file_hash_is_deterministic(file in arb_file()) {
+            let h1 = file.get_hash();
+            let h2 = file.get_hash();
+            prop_assert_eq!(h1, h2);
+        }
+    }
+
+    // ---- Symlink round-trip ----
+
+    proptest! {
+        #[test]
+        fn symlink_proto_roundtrip(sym in arb_symlink()) {
+            let proto = sym.as_proto();
+            let back = Symlink::from(proto);
+            prop_assert_eq!(sym.target, back.target);
+        }
+
+        #[test]
+        fn symlink_hash_is_deterministic(sym in arb_symlink()) {
+            let h1 = sym.get_hash();
+            let h2 = sym.get_hash();
+            prop_assert_eq!(h1, h2);
+        }
+    }
+
+    // ---- Tree round-trip ----
+
+    proptest! {
+        #[test]
+        fn tree_proto_roundtrip(tree in arb_tree()) {
+            let proto = tree.as_proto();
+            let back = Tree::try_from(proto).unwrap();
+            prop_assert_eq!(tree.entries.len(), back.entries.len());
+            for (orig, decoded) in tree.entries.iter().zip(back.entries.iter()) {
+                prop_assert_eq!(&orig.name, &decoded.name);
+                // Compare the proto representation for deep equality
+                // (TreeEntry doesn't derive PartialEq).
+                let orig_proto = orig.entry.as_proto();
+                let back_proto = decoded.entry.as_proto();
+                prop_assert_eq!(format!("{orig_proto:?}"), format!("{back_proto:?}"));
+            }
+        }
+
+        #[test]
+        fn tree_hash_is_deterministic(tree in arb_tree()) {
+            let h1 = tree.get_hash();
+            let h2 = tree.get_hash();
+            prop_assert_eq!(h1, h2);
+        }
+    }
+
+    // ---- TreeEntry discriminant isolation ----
+    // Two entries of different variants with the same Id must produce
+    // different content hashes. This is load-bearing for store integrity.
+
+    proptest! {
+        #[test]
+        fn tree_entry_discriminant_isolation(id in arb_id()) {
+            let file_entry = TreeEntry::File {
+                id,
+                executable: false,
+                copy_id: Vec::new(),
+            };
+            let tree_entry = TreeEntry::TreeId(id);
+            let symlink_entry = TreeEntry::SymlinkId(id);
+            let conflict_entry = TreeEntry::ConflictId(id);
+
+            let hash = |entry: &TreeEntry| -> blake3::Hash {
+                let mut hasher = blake3::Hasher::new();
+                entry.hash(&mut hasher);
+                hasher.finalize()
+            };
+
+            let h_file = hash(&file_entry);
+            let h_tree = hash(&tree_entry);
+            let h_sym = hash(&symlink_entry);
+            let h_conflict = hash(&conflict_entry);
+
+            // All four must be distinct.
+            let hashes = [h_file, h_tree, h_sym, h_conflict];
+            for i in 0..hashes.len() {
+                for j in (i + 1)..hashes.len() {
+                    prop_assert_ne!(hashes[i], hashes[j],
+                        "discriminant collision between variant {} and {}", i, j);
+                }
+            }
+        }
+
+        /// Non-empty copy_id must produce a different hash than empty.
+        #[test]
+        fn file_entry_copy_id_matters(id in arb_id(), copy_id in prop::collection::vec(any::<u8>(), 1..32)) {
+            let with_copy = TreeEntry::File {
+                id,
+                executable: false,
+                copy_id: copy_id.clone(),
+            };
+            let without_copy = TreeEntry::File {
+                id,
+                executable: false,
+                copy_id: Vec::new(),
+            };
+
+            let hash = |entry: &TreeEntry| -> blake3::Hash {
+                let mut hasher = blake3::Hasher::new();
+                entry.hash(&mut hasher);
+                hasher.finalize()
+            };
+
+            prop_assert_ne!(hash(&with_copy), hash(&without_copy),
+                "non-empty copy_id should produce a different hash");
+        }
+    }
+
+    // ---- Commit round-trip ----
+
+    proptest! {
+        #[test]
+        fn commit_proto_roundtrip(commit in arb_commit()) {
+            let proto = commit.as_proto();
+            let back = Commit::try_from(proto).unwrap();
+            prop_assert_eq!(&commit.parents, &back.parents);
+            prop_assert_eq!(&commit.predecessors, &back.predecessors);
+            prop_assert_eq!(&commit.root_tree, &back.root_tree);
+            prop_assert_eq!(&commit.conflict_labels, &back.conflict_labels);
+            prop_assert_eq!(commit.uses_tree_conflict_format, back.uses_tree_conflict_format);
+            prop_assert_eq!(&commit.change_id, &back.change_id);
+            prop_assert_eq!(&commit.description, &back.description);
+            // Verify author/committer presence round-trips.
+            prop_assert_eq!(commit.author.is_some(), back.author.is_some());
+            prop_assert_eq!(commit.committer.is_some(), back.committer.is_some());
+        }
+
+        #[test]
+        fn commit_hash_is_deterministic(commit in arb_commit()) {
+            let h1 = commit.get_hash();
+            let h2 = commit.get_hash();
+            prop_assert_eq!(h1, h2);
+        }
+    }
+
+    // ---- CommitSignature round-trip ----
+
+    proptest! {
+        #[test]
+        fn commit_signature_roundtrip(sig in arb_commit_signature()) {
+            let proto = sig.as_proto();
+            let back = CommitSignature::try_from(proto).unwrap();
+            prop_assert_eq!(&sig.name, &back.name);
+            prop_assert_eq!(&sig.email, &back.email);
+            prop_assert_eq!(sig.timestamp.millis_since_epoch, back.timestamp.millis_since_epoch);
+            prop_assert_eq!(sig.timestamp.tz_offset, back.timestamp.tz_offset);
+        }
+    }
+}

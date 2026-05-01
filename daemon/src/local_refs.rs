@@ -292,3 +292,174 @@ mod tests {
         assert_eq!(r2.get_ref("k").unwrap().as_deref(), Some(&b"v"[..]));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::remote::validate_ref_name;
+    use crate::store::Store;
+    use proptest::prelude::*;
+
+    /// Strategy for valid ref names: non-empty, no NUL, no '/',
+    /// not "." or "..".
+    fn arb_valid_ref_name() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_.][a-zA-Z0-9_.]{0,15}"
+            .prop_filter("not . or ..", |s| s != "." && s != "..")
+    }
+
+    fn refs() -> LocalRefs {
+        let store = Store::new_in_memory();
+        LocalRefs::new(store.database())
+    }
+
+    // ---- validate_ref_name never panics ----
+
+    proptest! {
+        #[test]
+        fn validate_ref_name_never_panics(name in ".*") {
+            // We only care that it doesn't panic — Ok or Err are both fine.
+            let _ = validate_ref_name(&name);
+        }
+
+        /// Valid names must always pass validation.
+        #[test]
+        fn valid_ref_names_accepted(name in arb_valid_ref_name()) {
+            prop_assert!(validate_ref_name(&name).is_ok(),
+                "expected valid: {name:?}");
+        }
+
+        /// Names containing NUL, '/', or being "."/".."/empty must fail.
+        #[test]
+        fn invalid_ref_names_rejected(name in prop_oneof![
+            Just(String::new()),
+            Just(".".to_owned()),
+            Just("..".to_owned()),
+            ".*\0.*",           // contains NUL
+            ".*/.*",            // contains slash
+        ]) {
+            prop_assert!(validate_ref_name(&name).is_err(),
+                "expected invalid: {name:?}");
+        }
+    }
+
+    // ---- CAS sequential model checking ----
+    //
+    // We generate a sequence of CAS operations on a single ref name and
+    // verify the outcome matches a simple sequential model (a HashMap).
+
+    #[derive(Clone, Debug)]
+    enum RefOp {
+        /// Create: expected=None, new=Some(value)
+        Create(Vec<u8>),
+        /// Update: expected=current, new=Some(value)
+        UpdateCorrect(Vec<u8>),
+        /// Stale update: expected=stale, new=Some(value). Must conflict.
+        UpdateStale(Vec<u8>, Vec<u8>),
+        /// Delete: expected=current, new=None
+        Delete,
+    }
+
+    fn arb_ref_op() -> impl Strategy<Value = RefOp> {
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..32).prop_map(RefOp::Create),
+            prop::collection::vec(any::<u8>(), 0..32).prop_map(RefOp::UpdateCorrect),
+            (
+                prop::collection::vec(any::<u8>(), 0..32),
+                prop::collection::vec(any::<u8>(), 0..32),
+            )
+                .prop_map(|(stale, new)| RefOp::UpdateStale(stale, new)),
+            Just(RefOp::Delete),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn cas_sequential_model(ops in prop::collection::vec(arb_ref_op(), 1..16)) {
+            let r = refs();
+            let name = "test_ref";
+            let mut model: Option<Bytes> = None;
+
+            for op in ops {
+                match op {
+                    RefOp::Create(v) => {
+                        let new_val = Bytes::from(v);
+                        let outcome = r.cas_ref(name, None, Some(&new_val)).unwrap();
+                        if model.is_none() {
+                            prop_assert_eq!(&outcome, &CasOutcome::Updated);
+                            model = Some(new_val);
+                        } else {
+                            // Ref exists — create-only must conflict.
+                            match &outcome {
+                                CasOutcome::Conflict { actual } => {
+                                    prop_assert_eq!(actual, &model);
+                                }
+                                CasOutcome::Updated => {
+                                    prop_assert!(false, "create-only must conflict on existing ref");
+                                }
+                            }
+                        }
+                    }
+                    RefOp::UpdateCorrect(v) => {
+                        let new_val = Bytes::from(v);
+                        let outcome = r.cas_ref(
+                            name,
+                            model.as_ref(),
+                            Some(&new_val),
+                        ).unwrap();
+                        prop_assert_eq!(&outcome, &CasOutcome::Updated);
+                        model = Some(new_val);
+                    }
+                    RefOp::UpdateStale(stale, new_val) => {
+                        let stale = Bytes::from(stale);
+                        let new_val = Bytes::from(new_val);
+                        // Only actually stale if the model disagrees.
+                        if model.as_ref() == Some(&stale) {
+                            // Not actually stale — just a regular update.
+                            let outcome = r.cas_ref(name, Some(&stale), Some(&new_val)).unwrap();
+                            prop_assert_eq!(&outcome, &CasOutcome::Updated);
+                            model = Some(new_val);
+                        } else {
+                            let outcome = r.cas_ref(name, Some(&stale), Some(&new_val)).unwrap();
+                            match &outcome {
+                                CasOutcome::Conflict { actual } => {
+                                    prop_assert_eq!(actual, &model);
+                                }
+                                CasOutcome::Updated => {
+                                    prop_assert!(false, "stale CAS must conflict");
+                                }
+                            }
+                        }
+                    }
+                    RefOp::Delete => {
+                        let outcome = r.cas_ref(name, model.as_ref(), None).unwrap();
+                        prop_assert_eq!(&outcome, &CasOutcome::Updated);
+                        model = None;
+                    }
+                }
+                // Verify get_ref matches the model at every step.
+                let got = r.get_ref(name).unwrap();
+                prop_assert_eq!(&got, &model);
+            }
+        }
+
+        /// list_refs output is always sorted, regardless of insertion order.
+        #[test]
+        fn list_refs_always_sorted(
+            names in prop::collection::vec(arb_valid_ref_name(), 1..16),
+        ) {
+            let r = refs();
+            let val = Bytes::from_static(b"x");
+            for name in &names {
+                // Ignore conflicts — just populate.
+                let _ = r.cas_ref(name, None, Some(&val));
+            }
+            let listed = r.list_refs().unwrap();
+            let mut sorted = listed.clone();
+            sorted.sort();
+            sorted.dedup();
+            prop_assert_eq!(&listed, &sorted, "list_refs must return sorted unique names");
+        }
+    }
+}

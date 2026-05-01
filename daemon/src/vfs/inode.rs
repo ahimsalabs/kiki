@@ -705,3 +705,271 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn id(byte: u8) -> Id {
+        Id([byte; 32])
+    }
+
+    fn arb_id() -> impl Strategy<Value = Id> {
+        any::<[u8; 32]>().prop_map(Id)
+    }
+
+    /// Strategy for valid child names (non-empty, no '/' or NUL).
+    fn arb_child_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_.]{0,7}"
+    }
+
+    // ---- intern_child idempotency ----
+
+    proptest! {
+        /// Interning the same (parent, name) pair N times always returns
+        /// the same id, and the original make_node result is the one stored.
+        #[test]
+        fn intern_child_idempotent(
+            root_id in arb_id(),
+            name in arb_child_name(),
+            child_id in arb_id(),
+            n in 2..8usize,
+        ) {
+            let slab = InodeSlab::new(root_id);
+            let first = slab.intern_child(ROOT_INODE, &name, || NodeRef::File {
+                id: child_id,
+                executable: false,
+            });
+            for _ in 1..n {
+                let again = slab.intern_child(ROOT_INODE, &name, || NodeRef::File {
+                    id: Id([0xff; 32]), // different — must not be observed
+                    executable: true,
+                });
+                prop_assert_eq!(first, again);
+            }
+            // Verify the stored node is the first one, not any later closure.
+            let inode = slab.get(first).unwrap();
+            match inode.node {
+                NodeRef::File { id: stored_id, executable } => {
+                    prop_assert_eq!(stored_id, child_id);
+                    prop_assert!(!executable);
+                }
+                _ => prop_assert!(false, "expected File, got {:?}", inode.node),
+            }
+        }
+    }
+
+    // ---- alloc monotonicity ----
+
+    proptest! {
+        /// Allocating N children produces strictly increasing inode ids.
+        #[test]
+        fn alloc_ids_are_monotonic(n in 2..32usize) {
+            let slab = InodeSlab::new(id(0));
+            let mut prev = 0u64;
+            for i in 0..n {
+                let child = slab.alloc(
+                    ROOT_INODE,
+                    format!("child_{i}"),
+                    NodeRef::File {
+                        id: id(i as u8),
+                        executable: false,
+                    },
+                );
+                prop_assert!(child > prev, "id {child} must be > {prev}");
+                prev = child;
+            }
+        }
+    }
+
+    // ---- attach / detach round-trip ----
+
+    proptest! {
+        /// After attach, the child is reachable via intern_child.
+        /// After detach, the child inode persists but name lookup fails.
+        #[test]
+        fn attach_detach_roundtrip(name in arb_child_name(), content in prop::collection::vec(any::<u8>(), 0..64)) {
+            let slab = InodeSlab::new(id(1));
+            slab.replace_node(ROOT_INODE, NodeRef::DirtyTree { children: BTreeMap::new() });
+
+            let child = slab.alloc(
+                ROOT_INODE,
+                name.clone(),
+                NodeRef::DirtyFile { content: content.clone(), executable: false },
+            );
+            prop_assert!(slab.attach_child(ROOT_INODE, name.clone(), child));
+
+            // Reachable via cache.
+            let looked_up = slab.intern_child(ROOT_INODE, &name, || panic!("should hit cache"));
+            prop_assert_eq!(looked_up, child);
+
+            // Detach.
+            let detached = slab.detach_child(ROOT_INODE, &name);
+            prop_assert_eq!(detached, Some(child));
+
+            // Name lookup now misses (allocates fresh).
+            let fresh = slab.intern_child(ROOT_INODE, &name, || NodeRef::File {
+                id: id(0xff),
+                executable: false,
+            });
+            prop_assert!(fresh > child, "fresh id after detach must be > old");
+
+            // But the orphaned child inode is still in the slab.
+            prop_assert!(slab.get(child).is_some(), "orphaned child must survive detach");
+        }
+    }
+
+    // ---- duplicate attach is rejected ----
+
+    proptest! {
+        #[test]
+        fn duplicate_attach_rejected(name in arb_child_name()) {
+            let slab = InodeSlab::new(id(1));
+            slab.replace_node(ROOT_INODE, NodeRef::DirtyTree { children: BTreeMap::new() });
+
+            let c1 = slab.alloc(ROOT_INODE, name.clone(), NodeRef::DirtyFile {
+                content: Vec::new(),
+                executable: false,
+            });
+            let c2 = slab.alloc(ROOT_INODE, name.clone(), NodeRef::DirtyFile {
+                content: Vec::new(),
+                executable: false,
+            });
+            prop_assert!(slab.attach_child(ROOT_INODE, name.clone(), c1));
+            prop_assert!(!slab.attach_child(ROOT_INODE, name.clone(), c2),
+                "duplicate attach must fail");
+        }
+    }
+
+    // ---- swap_root clears only root-level cache ----
+
+    proptest! {
+        /// After swap_root, (ROOT, *) entries are gone but (sub, *) survive.
+        #[test]
+        fn swap_root_selective_clear(
+            n_root_children in 1..6usize,
+            n_sub_children in 1..6usize,
+        ) {
+            let slab = InodeSlab::new(id(1));
+            let mut root_children = Vec::new();
+            for i in 0..n_root_children {
+                let name = format!("r{i}");
+                let child = slab.intern_child(ROOT_INODE, &name, || NodeRef::File {
+                    id: id(i as u8 + 10),
+                    executable: false,
+                });
+                root_children.push((name, child));
+            }
+
+            // Create a subtree and intern children under it.
+            let sub = slab.intern_child(ROOT_INODE, "sub", || NodeRef::Tree(id(0x50)));
+            let mut sub_children = Vec::new();
+            for i in 0..n_sub_children {
+                let name = format!("s{i}");
+                let child = slab.intern_child(sub, &name, || NodeRef::File {
+                    id: id(i as u8 + 20),
+                    executable: false,
+                });
+                sub_children.push((name, child));
+            }
+
+            slab.swap_root(id(0x99));
+
+            // Root-level re-intern should allocate fresh ids.
+            for (name, old_id) in &root_children {
+                let new_id = slab.intern_child(ROOT_INODE, name, || NodeRef::File {
+                    id: id(0xff),
+                    executable: false,
+                });
+                prop_assert!(new_id > *old_id, "root child {name} must get fresh id");
+            }
+            // "sub" entry under root is also gone.
+            let new_sub = slab.intern_child(ROOT_INODE, "sub", || NodeRef::Tree(id(0x51)));
+            prop_assert!(new_sub > sub, "sub entry under root must get fresh id");
+
+            // Sub-tree children must survive (cache hit, no allocation).
+            for (name, old_id) in &sub_children {
+                let same = slab.intern_child(sub, name, || {
+                    panic!("sub-tree cache for {name} should have survived swap_root")
+                });
+                prop_assert_eq!(same, *old_id);
+            }
+        }
+    }
+
+    // ---- materialize preserves dirty children (generalized Bug 3 regression) ----
+
+    proptest! {
+        /// Create N children, mark a random subset as dirty, then
+        /// materialize the parent. Dirty children must keep their
+        /// in-memory content; clean children get the loader's NodeRef.
+        #[test]
+        fn materialize_preserves_arbitrary_dirty_subset(
+            n in 1..8usize,
+            dirty_mask in any::<u8>(),
+        ) {
+            let slab = InodeSlab::new(id(1));
+            let mut names_and_ids = Vec::new();
+            let mut dirty_set = std::collections::HashSet::new();
+
+            for i in 0..n {
+                let name = format!("f{i}");
+                let child = slab.intern_child(ROOT_INODE, &name, || NodeRef::File {
+                    id: id(i as u8 + 10),
+                    executable: false,
+                });
+                // Use one bit of dirty_mask per child to decide.
+                if (dirty_mask >> (i % 8)) & 1 == 1 {
+                    slab.replace_node(child, NodeRef::DirtyFile {
+                        content: format!("dirty_{i}").into_bytes(),
+                        executable: false,
+                    });
+                    dirty_set.insert(i);
+                }
+                names_and_ids.push((name, child, i));
+            }
+
+            // Materialize parent — loader provides the original clean refs.
+            let children = slab.materialize_dir_for_mutation(ROOT_INODE, || {
+                (0..n).map(|i| {
+                    (
+                        format!("f{i}"),
+                        NodeRef::File {
+                            id: id(i as u8 + 10),
+                            executable: false,
+                        },
+                    )
+                })
+            }).expect("materialize");
+
+            for (name, old_id, i) in &names_and_ids {
+                let child_id = children[name];
+                prop_assert_eq!(child_id, *old_id,
+                    "must reuse existing id for {}", name);
+
+                let inode = slab.get(child_id).unwrap();
+                if dirty_set.contains(i) {
+                    let expected = format!("dirty_{i}").into_bytes();
+                    match &inode.node {
+                        NodeRef::DirtyFile { content, .. } => {
+                            prop_assert_eq!(content, &expected,
+                                "dirty child {} content must survive", name);
+                        }
+                        other => prop_assert!(false,
+                            "dirty child {} should be DirtyFile, got {:?}", name, other),
+                    }
+                } else {
+                    match &inode.node {
+                        NodeRef::File { id: file_id, .. } => {
+                            prop_assert_eq!(*file_id, id(*i as u8 + 10),
+                                "clean child {} should have loader's id", name);
+                        }
+                        other => prop_assert!(false,
+                            "clean child {} should be File, got {:?}", name, other),
+                    }
+                }
+            }
+        }
+    }
+}

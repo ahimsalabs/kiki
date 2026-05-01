@@ -281,3 +281,110 @@ root_tree_id = ""
         assert!(chained.contains("even"), "got: {chained}");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ---- hex_bytes round-trip ----
+    //
+    // Serialize then deserialize any byte vec through the TOML hex_bytes
+    // serde module. The round-trip must be identity.
+
+    proptest! {
+        #[test]
+        fn hex_bytes_roundtrip(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
+            // Use a MountMetadata with the bytes in op_id as the vehicle.
+            let m = MountMetadata {
+                working_copy_path: "/test".into(),
+                remote: "r".into(),
+                op_id: bytes.clone(),
+                workspace_id: Vec::new(),
+                root_tree_id: Vec::new(),
+            };
+            let serialized = toml::to_string_pretty(&m).unwrap();
+            let back: MountMetadata = toml::from_str(&serialized).unwrap();
+            prop_assert_eq!(&bytes, &back.op_id);
+        }
+    }
+
+    // Odd-length hex strings must always be rejected by the deserializer.
+    proptest! {
+        #[test]
+        fn hex_rejects_odd_length(len in (1..128usize).prop_filter("odd only", |n| n % 2 != 0)) {
+            // Build a valid hex string of the given odd length.
+            let hex_str: String = "a".repeat(len);
+            let toml_str = format!(
+                "working_copy_path = \"/x\"\nremote = \"\"\nop_id = \"{hex_str}\"\nworkspace_id = \"\"\nroot_tree_id = \"\"\n"
+            );
+            let err = toml::from_str::<MountMetadata>(&toml_str);
+            prop_assert!(err.is_err(), "odd-length hex must be rejected");
+        }
+    }
+
+    // Non-hex characters in a hex field must be rejected.
+    proptest! {
+        #[test]
+        fn hex_rejects_non_hex_chars(
+            // Two valid hex chars + one garbage char + one valid hex char = even length.
+            garbage in "[^0-9a-fA-F]"
+        ) {
+            let hex_str = format!("ab{garbage}c");
+            // Pad to even length if needed.
+            let hex_str = if hex_str.len() % 2 != 0 {
+                format!("{hex_str}0")
+            } else {
+                hex_str
+            };
+            let toml_str = format!(
+                "working_copy_path = \"/x\"\nremote = \"\"\nop_id = \"{hex_str}\"\nworkspace_id = \"\"\nroot_tree_id = \"\"\n"
+            );
+            let result = toml::from_str::<MountMetadata>(&toml_str);
+            prop_assert!(result.is_err(), "non-hex chars must be rejected");
+        }
+    }
+
+    // ---- MountMetadata TOML round-trip ----
+
+    proptest! {
+        #[test]
+        fn mount_metadata_toml_roundtrip(
+            wc_path in "(/[a-z0-9]{1,8}){1,4}",
+            remote in "[a-z0-9.:]{1,20}",
+            op_id in prop::collection::vec(any::<u8>(), 0..64),
+            workspace_id in prop::collection::vec(any::<u8>(), 0..32),
+            root_tree_id in prop::collection::vec(any::<u8>(), 0..32),
+        ) {
+            let m = MountMetadata {
+                working_copy_path: wc_path,
+                remote,
+                op_id,
+                workspace_id,
+                root_tree_id,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mount.toml");
+            m.write_to(&path).unwrap();
+            let back = MountMetadata::read_from(&path).unwrap();
+            prop_assert_eq!(&m, &back);
+        }
+    }
+
+    // ---- mount_dir_name stability and shape ----
+
+    proptest! {
+        #[test]
+        fn mount_dir_name_is_16_hex_chars(path in ".*") {
+            let name = mount_dir_name(&path);
+            prop_assert_eq!(name.len(), 16, "expected 16-char name, got {}", name.len());
+            prop_assert!(name.chars().all(|c| c.is_ascii_hexdigit()),
+                "name must be hex: {name}");
+        }
+
+        #[test]
+        fn mount_dir_name_is_deterministic(path in ".*") {
+            prop_assert_eq!(mount_dir_name(&path), mount_dir_name(&path));
+        }
+    }
+}

@@ -551,3 +551,144 @@ mod tests {
         assert_eq!(got.content, b"persistent");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_id() -> impl Strategy<Value = Id> {
+        any::<[u8; 32]>().prop_map(Id)
+    }
+
+    fn arb_file() -> impl Strategy<Value = File> {
+        // Cap at 1 KiB to keep tests fast in redb.
+        prop::collection::vec(any::<u8>(), 0..1024).prop_map(|content| File { content })
+    }
+
+    fn arb_symlink() -> impl Strategy<Value = Symlink> {
+        any::<String>().prop_map(|target| Symlink { target })
+    }
+
+    fn arb_tree_entry_mapping() -> impl Strategy<Value = TreeEntryMapping> {
+        let entry = prop_oneof![
+            (arb_id(), any::<bool>(), prop::collection::vec(any::<u8>(), 0..8)).prop_map(
+                |(id, executable, copy_id)| TreeEntry::File {
+                    id,
+                    executable,
+                    copy_id,
+                }
+            ),
+            arb_id().prop_map(TreeEntry::TreeId),
+            arb_id().prop_map(TreeEntry::SymlinkId),
+            arb_id().prop_map(TreeEntry::ConflictId),
+        ];
+        ("[a-z]{1,8}", entry).prop_map(|(name, entry)| TreeEntryMapping { name, entry })
+    }
+
+    fn arb_tree() -> impl Strategy<Value = Tree> {
+        prop::collection::vec(arb_tree_entry_mapping(), 0..6)
+            .prop_map(|entries| Tree { entries })
+    }
+
+    fn arb_commit() -> impl Strategy<Value = Commit> {
+        (
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 0..3),
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 0..3),
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 0..3),
+            any::<bool>(),
+            prop::collection::vec(any::<u8>(), 0..32),
+            ".*",
+        )
+            .prop_map(
+                |(parents, predecessors, root_tree, uses_tree_conflict_format, change_id, description)| {
+                    Commit {
+                        parents,
+                        predecessors,
+                        root_tree,
+                        conflict_labels: Vec::new(),
+                        uses_tree_conflict_format,
+                        change_id,
+                        description,
+                        author: None,
+                        committer: None,
+                    }
+                },
+            )
+    }
+
+    // ---- Store write→read round-trips ----
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn file_store_roundtrip(file in arb_file()) {
+            let store = Store::new_in_memory();
+            let (id, _) = store.write_file(file.clone()).unwrap();
+            let got = store.get_file(id).unwrap().expect("file present");
+            prop_assert_eq!(&file.content, &got.content);
+        }
+
+        #[test]
+        fn symlink_store_roundtrip(sym in arb_symlink()) {
+            let store = Store::new_in_memory();
+            let (id, _) = store.write_symlink(sym.clone()).unwrap();
+            let got = store.get_symlink(id).unwrap().expect("symlink present");
+            prop_assert_eq!(&sym.target, &got.target);
+        }
+
+        #[test]
+        fn tree_store_roundtrip(tree in arb_tree()) {
+            let store = Store::new_in_memory();
+            let (id, _) = store.write_tree(tree.clone()).unwrap();
+            let got = store.get_tree(id).unwrap().expect("tree present");
+            prop_assert_eq!(tree.entries.len(), got.entries.len());
+            for (a, b) in tree.entries.iter().zip(got.entries.iter()) {
+                prop_assert_eq!(&a.name, &b.name);
+            }
+        }
+
+        #[test]
+        fn commit_store_roundtrip(commit in arb_commit()) {
+            let store = Store::new_in_memory();
+            let (id, _) = store.write_commit(commit.clone()).unwrap();
+            let got = store.get_commit(id).unwrap().expect("commit present");
+            prop_assert_eq!(&commit.parents, &got.parents);
+            prop_assert_eq!(&commit.predecessors, &got.predecessors);
+            prop_assert_eq!(&commit.root_tree, &got.root_tree);
+            prop_assert_eq!(&commit.change_id, &got.change_id);
+            prop_assert_eq!(&commit.description, &got.description);
+        }
+
+        /// The raw bytes path and the typed path must agree.
+        #[test]
+        fn file_bytes_matches_typed(file in arb_file()) {
+            let store = Store::new_in_memory();
+            let (id, returned_bytes) = store.write_file(file.clone()).unwrap();
+            let raw = store.get_file_bytes(id).unwrap().expect("bytes present");
+            prop_assert_eq!(returned_bytes, raw.clone());
+            // Re-decoding raw bytes must yield the same file.
+            let decoded_proto = proto::jj_interface::File::decode(raw.as_ref()).unwrap();
+            prop_assert_eq!(&file.content, &File::from(decoded_proto).content);
+        }
+    }
+
+    // ---- hex_encode prefix correctness ----
+
+    proptest! {
+        /// For any byte slice, hex_encode of the full slice starts with
+        /// hex_encode of any prefix.
+        #[test]
+        fn hex_encode_prefix_property(
+            bytes in prop::collection::vec(any::<u8>(), 1..32),
+            prefix_len in 0..32usize,
+        ) {
+            let prefix_len = prefix_len.min(bytes.len());
+            let full_hex = hex_encode(&bytes);
+            let prefix_hex = hex_encode(&bytes[..prefix_len]);
+            prop_assert!(full_hex.starts_with(&prefix_hex),
+                "full={full_hex} should start with prefix={prefix_hex}");
+        }
+    }
+}

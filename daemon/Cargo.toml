@@ -37,4 +37,5 @@ zstd.workspace = true
 
 [dev-dependencies]
 assert_matches = "1.5.0"
+proptest = "1"
 tempfile = "3.14.0"
