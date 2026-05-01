@@ -1,4 +1,5 @@
 use std::cell::OnceCell;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use jj_lib::working_copy::{
     SnapshotStats, WorkingCopy, WorkingCopyFactory, WorkingCopyStateError,
 };
 use proto::jj_interface::{CheckOutReq, GetCheckoutStateReq, GetTreeStateReq, SnapshotReq};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::blocking_client::BlockingJujutsuInterfaceClient;
 
@@ -215,8 +216,8 @@ impl YakWorkingCopy {
             .expect("checkout_state populated above"))
     }
 
-    fn get_working_copy_lock(&self) -> DaemonLock {
-        DaemonLock::new()
+    fn get_working_copy_lock(&self) -> Result<DaemonLock, WorkingCopyStateError> {
+        DaemonLock::new(&self.working_copy_path)
     }
 
     fn snapshot_via_daemon(&mut self) -> Result<MergedTree, SnapshotError> {
@@ -240,13 +241,44 @@ impl YakWorkingCopy {
     }
 }
 
-/// Distributed lock. The daemon hold the lock since all work
-/// is done in it.
-struct DaemonLock {}
+/// Per-working-copy mutation lock.
+#[derive(Debug)]
+struct DaemonLock {
+    #[allow(dead_code)]
+    file: File,
+}
 impl DaemonLock {
-    pub fn new() -> Self {
-        warn!("DaemonLock is unimplemented. No locking currently done.");
-        DaemonLock {}
+    fn lock_path(working_copy_path: &Path) -> PathBuf {
+        working_copy_path.join(".jj").join("working_copy").join("yak.lock")
+    }
+
+    pub fn new(working_copy_path: &Path) -> Result<Self, WorkingCopyStateError> {
+        let lock_path = Self::lock_path(working_copy_path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                wc_state_err(
+                    format!("failed to create lock directory {}", parent.display()),
+                    e,
+                )
+            })?;
+        }
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| wc_state_err(format!("failed to open {}", lock_path.display()), e))?;
+        file.try_lock().map_err(|e| {
+            wc_state_err(
+                format!(
+                    "working copy is already locked by another process: {}",
+                    lock_path.display()
+                ),
+                e,
+            )
+        })?;
+        Ok(DaemonLock { file })
     }
 }
 
@@ -283,7 +315,7 @@ impl WorkingCopy for YakWorkingCopy {
 
     fn start_mutation(&self) -> Result<Box<dyn LockedWorkingCopy>, WorkingCopyStateError> {
         info!("Starting mutation");
-        let lock = self.get_working_copy_lock();
+        let lock = self.get_working_copy_lock()?;
         let wc = YakWorkingCopy {
             client: self.client.clone(),
             store: self.store.clone(),
@@ -466,5 +498,29 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
         // `operation_id()` don't keep returning the stale value.
         self.wc.checkout_state = OnceCell::new();
         Ok(Box::new(self.wc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_lock_serializes_access_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let wc = dir.path();
+        std::fs::create_dir_all(wc.join(".jj").join("working_copy")).unwrap();
+
+        let first = DaemonLock::new(wc).expect("first lock");
+        let second = DaemonLock::new(wc).expect_err("second lock must fail");
+        assert!(second.message.contains("already locked"), "{second:?}");
+        drop(first);
+        DaemonLock::new(wc).expect("lock should be released after drop");
+    }
+
+    #[test]
+    fn daemon_lock_path_stays_in_jj_working_copy_dir() {
+        let path = DaemonLock::lock_path(Path::new("/tmp/repo"));
+        assert_eq!(path, Path::new("/tmp/repo/.jj/working_copy/yak.lock"));
     }
 }

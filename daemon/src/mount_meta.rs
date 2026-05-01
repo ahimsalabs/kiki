@@ -89,12 +89,18 @@ impl MountMetadata {
     }
 }
 
-/// Path-safe stable id for a working-copy path. Uses blake3 truncated
-/// to 16 hex chars (64 bits).
+/// Path-safe stable id for a working-copy path.
+///
+/// Uses a lowercase ASCII prefix plus 128 bits of blake3 output:
+/// - safe on case-insensitive filesystems (macOS default, Windows),
+/// - free of reserved path characters,
+/// - not a Windows device name,
+/// - substantially lowers collision risk versus the older 64-bit form.
 pub fn mount_dir_name(working_copy_path: &str) -> String {
     let hash = blake3_bytes(working_copy_path.as_bytes());
-    let mut s = String::with_capacity(16);
-    for b in &hash.as_bytes()[..8] {
+    let mut s = String::with_capacity(3 + 32);
+    s.push_str("wc-");
+    for b in &hash.as_bytes()[..16] {
         use std::fmt::Write;
         let _ = write!(&mut s, "{b:02x}");
     }
@@ -375,16 +381,25 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn mount_dir_name_is_16_hex_chars(path in ".*") {
+        fn mount_dir_name_is_prefixed_lower_hex(path in ".*") {
             let name = mount_dir_name(&path);
-            prop_assert_eq!(name.len(), 16, "expected 16-char name, got {}", name.len());
-            prop_assert!(name.chars().all(|c| c.is_ascii_hexdigit()),
-                "name must be hex: {name}");
+            prop_assert_eq!(name.len(), 35, "expected 35-char name, got {}", name.len());
+            prop_assert!(name.starts_with("wc-"), "name must use wc- prefix: {name}");
+            prop_assert!(name[3..].chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "suffix must be lowercase hex: {name}");
         }
 
         #[test]
         fn mount_dir_name_is_deterministic(path in ".*") {
             prop_assert_eq!(mount_dir_name(&path), mount_dir_name(&path));
         }
+    }
+
+    #[test]
+    fn mount_dir_name_avoids_windows_reserved_basename() {
+        let name = mount_dir_name("C:\\repo");
+        assert_ne!(name, "con");
+        assert_ne!(name, "aux");
+        assert_ne!(name, "nul");
     }
 }

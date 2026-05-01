@@ -4,7 +4,12 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _};
 use bytes::Bytes;
+use jj_lib::backend::CommitId as JjCommitId;
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_store::{OpStore as _, OperationId, RootOperationData, ViewId};
+use jj_lib::simple_op_store::SimpleOpStore;
 use proto::jj_interface::*;
+use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -92,6 +97,22 @@ fn remote_status(context: &str) -> impl FnOnce(anyhow::Error) -> Status + '_ {
     move |e| Status::internal(format!("{context}: {e:#}"))
 }
 
+fn metadata_status(context: &str) -> impl FnOnce(anyhow::Error) -> Status + '_ {
+    move |e| Status::internal(format!("{context}: {e:#}"))
+}
+
+fn persist_metadata_snapshot(
+    meta_path: &Option<PathBuf>,
+    metadata: &MountMetadata,
+) -> anyhow::Result<()> {
+    if let Some(path) = meta_path {
+        metadata
+            .write_to(path)
+            .with_context(|| format!("persisting {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn hex(id: &ty::Id) -> String {
     let mut s = String::with_capacity(id.0.len() * 2);
     for b in id.0 {
@@ -99,6 +120,97 @@ fn hex(id: &ty::Id) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+#[derive(Clone, Copy)]
+enum OpStoreBlobKind {
+    View,
+    Operation,
+}
+
+impl OpStoreBlobKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Operation => "operation",
+        }
+    }
+}
+
+fn op_store_root_data() -> RootOperationData {
+    RootOperationData {
+        root_commit_id: JjCommitId::new(vec![0]),
+    }
+}
+
+async fn validate_op_store_blob_id(
+    kind: OpStoreBlobKind,
+    requested_id: &[u8],
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    if requested_id.len() != 64 {
+        anyhow::bail!(
+            "{} id must be 64 bytes, got {}",
+            kind.as_str(),
+            requested_id.len()
+        );
+    }
+    if requested_id.iter().all(|b| *b == 0) {
+        anyhow::bail!(
+            "{} id is the reserved all-zero root id and must not be stored",
+            kind.as_str()
+        );
+    }
+
+    let scratch = TempDir::new().context("creating temp op-store scratch dir")?;
+    let store = SimpleOpStore::init(scratch.path(), op_store_root_data())
+        .with_context(|| format!("initializing temp {} store", kind.as_str()))?;
+    match kind {
+        OpStoreBlobKind::View => {
+            let requested_id = ViewId::new(requested_id.to_vec());
+            std::fs::write(scratch.path().join("views").join(requested_id.hex()), bytes)
+                .context("writing temp view blob")?;
+            let view = store
+                .read_view(&requested_id)
+                .await
+                .map_err(|e| anyhow!("decoding view blob: {e}"))?;
+            let canonical_id = store
+                .write_view(&view)
+                .await
+                .map_err(|e| anyhow!("rehashing view blob: {e}"))?;
+            if canonical_id.as_bytes() != requested_id.as_bytes() {
+                anyhow::bail!(
+                    "view id/bytes mismatch: requested {} but canonical id is {}",
+                    requested_id.hex(),
+                    canonical_id.hex()
+                );
+            }
+        }
+        OpStoreBlobKind::Operation => {
+            let requested_id = OperationId::new(requested_id.to_vec());
+            std::fs::write(
+                scratch.path().join("operations").join(requested_id.hex()),
+                bytes,
+            )
+            .context("writing temp operation blob")?;
+            let operation = store
+                .read_operation(&requested_id)
+                .await
+                .map_err(|e| anyhow!("decoding operation blob: {e}"))?;
+            let canonical_id = store
+                .write_operation(&operation)
+                .await
+                .map_err(|e| anyhow!("rehashing operation blob: {e}"))?;
+            if canonical_id.as_bytes() != requested_id.as_bytes() {
+                anyhow::bail!(
+                    "operation id/bytes mismatch: requested {} but canonical id is {}",
+                    requested_id.hex(),
+                    canonical_id.hex()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Per-mount working-copy state.
@@ -179,23 +291,6 @@ impl Mount {
         }
     }
 
-    /// Persist the current metadata to disk if the mount is backed by
-    /// a real `<storage_dir>` (not the in-memory test variant). Logs
-    /// failures rather than propagating them — the in-memory state is
-    /// still authoritative; a transient write failure shouldn't fail
-    /// the RPC. Hard failures will resurface on the next restart's
-    /// rehydrate scan.
-    fn persist_metadata(&self) {
-        if let Some(path) = &self.meta_path
-            && let Err(e) = self.metadata().write_to(path)
-        {
-            tracing::error!(
-                path = %path.display(),
-                error = %format!("{e:#}"),
-                "failed to persist mount metadata"
-            );
-        }
-    }
 }
 
 pub struct JujutsuService {
@@ -1114,9 +1209,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<WriteViewReply>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        if req.view_id.is_empty() {
-            return Err(Status::invalid_argument("view_id must not be empty"));
-        }
+        validate_op_store_blob_id(OpStoreBlobKind::View, &req.view_id, &req.data)
+            .await
+            .map_err(decode_status("view blob"))?;
         store
             .write_view_bytes(&req.view_id, &req.data)
             .map_err(store_status("write_view"))?;
@@ -1136,8 +1231,11 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<ReadViewReply>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        if req.view_id.is_empty() {
-            return Err(Status::invalid_argument("view_id must not be empty"));
+        if req.view_id.len() != 64 {
+            return Err(Status::invalid_argument(format!(
+                "view_id must be 64 bytes, got {}",
+                req.view_id.len()
+            )));
         }
         // Local hit.
         if let Some(bytes) = store
@@ -1156,6 +1254,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 .await
                 .map_err(remote_status("remote get_blob (view)"))?
         {
+            validate_op_store_blob_id(OpStoreBlobKind::View, &req.view_id, bytes.as_ref())
+                .await
+                .map_err(|e| Status::data_loss(format!("remote view blob: {e:#}")))?;
             // Populate local cache.
             store
                 .write_view_bytes(&req.view_id, &bytes)
@@ -1178,11 +1279,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<WriteOperationReply>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        if req.operation_id.is_empty() {
-            return Err(Status::invalid_argument(
-                "operation_id must not be empty",
-            ));
-        }
+        validate_op_store_blob_id(OpStoreBlobKind::Operation, &req.operation_id, &req.data)
+            .await
+            .map_err(decode_status("operation blob"))?;
         store
             .write_operation_bytes(&req.operation_id, &req.data)
             .map_err(store_status("write_operation"))?;
@@ -1206,10 +1305,11 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<ReadOperationReply>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        if req.operation_id.is_empty() {
-            return Err(Status::invalid_argument(
-                "operation_id must not be empty",
-            ));
+        if req.operation_id.len() != 64 {
+            return Err(Status::invalid_argument(format!(
+                "operation_id must be 64 bytes, got {}",
+                req.operation_id.len()
+            )));
         }
         // Local hit.
         if let Some(bytes) = store
@@ -1228,6 +1328,13 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 .await
                 .map_err(remote_status("remote get_blob (operation)"))?
         {
+            validate_op_store_blob_id(
+                OpStoreBlobKind::Operation,
+                &req.operation_id,
+                bytes.as_ref(),
+            )
+            .await
+            .map_err(|e| Status::data_loss(format!("remote operation blob: {e:#}")))?;
             store
                 .write_operation_bytes(&req.operation_id, &bytes)
                 .map_err(store_status("cache write_operation"))?;
@@ -1330,9 +1437,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 req.working_copy_path
             ))
         })?;
+        let new_metadata = MountMetadata {
+            working_copy_path: mount.working_copy_path.clone(),
+            remote: mount.remote.clone(),
+            op_id: checkout.op_id.clone(),
+            workspace_id: checkout.workspace_id.clone(),
+            root_tree_id: mount.root_tree_id.clone(),
+        };
+        persist_metadata_snapshot(&mount.meta_path, &new_metadata)
+            .map_err(metadata_status("persist checkout state"))?;
         mount.op_id = checkout.op_id;
         mount.workspace_id = checkout.workspace_id;
-        mount.persist_metadata();
         Ok(Response::new(SetCheckoutStateReply {}))
     }
 
@@ -1381,8 +1496,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // that didn't fully push to the remote.
         let mut mounts = self.mounts.lock().await;
         if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
-            mount.root_tree_id = new_root.0.to_vec();
-            mount.persist_metadata();
+            let new_root_tree_id = new_root.0.to_vec();
+            let new_metadata = MountMetadata {
+                working_copy_path: mount.working_copy_path.clone(),
+                remote: mount.remote.clone(),
+                op_id: mount.op_id.clone(),
+                workspace_id: mount.workspace_id.clone(),
+                root_tree_id: new_root_tree_id.clone(),
+            };
+            persist_metadata_snapshot(&mount.meta_path, &new_metadata)
+                .map_err(metadata_status("persist snapshot metadata"))?;
+            mount.root_tree_id = new_root_tree_id;
         } else {
             // Mount disappeared between the two locks; surface as
             // not_found rather than internal-error so a transient race
@@ -1439,8 +1563,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // sees through `fs`.
         let mut mounts = self.mounts.lock().await;
         if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
-            mount.root_tree_id = req.new_tree_id;
-            mount.persist_metadata();
+            let new_root_tree_id = req.new_tree_id;
+            let new_metadata = MountMetadata {
+                working_copy_path: mount.working_copy_path.clone(),
+                remote: mount.remote.clone(),
+                op_id: mount.op_id.clone(),
+                workspace_id: mount.workspace_id.clone(),
+                root_tree_id: new_root_tree_id.clone(),
+            };
+            persist_metadata_snapshot(&mount.meta_path, &new_metadata)
+                .map_err(metadata_status("persist checkout metadata"))?;
+            mount.root_tree_id = new_root_tree_id;
         } else {
             // Mount disappeared between the two locks. Extremely
             // unlikely (no Unmount RPC exists yet) but we should not
@@ -1462,6 +1595,7 @@ mod tests {
 
     use assert_matches::assert_matches;
     use proto::jj_interface::jujutsu_interface_server::JujutsuInterface;
+    use proptest::prelude::*;
     // Several tests decode raw blob bytes off the dir:// remote to
     // confirm write-through actually pushed the prost-encoded payload.
     // The trait import lives here (test-only) rather than at the
@@ -1489,6 +1623,62 @@ mod tests {
         }))
         .await
         .unwrap();
+    }
+
+    async fn make_view_blob() -> (Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SimpleOpStore::init(dir.path(), op_store_root_data()).unwrap();
+        let view = jj_lib::op_store::View::make_root(JjCommitId::new(vec![1]));
+        let view_id = store.write_view(&view).await.unwrap();
+        let bytes = std::fs::read(dir.path().join("views").join(view_id.hex())).unwrap();
+        (view_id.as_bytes().to_vec(), bytes)
+    }
+
+    async fn make_operation_blob() -> (Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SimpleOpStore::init(dir.path(), op_store_root_data()).unwrap();
+        let view = jj_lib::op_store::View::make_root(JjCommitId::new(vec![1]));
+        let view_id = store.write_view(&view).await.unwrap();
+        let mut operation = jj_lib::op_store::Operation::make_root(view_id);
+        operation.parents = vec![OperationId::from_bytes(&[0; 64])];
+        operation.metadata.description = "non-root".into();
+        let op_id = store.write_operation(&operation).await.unwrap();
+        let bytes = std::fs::read(dir.path().join("operations").join(op_id.hex())).unwrap();
+        (op_id.as_bytes().to_vec(), bytes)
+    }
+
+    proptest! {
+        #[test]
+        fn wrong_view_id_never_validates(idx in 0usize..64, delta in any::<u8>()) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (mut id, bytes) = make_view_blob().await;
+                let tweak = if delta == 0 { 1 } else { delta };
+                id[idx] ^= tweak;
+                prop_assert!(
+                    validate_op_store_blob_id(OpStoreBlobKind::View, &id, &bytes)
+                        .await
+                        .is_err()
+                );
+                Ok(())
+            })?;
+        }
+
+        #[test]
+        fn wrong_operation_id_never_validates(idx in 0usize..64, delta in any::<u8>()) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (mut id, bytes) = make_operation_blob().await;
+                let tweak = if delta == 0 { 1 } else { delta };
+                id[idx] ^= tweak;
+                prop_assert!(
+                    validate_op_store_blob_id(OpStoreBlobKind::Operation, &id, &bytes)
+                        .await
+                        .is_err()
+                );
+                Ok(())
+            })?;
+        }
     }
 
     #[tokio::test]
@@ -2098,6 +2288,44 @@ mod tests {
             StorageConfig::on_disk(storage_dir.path().to_owned()),
         );
         svc.rehydrate().await.expect("rehydrate empty dir");
+    }
+
+    #[tokio::test]
+    async fn set_checkout_state_returns_error_when_metadata_persist_fails() {
+        let storage_dir = tempfile::tempdir().expect("storage tempdir");
+        let svc = JujutsuService::new(
+            None,
+            StorageConfig::on_disk(storage_dir.path().to_owned()),
+        );
+        let path = "/tmp/persist-fail".to_string();
+        init_mount(&svc, &path).await;
+
+        let poison = storage_dir.path().join("not-a-dir");
+        std::fs::write(&poison, b"x").unwrap();
+        let mut mounts = svc.mounts.lock().await;
+        let mount = mounts.get_mut(&path).unwrap();
+        mount.meta_path = Some(poison.join("mount.toml"));
+        drop(mounts);
+
+        let err = svc
+            .set_checkout_state(Request::new(SetCheckoutStateReq {
+                working_copy_path: path.clone(),
+                checkout_state: Some(CheckoutState {
+                    op_id: vec![1, 2, 3],
+                    workspace_id: b"default".to_vec(),
+                }),
+            }))
+            .await
+            .expect_err("persist failure must fail the RPC");
+        assert_eq!(err.code(), tonic::Code::Internal);
+
+        let err = svc
+            .get_checkout_state(Request::new(GetCheckoutStateReq {
+                working_copy_path: path,
+            }))
+            .await
+            .expect_err("in-memory state must stay unchanged on persist failure");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
     // ---- M9 / Layer C: remote blob CAS service-level integration ----
@@ -2766,6 +2994,92 @@ mod tests {
     // ---- M10.6: op-store RPCs -----------------------------------------
 
     #[tokio::test]
+    async fn write_view_rejects_mismatched_id_bytes() {
+        let svc = JujutsuService::bare();
+        init_mount(&svc, "/tmp/m106badview").await;
+        let (_actual_id, bytes) = make_view_blob().await;
+        let err = svc
+            .write_view(Request::new(WriteViewReq {
+                working_copy_path: "/tmp/m106badview".into(),
+                view_id: vec![0x55; 64],
+                data: bytes,
+            }))
+            .await
+            .expect_err("mismatched view id must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn read_view_rejects_corrupt_remote_blob() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+        let svc = JujutsuService::bare();
+        init_mount_with_remote(&svc, "/tmp/m106badviewremote", &remote_url).await;
+
+        let (_actual_id, bytes) = make_view_blob().await;
+        let wrong_id = vec![0x66; 64];
+        let mut hex = String::with_capacity(128);
+        for b in &wrong_id {
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{b:02x}");
+        }
+        std::fs::create_dir_all(remote_dir.path().join("view")).unwrap();
+        std::fs::write(remote_dir.path().join("view").join(hex), bytes).unwrap();
+
+        let err = svc
+            .read_view(Request::new(ReadViewReq {
+                working_copy_path: "/tmp/m106badviewremote".into(),
+                view_id: wrong_id,
+            }))
+            .await
+            .expect_err("corrupt remote view blob must be rejected");
+        assert_eq!(err.code(), tonic::Code::DataLoss);
+    }
+
+    #[tokio::test]
+    async fn write_operation_rejects_mismatched_id_bytes() {
+        let svc = JujutsuService::bare();
+        init_mount(&svc, "/tmp/m106badop").await;
+        let (_actual_id, bytes) = make_operation_blob().await;
+        let err = svc
+            .write_operation(Request::new(WriteOperationReq {
+                working_copy_path: "/tmp/m106badop".into(),
+                operation_id: vec![0x77; 64],
+                data: bytes,
+            }))
+            .await
+            .expect_err("mismatched operation id must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn read_operation_rejects_corrupt_remote_blob() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_url = format!("dir://{}", remote_dir.path().display());
+        let svc = JujutsuService::bare();
+        init_mount_with_remote(&svc, "/tmp/m106badopremote", &remote_url).await;
+
+        let (_actual_id, bytes) = make_operation_blob().await;
+        let wrong_id = vec![0x88; 64];
+        let mut hex = String::with_capacity(128);
+        for b in &wrong_id {
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{b:02x}");
+        }
+        std::fs::create_dir_all(remote_dir.path().join("operation")).unwrap();
+        std::fs::write(remote_dir.path().join("operation").join(hex), bytes).unwrap();
+
+        let err = svc
+            .read_operation(Request::new(ReadOperationReq {
+                working_copy_path: "/tmp/m106badopremote".into(),
+                operation_id: wrong_id,
+            }))
+            .await
+            .expect_err("corrupt remote operation blob must be rejected");
+        assert_eq!(err.code(), tonic::Code::DataLoss);
+    }
+
+    #[tokio::test]
     async fn write_view_pushes_to_dir_remote() {
         let remote_dir = tempfile::tempdir().expect("remote tempdir");
         let svc = JujutsuService::bare();
@@ -2777,8 +3091,7 @@ mod tests {
         )
         .await;
 
-        let view_id = vec![0xab; 64];
-        let view_data = b"view-proto-bytes".to_vec();
+        let (view_id, view_data) = make_view_blob().await;
         svc.write_view(Request::new(WriteViewReq {
             working_copy_path: path.clone(),
             view_id: view_id.clone(),
@@ -2806,8 +3119,7 @@ mod tests {
         // Service A writes a view.
         let svc_a = JujutsuService::bare();
         init_mount_with_remote(&svc_a, "/tmp/m106b_a", &remote_url).await;
-        let view_id = vec![0xcd; 64];
-        let view_data = b"shared-view".to_vec();
+        let (view_id, view_data) = make_view_blob().await;
         svc_a
             .write_view(Request::new(WriteViewReq {
                 working_copy_path: "/tmp/m106b_a".into(),
@@ -2865,8 +3177,7 @@ mod tests {
         // A writes an operation.
         let svc_a = JujutsuService::bare();
         init_mount_with_remote(&svc_a, "/tmp/m106d_a", &remote_url).await;
-        let op_id = vec![0x11; 64];
-        let op_data = b"operation-bytes".to_vec();
+        let (op_id, op_data) = make_operation_blob().await;
         svc_a
             .write_operation(Request::new(WriteOperationReq {
                 working_copy_path: "/tmp/m106d_a".into(),
@@ -2896,21 +3207,25 @@ mod tests {
         let svc = JujutsuService::bare();
         init_mount(&svc, "/tmp/m106e").await;
 
-        let op_id = vec![0xab; 64];
+        let (op_id, op_data) = make_operation_blob().await;
         svc.write_operation(Request::new(WriteOperationReq {
             working_copy_path: "/tmp/m106e".into(),
             operation_id: op_id.clone(),
-            data: b"op-data".to_vec(),
+            data: op_data,
         }))
         .await
         .expect("write_operation");
 
-        // Prefix "abab" should match.
+        let mut prefix = String::with_capacity(8);
+        for b in &op_id[..4] {
+            use std::fmt::Write;
+            let _ = write!(&mut prefix, "{b:02x}");
+        }
         let got = svc
             .resolve_operation_id_prefix(Request::new(
                 ResolveOperationIdPrefixReq {
                     working_copy_path: "/tmp/m106e".into(),
-                    hex_prefix: "abab".into(),
+                    hex_prefix: prefix,
                 },
             ))
             .await
