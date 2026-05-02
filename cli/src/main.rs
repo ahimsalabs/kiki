@@ -856,6 +856,16 @@ async fn run_git_command(
 /// Resolve the canonical working-copy path for the current workspace.
 /// Walks up from cwd looking for `.jj/`, matching jj's workspace discovery.
 fn workspace_path(command_helper: &CommandHelper) -> Result<String, CommandError> {
+    // Prefer the workspace loader's root (handles -R correctly).
+    if let Ok(loader) = command_helper.workspace_loader() {
+        let root = loader.workspace_root();
+        return root
+            .to_str()
+            .map(|s| s.to_owned())
+            .ok_or_else(|| cli_error("workspace path is not valid UTF-8"));
+    }
+
+    // Fallback: walk up from cwd looking for .jj/.
     let cwd = command_helper.cwd();
     let mut dir = cwd.to_path_buf();
     loop {

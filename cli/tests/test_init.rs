@@ -157,6 +157,34 @@ fn test_nested_tree_round_trips() {
     ");
 }
 
+/// Running `kiki -R <path>` from inside a different workspace must resolve
+/// the correct workspace path — not the cwd's `.jj/`. Before the fix,
+/// `workspace_path()` walked up from cwd, found the wrong workspace, and
+/// the GitDetectHeadChange RPC returned NotFound (surfaced as a warning).
+#[test]
+fn test_dash_r_resolves_correct_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo1"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo2"]);
+    let repo1_path = test_env.env_root().join("repo1");
+    let repo2_path = test_env.env_root().join("repo2");
+
+    // Run `log` on repo2 but with cwd inside repo1. Before the fix this
+    // produced a "git import failed" warning because workspace_path()
+    // found repo1's .jj/ instead of repo2's.
+    let (stdout, stderr) = test_env.jj_cmd_ok(
+        &repo1_path,
+        &["-R", repo2_path.to_str().unwrap(), "log"],
+    );
+    // No warning about git import failure.
+    assert!(
+        !stderr.contains("git import failed"),
+        "unexpected git import warning when using -R: {stderr}"
+    );
+    // Should show repo2's log (different change id from repo1).
+    assert!(stdout.contains("rlvkpnrz"), "expected repo2's change id in log output: {stdout}");
+}
+
 // Symlink round-trip companion to `test_nested_tree_round_trips`.
 #[cfg(unix)]
 #[test]
