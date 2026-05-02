@@ -278,4 +278,42 @@ impl BlockingJujutsuInterfaceClient {
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.resolve_operation_id_prefix(request))
     }
+
+    // ---- Git remote operations ----------------------------------------
+
+    pub fn git_remote_add(
+        &self,
+        request: impl tonic::IntoRequest<GitRemoteAddReq>,
+    ) -> Result<tonic::Response<GitRemoteAddReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.git_remote_add(request))
+    }
+
+    pub fn git_remote_list(
+        &self,
+        request: impl tonic::IntoRequest<GitRemoteListReq>,
+    ) -> Result<tonic::Response<GitRemoteListReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.git_remote_list(request))
+    }
+
+    pub fn git_push(
+        &self,
+        request: impl tonic::IntoRequest<GitPushReq>,
+    ) -> Result<tonic::Response<GitPushReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.git_push(request))
+    }
+
+    pub fn git_fetch(
+        &self,
+        request: impl tonic::IntoRequest<GitFetchReq>,
+    ) -> Result<tonic::Response<GitFetchReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.git_fetch(request))
+    }
 }

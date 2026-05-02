@@ -191,6 +191,14 @@ service JujutsuInterface {
   rpc ReadOperation(ReadOperationReq) returns (ReadOperationReply) {}
   rpc ResolveOperationIdPrefix(ResolveOperationIdPrefixReq)
       returns (ResolveOperationIdPrefixReply) {}
+
+  // Git remote operations. The daemon's per-mount content store is a
+  // bare git repo (post git-convergence). These RPCs manage git remotes
+  // and drive push/fetch via git subprocess, matching `jj git` behavior.
+  rpc GitRemoteAdd(GitRemoteAddReq) returns (GitRemoteAddReply) {}
+  rpc GitRemoteList(GitRemoteListReq) returns (GitRemoteListReply) {}
+  rpc GitPush(GitPushReq) returns (GitPushReply) {}
+  rpc GitFetch(GitFetchReq) returns (GitFetchReply) {}
 }
 
 
@@ -487,4 +495,49 @@ message ResolveOperationIdPrefixReply {
   // Populated only when resolution == 1. Full raw bytes of the
   // matching operation id.
   bytes full_id = 2;
+}
+
+// Git remote operations (git convergence — see GIT_CONVERGENCE.md §git-remote-operations).
+// The daemon's per-mount content store is a bare git repo. These messages
+// drive git subprocess push/fetch and remote config, matching `jj git`.
+
+message GitRemoteAddReq {
+  string working_copy_path = 1;
+  string name = 2;
+  string url = 3;
+}
+message GitRemoteAddReply {}
+
+message GitRemoteListReq {
+  string working_copy_path = 1;
+}
+message GitRemoteListReply {
+  message Remote {
+    string name = 1;
+    string url = 2;
+  }
+  repeated Remote remotes = 1;
+}
+
+message GitPushReq {
+  string working_copy_path = 1;
+  string remote = 2;
+  repeated GitPushBookmark bookmarks = 3;
+}
+message GitPushBookmark {
+  string name = 1;
+  bytes commit_id = 2;
+}
+message GitPushReply {}
+
+message GitFetchReq {
+  string working_copy_path = 1;
+  string remote = 2;
+}
+message GitFetchReply {
+  repeated GitFetchedBookmark bookmarks = 1;
+}
+message GitFetchedBookmark {
+  string name = 1;
+  bytes commit_id = 2;
 }

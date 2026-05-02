@@ -1640,6 +1640,93 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
         Ok(Response::new(CheckOutReply {}))
     }
+
+    // ---- Git remote operations ----------------------------------------
+
+    #[tracing::instrument(skip(self))]
+    async fn git_remote_add(
+        &self,
+        request: Request<GitRemoteAddReq>,
+    ) -> Result<Response<GitRemoteAddReply>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let git_path = store.git_repo_path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::git_ops::remote_add(&git_path, &req.name, &req.url)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+        .map_err(|e| Status::internal(format!("git remote add: {e:#}")))?;
+        Ok(Response::new(GitRemoteAddReply {}))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn git_remote_list(
+        &self,
+        request: Request<GitRemoteListReq>,
+    ) -> Result<Response<GitRemoteListReply>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let git_path = store.git_repo_path().to_path_buf();
+        let remotes = tokio::task::spawn_blocking(move || {
+            crate::git_ops::remote_list(&git_path)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+        .map_err(|e| Status::internal(format!("git remote list: {e:#}")))?;
+        Ok(Response::new(GitRemoteListReply {
+            remotes: remotes
+                .into_iter()
+                .map(|(name, url)| git_remote_list_reply::Remote { name, url })
+                .collect(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn git_push(
+        &self,
+        request: Request<GitPushReq>,
+    ) -> Result<Response<GitPushReply>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let git_path = store.git_repo_path().to_path_buf();
+        let bookmarks: Vec<(String, Vec<u8>)> = req
+            .bookmarks
+            .into_iter()
+            .map(|b| (b.name, b.commit_id))
+            .collect();
+        let remote = req.remote;
+        tokio::task::spawn_blocking(move || {
+            crate::git_ops::push(&git_path, &remote, &bookmarks)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+        .map_err(|e| Status::internal(format!("git push: {e:#}")))?;
+        Ok(Response::new(GitPushReply {}))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn git_fetch(
+        &self,
+        request: Request<GitFetchReq>,
+    ) -> Result<Response<GitFetchReply>, Status> {
+        let req = request.into_inner();
+        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let git_path = store.git_repo_path().to_path_buf();
+        let remote = req.remote;
+        let bookmarks = tokio::task::spawn_blocking(move || {
+            crate::git_ops::fetch(&git_path, &remote)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+        .map_err(|e| Status::internal(format!("git fetch: {e:#}")))?;
+        Ok(Response::new(GitFetchReply {
+            bookmarks: bookmarks
+                .into_iter()
+                .map(|(name, commit_id)| GitFetchedBookmark { name, commit_id })
+                .collect(),
+        }))
+    }
 }
 
 #[cfg(test)]

@@ -42,6 +42,66 @@ pub(crate) struct InitArgs {
 enum KikiCommands {
     Init(InitArgs),
     Status,
+    /// Git remote operations (push, fetch, remote management)
+    Git(GitArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct GitArgs {
+    #[command(subcommand)]
+    command: GitCommands,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum GitCommands {
+    /// Manage git remotes
+    Remote(GitRemoteArgs),
+    /// Push bookmarks to a git remote
+    Push(GitPushArgs),
+    /// Fetch from a git remote
+    Fetch(GitFetchArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct GitRemoteArgs {
+    #[command(subcommand)]
+    command: GitRemoteCommands,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum GitRemoteCommands {
+    /// Add a git remote
+    Add(GitRemoteAddArgs),
+    /// List git remotes
+    List,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct GitRemoteAddArgs {
+    /// Remote name
+    name: String,
+    /// Remote URL
+    url: String,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct GitPushArgs {
+    /// Remote to push to
+    #[arg(long, default_value = "origin")]
+    remote: String,
+    /// Bookmark(s) to push (can be repeated)
+    #[arg(long)]
+    bookmark: Vec<String>,
+    /// Push all bookmarks
+    #[arg(long, conflicts_with = "bookmark")]
+    all: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct GitFetchArgs {
+    /// Remote to fetch from
+    #[arg(long, default_value = "origin")]
+    remote: String,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -310,7 +370,165 @@ async fn run_kk_command(
 
             Ok(())
         }
+        KikiCommands::Git(git_args) => {
+            run_git_command(ui, command_helper, &client, git_args).await
+        }
     }
+}
+
+async fn run_git_command(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    client: &BlockingJujutsuInterfaceClient,
+    git_args: GitArgs,
+) -> Result<(), CommandError> {
+    match git_args.command {
+        GitCommands::Remote(remote_args) => match remote_args.command {
+            GitRemoteCommands::Add(add_args) => {
+                let wc_path = workspace_path(command_helper)?;
+                client
+                    .git_remote_add(proto::jj_interface::GitRemoteAddReq {
+                        working_copy_path: wc_path,
+                        name: add_args.name,
+                        url: add_args.url,
+                    })
+                    .map_err(|e| {
+                        internal_error_with_message("daemon GitRemoteAdd RPC failed", e)
+                    })?;
+                Ok(())
+            }
+            GitRemoteCommands::List => {
+                let wc_path = workspace_path(command_helper)?;
+                let resp = client
+                    .git_remote_list(proto::jj_interface::GitRemoteListReq {
+                        working_copy_path: wc_path,
+                    })
+                    .map_err(|e| {
+                        internal_error_with_message("daemon GitRemoteList RPC failed", e)
+                    })?;
+                let mut formatter = ui.stdout_formatter();
+                for remote in resp.into_inner().remotes {
+                    writeln!(formatter, "{}\t{}", remote.name, remote.url)?;
+                }
+                Ok(())
+            }
+        },
+        GitCommands::Push(push_args) => {
+            let wc_path = workspace_path(command_helper)?;
+            let workspace_helper = command_helper.workspace_helper(ui)?;
+            let repo = workspace_helper.repo();
+            let view = repo.view();
+
+            use jj_lib::object_id::ObjectId as _;
+            use jj_lib::ref_name::RefName;
+
+            let bookmarks: Vec<proto::jj_interface::GitPushBookmark> = if push_args.all {
+                view.local_bookmarks()
+                    .filter_map(|(name, target)| {
+                        target.as_normal().map(|id| proto::jj_interface::GitPushBookmark {
+                            name: name.as_str().to_owned(),
+                            commit_id: id.to_bytes(),
+                        })
+                    })
+                    .collect()
+            } else if push_args.bookmark.is_empty() {
+                return Err(cli_error(
+                    "no bookmarks specified; use --bookmark <name> or --all",
+                ));
+            } else {
+                let mut result = Vec::new();
+                for name in &push_args.bookmark {
+                    let ref_name = RefName::new(name.as_str());
+                    let target = view.get_local_bookmark(ref_name);
+                    if target.is_absent() {
+                        return Err(cli_error(format!("bookmark '{name}' not found")));
+                    }
+                    let commit_id = target.as_normal().ok_or_else(|| {
+                        cli_error(format!("bookmark '{name}' is conflicted"))
+                    })?;
+                    result.push(proto::jj_interface::GitPushBookmark {
+                        name: name.clone(),
+                        commit_id: commit_id.to_bytes(),
+                    });
+                }
+                result
+            };
+
+            if bookmarks.is_empty() {
+                writeln!(ui.status(), "Nothing to push.")?;
+                return Ok(());
+            }
+
+            let count = bookmarks.len();
+            let names: Vec<&str> = bookmarks.iter().map(|b| b.name.as_str()).collect();
+            writeln!(
+                ui.status(),
+                "Pushing {} bookmark(s) to {}: {}",
+                count,
+                push_args.remote,
+                names.join(", ")
+            )?;
+
+            client
+                .git_push(proto::jj_interface::GitPushReq {
+                    working_copy_path: wc_path,
+                    remote: push_args.remote,
+                    bookmarks,
+                })
+                .map_err(|e| internal_error_with_message("daemon GitPush RPC failed", e))?;
+
+            writeln!(ui.status(), "Done.")?;
+            Ok(())
+        }
+        GitCommands::Fetch(fetch_args) => {
+            let wc_path = workspace_path(command_helper)?;
+            writeln!(ui.status(), "Fetching from {}...", fetch_args.remote)?;
+
+            let resp = client
+                .git_fetch(proto::jj_interface::GitFetchReq {
+                    working_copy_path: wc_path,
+                    remote: fetch_args.remote.clone(),
+                })
+                .map_err(|e| internal_error_with_message("daemon GitFetch RPC failed", e))?;
+
+            let fetched = resp.into_inner().bookmarks;
+            if fetched.is_empty() {
+                writeln!(ui.status(), "Nothing new from remote.")?;
+            } else {
+                let mut formatter = ui.stdout_formatter();
+                for b in &fetched {
+                    let hex: String = b.commit_id.iter().map(|byte| format!("{byte:02x}")).collect();
+                    let short = &hex[..12.min(hex.len())];
+                    writeln!(formatter, "  {}: {short}", b.name)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Resolve the canonical working-copy path for the current workspace.
+/// Walks up from cwd looking for `.jj/`, matching jj's workspace discovery.
+fn workspace_path(command_helper: &CommandHelper) -> Result<String, CommandError> {
+    let cwd = command_helper.cwd();
+    let mut dir = cwd.to_path_buf();
+    loop {
+        if dir.join(".jj").is_dir() {
+            break;
+        }
+        if !dir.pop() {
+            return Err(cli_error(
+                "not in a jj workspace (no .jj/ directory found)",
+            ));
+        }
+    }
+    let wc_path = dir.canonicalize().map_err(|e| {
+        user_error_with_message("failed to resolve workspace path", e)
+    })?;
+    wc_path
+        .to_str()
+        .map(|s| s.to_owned())
+        .ok_or_else(|| cli_error("workspace path is not valid UTF-8"))
 }
 
 /// Finalize whatever transport the daemon chose. On Linux (Fuse) the

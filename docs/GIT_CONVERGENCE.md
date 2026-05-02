@@ -1085,16 +1085,15 @@ simpler final architecture.
 
 ### Open
 
-5. **jj repo metadata for git push/fetch.** The `GitBackend` needs a
-   jj repo wrapper (op_store, op_heads, index) to get a `MutableRepo`
-   for `push_refs` / `GitFetch`. Two options:
-   - Use `ReadonlyRepo::init` with default store initializers — creates
-     the minimal repo metadata alongside the git repo. This is local
-     bookkeeping, never synced. Cleanest option.
-   - Use `Workspace::init_internal_git` — creates a full workspace
-     including working copy type. Unnecessary but harmless.
-   Decision: use `ReadonlyRepo::init`. The jj metadata lives at
-   `<storage_dir>/mounts/<hash>/jj-repo/` (sibling to `git/`).
+5. ~~**jj repo metadata for git push/fetch.**~~ The initial
+   implementation bypasses jj-lib's `push_refs`/`GitFetch` entirely:
+   the daemon sets `refs/heads/*` via gix and drives the `git`
+   subprocess directly for push/fetch. The CLI reads bookmarks from
+   its own jj View (via `workspace_helper`) to determine what to push,
+   and the daemon returns fetched bookmark→commit mappings after fetch.
+   No daemon-side jj repo is needed for this approach. A future
+   iteration may add a jj repo wrapper to use `push_refs`/`GitFetch`
+   for richer error handling and ref tracking.
 
 6. **Pack file management.** git's ODB accumulates loose objects.
    Options:
@@ -1103,19 +1102,12 @@ simpler final architecture.
    - Hook into jj's `gc()` Backend method (GitBackend runs `git gc`)
    Not urgent — loose objects work fine for small-to-medium repos.
 
-7. **Bookmark model bridging.** Kiki's catalog refs are flat strings
-   (`op_heads`, custom refs). jj's bookmarks are structured
-   (`local_bookmarks`, `remote_bookmarks` with tracking state). The
-   push/fetch RPCs need to bridge this:
-   - On push: read kiki catalog refs → set `local_bookmark_target` in
-     `MutableRepo` → `push_refs` handles export + push
-   - On fetch: `import_refs` updates jj's View → read View's
-     `local_bookmarks()` → write back to kiki catalog refs via `cas_ref`
-   The bridging is straightforward but the exact ref naming convention
-   needs design.
+7. ~~**Bookmark model bridging.**~~ The initial implementation keeps
+   the boundary simple: the CLI's jj View owns bookmarks (as normal
+   jj bookmarks). On push, the CLI reads bookmark→commit from its View
+   and sends them to the daemon. On fetch, the daemon returns the
+   remote-tracking refs. No catalog ref bridging is needed for v1.
 
-8. **StoreFactories registration.** The CLI-side `KikiBackend` needs
-   to register with `StoreFactories` under a custom name (e.g. `"kiki"`)
-   so `Workspace::load` can find it. The `store/type` file contains
-   this name. The daemon-side `GitBackend` uses the standard `"git"`
-   type — the daemon doesn't go through `StoreFactories` at all.
+8. ~~**StoreFactories registration.**~~ Already done — `KikiBackend`
+   registers as `"kiki"` in `create_store_factories()` (cli/src/main.rs).
+   The daemon uses `GitBackend` directly (no `StoreFactories`).

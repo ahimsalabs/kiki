@@ -9,6 +9,7 @@ use tracing::{error, info};
 use crate::remote::{fs::FsRemoteStore, server::RemoteStoreService, RemoteStore};
 use crate::service::StorageConfig;
 
+mod git_ops;
 mod git_store;
 mod hash;
 mod local_refs;
