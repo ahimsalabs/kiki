@@ -427,9 +427,15 @@ mod tests {
         let nfs = build_adapter();
         let result = nfs.readdir(nfs.root_dir(), 0, 100).await.expect("readdir");
         assert!(result.end);
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].name.as_ref(), b"hello.txt");
-        assert!(matches!(result.entries[0].attr.ftype, ftype3::NF3REG));
+        assert_eq!(result.entries.len(), 2);
+        // Entries: hello.txt (from the tree) + .git (synthesized).
+        let names: Vec<_> = result.entries.iter().map(|e| e.name.as_ref().to_vec()).collect();
+        assert!(names.contains(&b"hello.txt".to_vec()));
+        assert!(names.contains(&b".git".to_vec()));
+        let hello = result.entries.iter().find(|e| e.name.as_ref() == b"hello.txt").unwrap();
+        assert!(matches!(hello.attr.ftype, ftype3::NF3REG));
+        let git = result.entries.iter().find(|e| e.name.as_ref() == b".git").unwrap();
+        assert!(matches!(git.attr.ftype, ftype3::NF3REG));
     }
 
     /// `write` against a directory inode surfaces NFS3ERR_ISDIR (mapped

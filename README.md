@@ -43,8 +43,10 @@ each one is a FUSE (Linux) or NFS (macOS) mount.
 automatically. Reads fetch on demand and cache locally.
 
 **Git interop.** `kiki git push/fetch/remote` routes through
-the daemon. The storage format is converging to git objects, so
-GitHub and GitLab work as remotes.
+the daemon. The storage format is git objects (via jj-lib's
+`GitBackend`), so GitHub and GitLab work as remotes. Stock git
+tools (`git log`, `git blame`, editors) work against mounts —
+the VFS synthesizes a `.git` gitdir pointer at the workspace root.
 
 ## GitHub example
 
@@ -92,9 +94,11 @@ daemon, or (future) S3.
 
 Working: FUSE (Linux), NFS (macOS), read/write/snapshot,
 multi-machine sync via `dir://`, `ssh://`, and `kiki://`,
-durable local storage, operation log sharing, `git push`/`git fetch`.
+durable local storage, operation log sharing, `git push`/`git fetch`,
+git-convergent storage (git objects via `GitBackend`),
+stock git tool support (`.git` synthesis in VFS).
 
-In progress: `.gitignore`-aware VFS, git object convergence,
+In progress: `.gitignore`-aware VFS,
 async offline push queue.
 
 Designed: [managed workspaces](./docs/WORKSPACES.md),

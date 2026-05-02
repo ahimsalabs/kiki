@@ -152,6 +152,88 @@ pub fn fetch(
     Ok(bookmarks)
 }
 
+/// Write HEAD as a detached head pointing at `commit_oid` in the bare git repo.
+pub fn export_head(git_repo_path: &Path, commit_oid: &[u8]) -> Result<()> {
+    let repo = gix::open(git_repo_path).context("opening git repo for export_head")?;
+    let oid = gix::ObjectId::try_from(commit_oid)
+        .map_err(|_| anyhow!("invalid commit id for export_head"))?;
+    if !repo.objects.exists(&oid) {
+        anyhow::bail!("commit {} not found in git ODB", oid);
+    }
+    repo.reference(
+        "HEAD",
+        oid,
+        gix::refs::transaction::PreviousValue::Any,
+        "kiki export head",
+    )
+    .context("setting HEAD")?;
+    Ok(())
+}
+
+/// Write `refs/heads/<name>` for each bookmark in the bare git repo.
+///
+/// This is the ref-setting part extracted from `push()` — without the
+/// subsequent `git push` subprocess call.
+pub fn export_bookmarks(git_repo_path: &Path, bookmarks: &[(String, Vec<u8>)]) -> Result<()> {
+    let repo = gix::open(git_repo_path).context("opening git repo for export_bookmarks")?;
+    for (name, oid_bytes) in bookmarks {
+        let oid = gix::ObjectId::try_from(oid_bytes.as_slice())
+            .map_err(|_| anyhow!("invalid commit id for bookmark '{name}'"))?;
+        if !repo.objects.exists(&oid) {
+            anyhow::bail!(
+                "commit {} for bookmark '{name}' not found in git ODB",
+                oid
+            );
+        }
+        let ref_name = format!("refs/heads/{name}");
+        repo.reference(
+            ref_name.clone(),
+            oid,
+            gix::refs::transaction::PreviousValue::Any,
+            "kiki export bookmark",
+        )
+        .with_context(|| format!("setting ref {ref_name}"))?;
+    }
+    Ok(())
+}
+
+/// Read the current HEAD commit from the bare git repo.
+/// Returns `None` if HEAD is unborn or symbolic (not detached).
+#[allow(dead_code)] // Used by tests; will be wired into import path.
+pub fn read_head(git_repo_path: &Path) -> Result<Option<Vec<u8>>> {
+    let repo = gix::open(git_repo_path).context("opening git repo for read_head")?;
+    let head = repo.head().context("reading HEAD")?;
+    match head.kind {
+        gix::head::Kind::Detached { target, .. } => Ok(Some(target.as_bytes().to_vec())),
+        _ => Ok(None),
+    }
+}
+
+/// Read all `refs/heads/*` from the bare git repo.
+/// Returns `(bookmark_name, commit_oid_bytes)` pairs.
+#[allow(dead_code)] // Used by tests; will be wired into import path.
+pub fn read_local_refs(git_repo_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let repo = gix::open(git_repo_path).context("opening git repo for read_local_refs")?;
+    let prefix = "refs/heads/";
+    let mut bookmarks = Vec::new();
+    for r in repo.references()?.prefixed(prefix.as_bytes())? {
+        let r = r.map_err(|e| anyhow!("iterating refs: {e}"))?;
+        let name = r.name().as_bstr();
+        let short = match name.strip_prefix(prefix.as_bytes()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let oid = r
+            .id()
+            .object()
+            .context("peeling ref to object")?
+            .id;
+        let short_str = String::from_utf8_lossy(short).into_owned();
+        bookmarks.push((short_str, oid.as_bytes().to_vec()));
+    }
+    Ok(bookmarks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +287,90 @@ mod tests {
             err.unwrap_err().to_string().contains("not found"),
             "should mention missing commit"
         );
+    }
+
+    /// Create a commit in a bare repo using git plumbing commands.
+    /// Returns the 20-byte raw OID of the commit.
+    fn create_test_commit(git_dir: &Path) -> Vec<u8> {
+        // Create a blob.
+        let blob = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(git_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            blob.stdin.as_ref().unwrap().write_all(b"hello\n").unwrap();
+        }
+        let blob_out = blob.wait_with_output().unwrap();
+        assert!(blob_out.status.success());
+        let blob_hex = String::from_utf8(blob_out.stdout).unwrap();
+        let blob_hex = blob_hex.trim();
+
+        // Create a tree containing that blob.
+        let tree_input = format!("100644 blob {blob_hex}\tfile.txt\n");
+        let tree = Command::new("git")
+            .args(["mktree"])
+            .current_dir(git_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            tree.stdin
+                .as_ref()
+                .unwrap()
+                .write_all(tree_input.as_bytes())
+                .unwrap();
+        }
+        let tree_out = tree.wait_with_output().unwrap();
+        assert!(tree_out.status.success());
+        let tree_hex = String::from_utf8(tree_out.stdout).unwrap();
+        let tree_hex = tree_hex.trim();
+
+        // Create a commit pointing at that tree.
+        let commit = Command::new("git")
+            .args(["commit-tree", tree_hex, "-m", "test commit"])
+            .current_dir(git_dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+        let commit_hex = String::from_utf8(commit.stdout).unwrap();
+        let commit_hex = commit_hex.trim();
+
+        // Parse the hex OID into raw bytes via gix.
+        let oid = gix::ObjectId::from_hex(commit_hex.as_bytes()).unwrap();
+        oid.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn export_head_round_trip() {
+        let (_tmp, git_dir) = init_bare_repo();
+        let commit_oid = create_test_commit(&git_dir);
+
+        export_head(&git_dir, &commit_oid).unwrap();
+        let read_back = read_head(&git_dir).unwrap();
+        assert_eq!(read_back, Some(commit_oid));
+    }
+
+    #[test]
+    fn export_bookmarks_round_trip() {
+        let (_tmp, git_dir) = init_bare_repo();
+        let commit_oid = create_test_commit(&git_dir);
+
+        let bookmarks = vec![("my-branch".to_owned(), commit_oid.clone())];
+        export_bookmarks(&git_dir, &bookmarks).unwrap();
+
+        let refs = read_local_refs(&git_dir).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "my-branch");
+        assert_eq!(refs[0].1, commit_oid);
     }
 }

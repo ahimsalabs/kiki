@@ -50,6 +50,11 @@ use crate::{
 /// from `snapshot`'s rollup. See `KikiFs::jj_subtree`.
 const JJ_DIR: &str = ".jj";
 
+/// Synthesized read-only `.git` gitdir file at the workspace root.
+/// Contains `gitdir: <path>\n` so that stock git tools work against
+/// the mount. Pinned outside the content-addressed tree, same as `.jj/`.
+const GIT_FILE: &str = ".git";
+
 /// Kind of filesystem object. Smaller than the NFS `ftype3` and FUSE
 /// `FileType` enums; we never serve block/char/socket/fifo nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +319,14 @@ pub struct KikiFs {
     /// `None` until the first `mkdir(root, ".jj")`. See type-level docs
     /// for why this is separate from the slab's root children.
     jj_subtree: Mutex<Option<InodeId>>,
+    /// Inode id of the synthesized `.git` gitdir file. Populated at
+    /// construction time. Contains `gitdir: <path>\n` and is read-only.
+    git_file: InodeId,
+    /// Pre-computed content of the `.git` gitdir file. Kept here for
+    /// potential future use (e.g. fast-path reads bypassing the slab);
+    /// the authoritative copy lives in the slab as a `DirtyFile`.
+    #[allow(dead_code)]
+    git_file_content: Vec<u8>,
 }
 
 impl KikiFs {
@@ -335,11 +348,25 @@ impl KikiFs {
         root_tree: Id,
         remote: Option<Arc<dyn RemoteStore>>,
     ) -> Self {
+        let slab = InodeSlab::new(root_tree);
+        let git_content =
+            format!("gitdir: {}\n", store.git_repo_path().display()).into_bytes();
+        let git_file = slab.alloc(
+            ROOT_INODE,
+            GIT_FILE.to_owned(),
+            NodeRef::DirtyFile {
+                content: git_content.clone(),
+                executable: false,
+            },
+        );
+        // NOTE: do NOT call slab.attach_child — pinned like .jj/
         KikiFs {
             store,
             remote,
-            slab: InodeSlab::new(root_tree),
+            slab,
             jj_subtree: Mutex::new(None),
+            git_file,
+            git_file_content: git_content,
         }
     }
 
@@ -352,6 +379,11 @@ impl KikiFs {
     /// either currently populated or about to be by a `mkdir`.
     fn is_jj_root(&self, parent: InodeId, name: &str) -> bool {
         parent == self.root() && name == JJ_DIR
+    }
+
+    /// True when `(parent, name)` addresses the synthesized `.git` file.
+    fn is_git_file(&self, parent: InodeId, name: &str) -> bool {
+        parent == self.root() && name == GIT_FILE
     }
 
     /// Read a tree blob. Local store first; on miss with a configured
@@ -618,6 +650,10 @@ impl KikiFs {
         if self.is_jj_root(parent, name) && self.jj_subtree().is_some() {
             return Ok(true);
         }
+        // Synthesized `.git` always exists at the root.
+        if self.is_git_file(parent, name) {
+            return Ok(true);
+        }
         let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
         match parent_inode.node {
             NodeRef::DirtyTree { children } => Ok(children.contains_key(name)),
@@ -734,7 +770,7 @@ impl KikiFs {
                     // never lands in root.children — but legacy slabs
                     // (e.g. a tree checked out from a pre-M7 snapshot
                     // that contained `.jj/`) might have one anyway.
-                    if is_root && name == JJ_DIR {
+                    if is_root && (name == JJ_DIR || name == GIT_FILE) {
                         continue;
                     }
                     let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
@@ -774,6 +810,10 @@ impl KikiFs {
 #[async_trait]
 impl JjKikiFs for KikiFs {
     async fn lookup(&self, parent: InodeId, name: &str) -> Result<InodeId, FsError> {
+        // Synthesized `.git` gitdir file at the workspace root.
+        if self.is_git_file(parent, name) {
+            return Ok(self.git_file);
+        }
         // Pinned `.jj/` shadows whatever the user tree has at the same
         // name. If unpinned we fall through; legacy trees that contain
         // a real `.jj` entry (snapshots taken before M7) still resolve
@@ -841,9 +881,11 @@ impl JjKikiFs for KikiFs {
 
     async fn readdir(&self, dir: InodeId) -> Result<Vec<DirEntry>, FsError> {
         let inode = self.slab.get(dir).ok_or(FsError::NotFound)?;
-        // Splice the pinned `.jj/` into the root listing. Any same-named
-        // entry in the user tree is shadowed (matches `lookup`).
-        let pinned_jj = if dir == self.root() {
+        // Splice the pinned `.jj/` and synthesized `.git` into the root
+        // listing. Any same-named entry in the user tree is shadowed
+        // (matches `lookup`).
+        let is_root = dir == self.root();
+        let pinned_jj = if is_root {
             self.jj_subtree()
         } else {
             None
@@ -856,6 +898,10 @@ impl JjKikiFs for KikiFs {
                 for (name, child_id) in children {
                     if pinned_jj.is_some() && name == JJ_DIR {
                         // pinned shadows; emit once below
+                        continue;
+                    }
+                    // Shadow any user-tree `.git` entry with the synthesized one.
+                    if is_root && name == GIT_FILE {
                         continue;
                     }
                     let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
@@ -877,6 +923,13 @@ impl JjKikiFs for KikiFs {
                         kind: FileKind::Directory,
                     });
                 }
+                if is_root {
+                    out.push(DirEntry {
+                        inode: self.git_file,
+                        name: GIT_FILE.to_owned(),
+                        kind: FileKind::Regular,
+                    });
+                }
                 Ok(out)
             }
             NodeRef::Tree(_) => {
@@ -884,6 +937,10 @@ impl JjKikiFs for KikiFs {
                 let mut out = Vec::with_capacity(tree.len() + pinned_jj.is_some() as usize);
                 for entry in &tree {
                     if pinned_jj.is_some() && entry.name == JJ_DIR {
+                        continue;
+                    }
+                    // Shadow any user-tree `.git` entry with the synthesized one.
+                    if is_root && entry.name == GIT_FILE {
                         continue;
                     }
                     let kind = Self::entry_kind(entry);
@@ -900,6 +957,13 @@ impl JjKikiFs for KikiFs {
                         inode: jj_ino,
                         name: JJ_DIR.to_owned(),
                         kind: FileKind::Directory,
+                    });
+                }
+                if is_root {
+                    out.push(DirEntry {
+                        inode: self.git_file,
+                        name: GIT_FILE.to_owned(),
+                        kind: FileKind::Regular,
                     });
                 }
                 Ok(out)
@@ -1033,6 +1097,11 @@ impl JjKikiFs for KikiFs {
     }
 
     async fn write(&self, ino: InodeId, offset: u64, data: &[u8]) -> Result<u32, FsError> {
+        if ino == self.git_file {
+            return Err(FsError::StoreError(
+                "read-only synthesized .git file".into(),
+            ));
+        }
         self.ensure_dirty_file(ino).await?;
         // Dirty the file's parent and ancestors so snapshot can
         // discover the modification (ensure_dirty_tree propagates).
@@ -1070,6 +1139,11 @@ impl JjKikiFs for KikiFs {
         size: Option<u64>,
         executable: Option<bool>,
     ) -> Result<Attr, FsError> {
+        if ino == self.git_file {
+            return Err(FsError::StoreError(
+                "read-only synthesized .git file".into(),
+            ));
+        }
         // Both fields touch a file — make sure we're working with a
         // dirty buffer, and dirty ancestors so snapshot can find us.
         if size.is_some() || executable.is_some() {
@@ -1106,6 +1180,11 @@ impl JjKikiFs for KikiFs {
     }
 
     async fn remove(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
+        if self.is_git_file(parent, name) {
+            return Err(FsError::StoreError(
+                "cannot remove synthesized .git file".into(),
+            ));
+        }
         // Pinned `.jj/` removal: rmdir-empty guard, then clear the pin.
         // The slab still owns the inode (orphaned, same as `detach_child`)
         // so any cached kernel handle stays resolvable.
@@ -1170,7 +1249,11 @@ impl JjKikiFs for KikiFs {
         // detached and reattached the way regular entries are. jj-lib
         // never renames `.jj` itself, so blocking this is correct in
         // practice and keeps the slab/pin invariants simple.
-        if self.is_jj_root(parent, name) || self.is_jj_root(new_parent, new_name) {
+        if self.is_jj_root(parent, name)
+            || self.is_jj_root(new_parent, new_name)
+            || self.is_git_file(parent, name)
+            || self.is_git_file(new_parent, new_name)
+        {
             return Err(FsError::AlreadyExists);
         }
         // Both parents need to be DirtyTree so we can mutate their
@@ -1395,7 +1478,10 @@ mod tests {
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
         let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let entries = fs.readdir(fs.root()).await.expect("readdir empty root");
-        assert!(entries.is_empty(), "got {entries:?}");
+        // The only entry in an empty repo is the synthesized `.git`.
+        assert_eq!(entries.len(), 1, "got {entries:?}");
+        assert_eq!(entries[0].name, ".git");
+        assert_eq!(entries[0].kind, FileKind::Regular);
         let attr = fs.getattr(fs.root()).await.expect("getattr root");
         assert_eq!(attr.kind, FileKind::Directory);
     }
@@ -1462,11 +1548,16 @@ mod tests {
         let mut entries = fs.readdir(fs.root()).await.unwrap();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["bin", "hello.txt", "link"]);
+        assert_eq!(names, vec![".git", "bin", "hello.txt", "link"]);
         let kinds: Vec<_> = entries.iter().map(|e| e.kind).collect();
         assert_eq!(
             kinds,
-            vec![FileKind::Directory, FileKind::Regular, FileKind::Symlink]
+            vec![
+                FileKind::Regular,
+                FileKind::Directory,
+                FileKind::Regular,
+                FileKind::Symlink
+            ]
         );
     }
 
@@ -1862,11 +1953,11 @@ mod tests {
             .expect("create_file");
         fs.write(user_file, 0, b"hi").await.unwrap();
 
-        // `.jj/` and `README` are both visible through readdir.
+        // `.git`, `.jj/`, and `README` are all visible through readdir.
         let mut listing = fs.readdir(fs.root()).await.unwrap();
         listing.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<_> = listing.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec![".jj", "README"]);
+        assert_eq!(names, vec![".git", ".jj", "README"]);
 
         // Lookup of `.jj` returns the pinned inode.
         assert_eq!(fs.lookup(fs.root(), ".jj").await.unwrap(), jj_ino);
@@ -1917,11 +2008,11 @@ mod tests {
         let (data, _) = fs.read(jj_file, 0, 1024).await.unwrap();
         assert_eq!(data, b"present");
 
-        // readdir at root mixes the user tree with the pin.
+        // readdir at root mixes the user tree with the pin and `.git`.
         let mut listing = fs.readdir(fs.root()).await.unwrap();
         listing.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<_> = listing.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec![".jj", "only-a.txt"]);
+        assert_eq!(names, vec![".git", ".jj", "only-a.txt"]);
     }
 
     /// `mkdir(root, ".jj")` twice fails AlreadyExists. Same goes for
@@ -2019,6 +2110,91 @@ mod tests {
             }
             other => panic!("expected clean File after snapshot, got {other:?}"),
         }
+    }
+
+    // ----- Synthesized `.git` gitdir file tests ------------------------------
+
+    /// The synthesized `.git` file is visible via lookup and readdir,
+    /// contains the expected `gitdir:` content, and is excluded from
+    /// snapshot output.
+    #[tokio::test]
+    async fn git_file_lookup_read_content() {
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let expected =
+            format!("gitdir: {}\n", store.git_repo_path().display());
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+
+        // lookup resolves the synthesized `.git` inode.
+        let git_ino = fs.lookup(fs.root(), ".git").await.expect("lookup .git");
+
+        // getattr reports it as a regular file with the right size.
+        let attr = fs.getattr(git_ino).await.expect("getattr .git");
+        assert_eq!(attr.kind, FileKind::Regular);
+        assert_eq!(attr.size, expected.len() as u64);
+        assert!(!attr.executable);
+
+        // read returns the full `gitdir:` content.
+        let (data, eof) = fs.read(git_ino, 0, 4096).await.expect("read .git");
+        assert_eq!(String::from_utf8(data).unwrap(), expected);
+        assert!(eof);
+
+        // readdir includes `.git`.
+        let listing = fs.readdir(fs.root()).await.unwrap();
+        assert!(
+            listing.iter().any(|e| e.name == ".git"),
+            "readdir must include .git"
+        );
+
+        // snapshot must NOT include `.git` in the rolled-up tree.
+        let snap = fs.snapshot().await.unwrap();
+        let tree = read_tree(&store, snap);
+        assert!(
+            !tree.iter().any(|e| e.name == ".git"),
+            "snapshot must not contain .git"
+        );
+    }
+
+    /// Writing to the synthesized `.git` file is rejected.
+    #[tokio::test]
+    async fn git_file_is_read_only() {
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let git_ino = fs.lookup(fs.root(), ".git").await.unwrap();
+
+        let err = fs.write(git_ino, 0, b"nope").await.unwrap_err();
+        assert!(matches!(err, FsError::StoreError(_)));
+
+        let err = fs.setattr(git_ino, Some(0), None).await.unwrap_err();
+        assert!(matches!(err, FsError::StoreError(_)));
+    }
+
+    /// Removing or renaming the synthesized `.git` file is rejected.
+    #[tokio::test]
+    async fn git_file_cannot_be_removed_or_renamed() {
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+
+        let err = fs.remove(fs.root(), ".git").await.unwrap_err();
+        assert!(matches!(err, FsError::StoreError(_)));
+
+        // Creating a file named `.git` collides with the synthesized one.
+        let err = fs
+            .create_file(fs.root(), ".git", false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, FsError::AlreadyExists);
+
+        // Renaming something to `.git` is rejected.
+        let (f, _) = fs.create_file(fs.root(), "tmp", false).await.unwrap();
+        let _ = f; // suppress unused warning
+        let err = fs
+            .rename(fs.root(), "tmp", fs.root(), ".git")
+            .await
+            .unwrap_err();
+        assert_eq!(err, FsError::AlreadyExists);
     }
 
     // ----- Regression tests for e2e bugs (2026-05-01) ----------------------

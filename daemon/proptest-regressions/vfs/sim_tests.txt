@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b9c758856a24c0de68d1fa201104457bb8e47f1cca765ae9fd6786be8c06c30d # shrinks to ops = [Snapshot]
+cc 1b811d0939a789c68add8b07100abdd1e028d8fd6727034bdf5066833b652bba # shrinks to ops = [CreateFile("a")]
+cc ab2f7a20f7609697fb68c4866d503e5e587ba72b09f505250773e00030eb48fa # shrinks to ops = [Snapshot]
+cc 1b2494023e6f3dbcbbf2ca946d3490e5d3b3fa042e291a1a1e325aa8cd8d7d0c # shrinks to (ops, crash_point) = ([CreateFile("a")], 0)

@@ -281,6 +281,10 @@ impl Sim {
             .expect("readdir failed on a valid tree");
         let mut result = BTreeMap::new();
         for entry in entries {
+            // Skip synthesized entries that are not part of the user model.
+            if entry.name == ".git" || entry.name == ".jj" {
+                continue;
+            }
             let attr = self
                 .rt
                 .block_on(fs.getattr(entry.inode))
@@ -391,10 +395,11 @@ async fn basic_write_snapshot_crash_rehydrate() {
     let (data, _) = fs2.read(ino2, 0, u32::MAX).await.unwrap();
     assert_eq!(data, b"world");
 
-    // No other entries.
+    // No other entries (besides the synthesized .git).
     let entries = fs2.readdir(ROOT_INODE).await.unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "hello.txt");
+    let user_entries: Vec<_> = entries.iter().filter(|e| e.name != ".git").collect();
+    assert_eq!(user_entries.len(), 1);
+    assert_eq!(user_entries[0].name, "hello.txt");
 }
 
 #[tokio::test]
@@ -435,7 +440,8 @@ async fn no_snapshot_means_rehydrate_to_empty() {
     // Rehydrate from initial empty root.
     let fs2 = KikiFs::new(store.clone(), root, None);
     let entries = fs2.readdir(ROOT_INODE).await.unwrap();
-    assert!(entries.is_empty(), "expected empty after crash without snapshot");
+    let user_entries: Vec<_> = entries.iter().filter(|e| e.name != ".git").collect();
+    assert!(user_entries.is_empty(), "expected empty after crash without snapshot");
 }
 
 #[tokio::test]

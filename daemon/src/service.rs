@@ -225,6 +225,47 @@ async fn validate_op_store_blob_id(
     Ok(())
 }
 
+/// Extract resolved (non-conflicting) local bookmarks from raw View proto
+/// bytes (jj-lib `simple_op_store::View` format).
+///
+/// Returns `(bookmark_name, commit_id_bytes)` pairs. Conflicted or absent
+/// targets are silently skipped. Decode failures return an empty vec (the
+/// caller treats this as best-effort).
+fn bookmarks_from_view_bytes(data: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use jj_lib::protos::simple_op_store as op_proto;
+    use prost014::Message as _;
+
+    let Ok(view) = op_proto::View::decode(data) else {
+        return Vec::new();
+    };
+
+    view.bookmarks
+        .into_iter()
+        .filter_map(|b| {
+            let id = resolved_commit_id(b.local_target?)?;
+            Some((b.name, id))
+        })
+        .collect()
+}
+
+/// Extract a single commit id from a non-conflicting RefTarget proto.
+///
+/// kiki only produces the modern `Conflict` format (via jj-lib's
+/// `SimpleOpStore`), so we only handle that variant. Returns `None`
+/// for absent or conflicted targets.
+fn resolved_commit_id(
+    target: jj_lib::protos::simple_op_store::RefTarget,
+) -> Option<Vec<u8>> {
+    use jj_lib::protos::simple_op_store::ref_target::Value;
+
+    match target.value? {
+        Value::Conflict(c) if c.removes.is_empty() && c.adds.len() == 1 => {
+            c.adds.into_iter().next()?.value
+        }
+        _ => None,
+    }
+}
+
 /// Per-mount working-copy state.
 ///
 /// Keyed by `working_copy_path` in `JujutsuService::mounts`. Holds everything
@@ -1293,6 +1334,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                     .map_err(remote_status("remote put_blob (extra)"))?;
             }
         }
+
+        // Colocation: update HEAD in the bare git repo so stock `git log`
+        // shows the latest state. Best-effort — a failure here doesn't
+        // invalidate the commit itself.
+        let git_path = store.git_repo_path().to_path_buf();
+        if let Err(e) = crate::git_ops::export_head(&git_path, &id) {
+            tracing::warn!("export_head after WriteCommit: {e:#}");
+        }
+
         Ok(Response::new(CommitId { commit_id: id }))
     }
 
@@ -1333,6 +1383,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         validate_op_store_blob_id(OpStoreBlobKind::View, &req.view_id, &req.data)
             .await
             .map_err(decode_status("view blob"))?;
+
+        // Decode bookmarks before data is potentially moved to remote.
+        let bookmarks = bookmarks_from_view_bytes(&req.data);
+
         store
             .write_view_bytes(&req.view_id, &req.data)
             .map_err(store_status("write_view"))?;
@@ -1342,6 +1396,16 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 .await
                 .map_err(remote_status("remote put_blob (view)"))?;
         }
+
+        // Best-effort: export bookmarks to git refs so stock git tools
+        // see branches (e.g. `git log --all`, `git push`).
+        if !bookmarks.is_empty() {
+            let git_path = store.git_repo_path().to_path_buf();
+            if let Err(e) = crate::git_ops::export_bookmarks(&git_path, &bookmarks) {
+                warn!("export_bookmarks after WriteView: {e:#}");
+            }
+        }
+
         Ok(Response::new(WriteViewReply {}))
     }
 

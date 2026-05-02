@@ -743,11 +743,20 @@ mod tests {
             .collect()
             .await;
         let names: Vec<_> = entries.iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
-        assert_eq!(names, vec![".".to_string(), "..".to_string(), "hello.txt".to_string()]);
-        // `.` and `..` are directories; the file entry must be a regular file.
+        assert_eq!(
+            names,
+            vec![
+                ".".to_string(),
+                "..".to_string(),
+                "hello.txt".to_string(),
+                ".git".to_string(),
+            ]
+        );
+        // `.` and `..` are directories; the file entries must be regular files.
         assert_eq!(entries[0].kind, FileType::Directory);
         assert_eq!(entries[1].kind, FileType::Directory);
         assert_eq!(entries[2].kind, FileType::RegularFile);
+        assert_eq!(entries[3].kind, FileType::RegularFile);
     }
 
     #[tokio::test]
@@ -763,7 +772,7 @@ mod tests {
             .collect()
             .await;
         let names: Vec<_> = entries.iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
-        assert_eq!(names, vec!["hello.txt".to_string()]);
+        assert_eq!(names, vec!["hello.txt".to_string(), ".git".to_string()]);
     }
 
     #[tokio::test]
