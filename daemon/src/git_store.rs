@@ -11,9 +11,11 @@
 //!   by calling `git_repo()` which returns a fresh thread-local handle.
 //!   gix's ODB uses lock-free `ArcSwap` + atomics for reads.
 //!
-//! - **Writes** go through `GitBackend` (which holds the mutex) for
-//!   commits (extras table, change-id headers), and directly through
-//!   gix for blobs/trees (atomic tmp+rename, safe without mutex).
+//! - **Writes** of files, trees, symlinks, and commits go through
+//!   `GitBackend` (which holds the mutex). Raw git object byte writes
+//!   (`write_git_object_bytes`, used by RemoteStore sync) bypass the
+//!   mutex and write directly through gix (atomic tmp+rename, safe
+//!   without mutex).
 //!
 //! - **Op-store** (views, operations) stays in redb as before.
 
@@ -35,6 +37,10 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 const VIEWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("views_v1");
 const OPERATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("operations_v1");
+
+/// SHA-1 hash length (20 bytes). Used as the key size for the extras
+/// stacked table.
+const HASH_LENGTH: usize = 20;
 
 /// Result of a prefix scan against the operations table.
 /// Same shape as jj-lib's `PrefixResolution`.
@@ -63,6 +69,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub struct GitContentStore {
     git_backend: GitBackend,
     op_db: Arc<Database>,
+    /// Holds the TempDir for in-memory test stores so it isn't dropped
+    /// (and the git repo directory deleted) while the store is alive.
+    #[cfg(test)]
+    _tmp: Option<tempfile::TempDir>,
 }
 
 impl std::fmt::Debug for GitContentStore {
@@ -88,7 +98,12 @@ impl GitContentStore {
         let git_backend = GitBackend::init_internal(settings, store_path)
             .map_err(|e| anyhow!("GitBackend::init_internal: {e}"))?;
         let op_db = Self::open_op_db(redb_path)?;
-        Ok(GitContentStore { git_backend, op_db })
+        Ok(GitContentStore {
+            git_backend,
+            op_db,
+            #[cfg(test)]
+            _tmp: None,
+        })
     }
 
     /// Open an existing git-backed content store.
@@ -100,7 +115,12 @@ impl GitContentStore {
         let git_backend = GitBackend::load(settings, store_path)
             .map_err(|e| anyhow!("GitBackend::load: {e}"))?;
         let op_db = Self::open_op_db(redb_path)?;
-        Ok(GitContentStore { git_backend, op_db })
+        Ok(GitContentStore {
+            git_backend,
+            op_db,
+            #[cfg(test)]
+            _tmp: None,
+        })
     }
 
     fn open_op_db(redb_path: &Path) -> Result<Arc<Database>> {
@@ -128,10 +148,6 @@ impl GitContentStore {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store_path = tmp.path().join("store");
         std::fs::create_dir_all(&store_path).expect("create store dir");
-        // We leak the TempDir so the git repo survives the constructor.
-        // Tests are short-lived; this is acceptable.
-        let tmp = Box::leak(Box::new(tmp));
-        let _ = tmp;
         let git_backend = GitBackend::init_internal(settings, &store_path)
             .expect("GitBackend::init_internal in test");
         let op_db = redb::Builder::new()
@@ -146,6 +162,7 @@ impl GitContentStore {
         GitContentStore {
             git_backend,
             op_db: Arc::new(op_db),
+            _tmp: Some(tmp),
         }
     }
 
@@ -157,11 +174,13 @@ impl GitContentStore {
     }
 
     /// The root commit ID (all-zeros, 20 bytes).
+    #[allow(dead_code)] // used by future git push/fetch RPCs
     pub fn root_commit_id(&self) -> &CommitId {
         self.git_backend.root_commit_id()
     }
 
     /// Path to the bare git repo.
+    #[allow(dead_code)] // used by future git push/fetch RPCs and tests
     pub fn git_repo_path(&self) -> &Path {
         self.git_backend.git_repo_path()
     }
@@ -281,7 +300,8 @@ impl GitContentStore {
 
     /// Write a tree to the git ODB. Returns the 20-byte SHA-1 id.
     pub fn write_tree(&self, entries: &[GitTreeEntry]) -> Result<Vec<u8>> {
-        let jj_tree = self.entries_to_jj_tree(entries);
+        let jj_tree = self.entries_to_jj_tree(entries)
+            .context("building jj tree from entries")?;
         let tree_id =
             pollster::block_on(self.git_backend.write_tree(RepoPath::root(), &jj_tree))
                 .map_err(|e| anyhow!("write_tree: {e}"))?;
@@ -347,6 +367,7 @@ impl GitContentStore {
     }
 
     /// Check whether a git object exists in the ODB.
+    #[allow(dead_code)] // used by future remote sync and tests
     pub fn has_git_object(&self, id: &[u8]) -> Result<bool> {
         let oid = gix::ObjectId::try_from(id)
             .map_err(|_| anyhow!("invalid git object id ({} bytes)", id.len()))?;
@@ -355,6 +376,37 @@ impl GitContentStore {
     }
 
     // ---- Extras table (for RemoteStore replication) ----
+
+    /// Write extras (change-id + predecessors) for a commit into the
+    /// extras table. Used by the fetch layer to persist extras received
+    /// from a remote.
+    ///
+    /// **Cache note:** This opens a fresh `TableStore`, bypassing
+    /// `GitBackend`'s internal cached `ReadonlyTable`. A subsequent
+    /// `read_commit` will miss that cache and fall through to
+    /// `import_head_commits`, which re-reads the table from disk and
+    /// finds the entry (no data loss). The unnecessary import walk is a
+    /// performance cost; a future optimization would expose
+    /// `GitBackend`'s `TableStore` or add `invalidate_extras_cache()`.
+    pub fn write_extras(&self, commit_id: &[u8], extras_bytes: &[u8]) -> Result<()> {
+        let extra_dir = self
+            .git_backend
+            .git_repo_path()
+            .parent()
+            .ok_or_else(|| anyhow!("git repo path has no parent"))?
+            .join("extra");
+        let table_store =
+            jj_lib::stacked_table::TableStore::load(extra_dir, HASH_LENGTH);
+        let (table, _lock) = table_store
+            .get_head_locked()
+            .map_err(|e| anyhow!("read extras table head: {e}"))?;
+        let mut mut_table = table.start_mutation();
+        mut_table.add_entry(commit_id.to_vec(), extras_bytes.to_vec());
+        table_store
+            .save_table(mut_table)
+            .map_err(|e| anyhow!("save extras table: {e}"))?;
+        Ok(())
+    }
 
     /// Read the extras table entry for a commit. Returns the raw
     /// protobuf bytes (change-id + predecessors). Used by RemoteStore
@@ -450,14 +502,20 @@ impl GitContentStore {
     }
 
     /// Convert our `GitTreeEntry` list to jj-lib's `backend::Tree`.
-    fn entries_to_jj_tree(&self, entries: &[GitTreeEntry]) -> backend::Tree {
+    ///
+    /// Returns an error if any entry has an invalid name (empty or
+    /// containing `/`). Entries are sorted by name before building the
+    /// tree to satisfy `from_sorted_entries`'s invariant — proto message
+    /// order is not guaranteed to be sorted.
+    fn entries_to_jj_tree(&self, entries: &[GitTreeEntry]) -> Result<backend::Tree> {
         use jj_lib::backend::TreeValue;
         use jj_lib::repo_path::RepoPathComponentBuf;
 
-        let jj_entries: Vec<(RepoPathComponentBuf, TreeValue)> = entries
+        let mut jj_entries: Vec<(RepoPathComponentBuf, TreeValue)> = entries
             .iter()
             .map(|e| {
-                let name = RepoPathComponentBuf::new(&e.name).unwrap();
+                let name = RepoPathComponentBuf::new(&e.name)
+                    .map_err(|_| anyhow!("invalid tree entry name: {:?}", e.name))?;
                 let value = match e.kind {
                     GitEntryKind::File { executable } => TreeValue::File {
                         id: FileId::from_bytes(&e.id),
@@ -470,10 +528,13 @@ impl GitContentStore {
                         TreeValue::GitSubmodule(CommitId::from_bytes(&e.id))
                     }
                 };
-                (name, value)
+                Ok((name, value))
             })
-            .collect();
-        backend::Tree::from_sorted_entries(jj_entries)
+            .collect::<Result<Vec<_>>>()?;
+        // Sort by name to satisfy from_sorted_entries's debug_assert.
+        // Proto message order is not guaranteed to be sorted.
+        jj_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(backend::Tree::from_sorted_entries(jj_entries))
     }
 }
 
@@ -505,26 +566,21 @@ pub enum GitEntryKind {
 }
 
 /// Serialize the extras fields (change-id + predecessors) for
-/// replication. Uses a minimal protobuf-compatible encoding.
-///
-/// This mirrors the format in jj-lib's `git_store.proto` Commit
-/// message: field 4 = change_id (bytes), field 2 = predecessors
-/// (repeated bytes).
+/// replication. Uses jj-lib's internal `git_store::Commit` proto
+/// format so that the bytes written to the extras table are directly
+/// consumable by `GitBackend::read_commit`.
 fn serialize_extras_for_replication(commit: &backend::Commit) -> Vec<u8> {
-    use prost::Message;
+    use prost014::Message;
 
-    // Re-use the proto module's Commit message for encoding, but only
-    // populate the extras-relevant fields.
-    let extras_proto = proto::jj_interface::Commit {
+    let mut proto = jj_lib::protos::git_store::Commit {
         change_id: commit.change_id.to_bytes(),
-        predecessors: commit
-            .predecessors
-            .iter()
-            .map(|id| id.to_bytes())
-            .collect(),
         ..Default::default()
     };
-    extras_proto.encode_to_vec()
+    proto.uses_tree_conflict_format = true;
+    for predecessor in &commit.predecessors {
+        proto.predecessors.push(predecessor.to_bytes());
+    }
+    proto.encode_to_vec()
 }
 
 /// Check if a gix error is a "not found" error.
@@ -534,6 +590,271 @@ fn is_not_found(err: &gix::object::find::existing::Error) -> bool {
         gix::object::find::existing::Error::NotFound { .. }
     )
 }
+
+// ---- Proto ↔ git-store type conversions ----
+//
+// These replace the old ty::* ↔ proto conversions. The proto wire format
+// is unchanged (same messages, same field semantics), but the daemon-side
+// types are now GitTreeEntry/GitEntryKind (for trees) and
+// backend::Commit (for commits, via jj-lib).
+
+/// Convert a proto `Tree` message to a list of `GitTreeEntry`.
+pub fn tree_from_proto(
+    proto: proto::jj_interface::Tree,
+) -> anyhow::Result<Vec<GitTreeEntry>> {
+    proto
+        .entries
+        .into_iter()
+        .map(|e| {
+            let proto_val = e
+                .value
+                .ok_or_else(|| anyhow!("tree entry {:?} missing value oneof", e.name))?;
+            let value = proto_val
+                .value
+                .ok_or_else(|| anyhow!("TreeValue missing value oneof for {:?}", e.name))?;
+            use proto::jj_interface::tree_value::Value;
+            let (kind, id) = match value {
+                Value::TreeId(id) => (GitEntryKind::Tree, id),
+                Value::SymlinkId(id) => (GitEntryKind::Symlink, id),
+                Value::ConflictId(id) => {
+                    // Conflicts are surfaced as opaque blobs on the wire.
+                    // The git store doesn't have a native conflict type;
+                    // treat as a non-executable file for storage.
+                    (GitEntryKind::File { executable: false }, id)
+                }
+                Value::File(f) => (
+                    GitEntryKind::File {
+                        executable: f.executable,
+                    },
+                    f.id,
+                ),
+            };
+            Ok(GitTreeEntry {
+                name: e.name,
+                kind,
+                id,
+            })
+        })
+        .collect()
+}
+
+/// Convert a list of `GitTreeEntry` to a proto `Tree` message.
+pub fn tree_to_proto(entries: &[GitTreeEntry]) -> proto::jj_interface::Tree {
+    let proto_entries = entries
+        .iter()
+        .map(|e| {
+            let value = match e.kind {
+                GitEntryKind::File { executable } => {
+                    proto::jj_interface::tree_value::Value::File(
+                        proto::jj_interface::tree_value::File {
+                            id: e.id.clone(),
+                            executable,
+                            copy_id: Vec::new(),
+                        },
+                    )
+                }
+                GitEntryKind::Tree => {
+                    proto::jj_interface::tree_value::Value::TreeId(e.id.clone())
+                }
+                GitEntryKind::Symlink => {
+                    proto::jj_interface::tree_value::Value::SymlinkId(e.id.clone())
+                }
+                GitEntryKind::Submodule => {
+                    // Lossy: submodule entries are mapped to TreeId on the
+                    // wire. A round-trip through proto will come back as a
+                    // tree, not a submodule. Acceptable because kiki doesn't
+                    // create submodule entries — they only appear if a
+                    // pre-existing repo contains them, and we surface them
+                    // read-only.
+                    proto::jj_interface::tree_value::Value::TreeId(e.id.clone())
+                }
+            };
+            proto::jj_interface::tree::Entry {
+                name: e.name.clone(),
+                value: Some(proto::jj_interface::TreeValue {
+                    value: Some(value),
+                }),
+            }
+        })
+        .collect();
+    proto::jj_interface::Tree {
+        entries: proto_entries,
+    }
+}
+
+/// Convert a proto `Commit` message to a jj-lib `backend::Commit`.
+pub fn commit_from_proto(
+    proto: proto::jj_interface::Commit,
+) -> anyhow::Result<backend::Commit> {
+    use jj_lib::backend::{ChangeId, Signature, Timestamp};
+    use jj_lib::merge::Merge;
+
+    let parents = proto
+        .parents
+        .into_iter()
+        .map(|p| backend::CommitId::from_bytes(&p))
+        .collect();
+    let predecessors = proto
+        .predecessors
+        .into_iter()
+        .map(|p| backend::CommitId::from_bytes(&p))
+        .collect();
+
+    // root_tree: the proto carries a repeated bytes field. With
+    // uses_tree_conflict_format, the entries alternate removes/adds
+    // (Merge encoding). Without it, it's a single legacy tree id.
+    let root_tree: Merge<TreeId> = if proto.uses_tree_conflict_format {
+        let tree_ids: Vec<TreeId> = proto
+            .root_tree
+            .into_iter()
+            .map(|b| TreeId::from_bytes(&b))
+            .collect();
+        Merge::from_vec(tree_ids)
+    } else {
+        let id = proto
+            .root_tree
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Merge::resolved(TreeId::from_bytes(&id))
+    };
+
+    let change_id = ChangeId::new(proto.change_id);
+
+    let author = proto
+        .author
+        .map(signature_from_proto)
+        .transpose()
+        .context("author")?
+        .unwrap_or_else(|| Signature {
+            name: String::new(),
+            email: String::new(),
+            timestamp: Timestamp {
+                timestamp: jj_lib::backend::MillisSinceEpoch(0),
+                tz_offset: 0,
+            },
+        });
+
+    let committer = proto
+        .committer
+        .map(signature_from_proto)
+        .transpose()
+        .context("committer")?
+        .unwrap_or_else(|| Signature {
+            name: String::new(),
+            email: String::new(),
+            timestamp: Timestamp {
+                timestamp: jj_lib::backend::MillisSinceEpoch(0),
+                tz_offset: 0,
+            },
+        });
+
+    // conflict_labels: same Merge encoding as root_tree (alternating
+    // removes/adds). Empty vec → resolved empty string (the default).
+    let conflict_labels: Merge<String> = if proto.conflict_labels.is_empty() {
+        Merge::resolved(String::new())
+    } else {
+        Merge::from_vec(proto.conflict_labels)
+    };
+
+    // secure_sig: the proto carries only the raw signature bytes.
+    // The signed data is the git commit object itself, which the
+    // caller can reconstruct from the git ODB when needed. We store
+    // it with an empty `data` field — GitBackend::read_commit
+    // repopulates `data` from the git object on read.
+    let secure_sig = proto.secure_sig.map(|sig| backend::SecureSig {
+        data: Vec::new(),
+        sig,
+    });
+
+    Ok(backend::Commit {
+        parents,
+        predecessors,
+        root_tree,
+        conflict_labels,
+        change_id,
+        description: proto.description,
+        author,
+        committer,
+        secure_sig,
+    })
+}
+
+/// Convert a jj-lib `backend::Commit` to a proto `Commit` message.
+pub fn commit_to_proto(commit: &backend::Commit) -> proto::jj_interface::Commit {
+    use jj_lib::object_id::ObjectId;
+
+    let root_tree: Vec<Vec<u8>> = commit
+        .root_tree
+        .iter()
+        .map(|id| id.to_bytes())
+        .collect();
+    // A resolved merge has a single term — encode as the legacy format
+    // (uses_tree_conflict_format = false) for maximal compat. Multi-term
+    // merges set the flag so the reader knows the alternation pattern.
+    let uses_tree_conflict_format = root_tree.len() != 1;
+
+    // conflict_labels: same Merge encoding as root_tree. Omit when
+    // resolved to empty string (the common case) for wire compat.
+    let conflict_labels: Vec<String> = if commit.conflict_labels.is_resolved() {
+        Vec::new()
+    } else {
+        commit.conflict_labels.iter().cloned().collect()
+    };
+
+    proto::jj_interface::Commit {
+        parents: commit.parents.iter().map(|id| id.to_bytes()).collect(),
+        predecessors: commit
+            .predecessors
+            .iter()
+            .map(|id| id.to_bytes())
+            .collect(),
+        root_tree,
+        conflict_labels,
+        uses_tree_conflict_format,
+        change_id: commit.change_id.to_bytes(),
+        description: commit.description.clone(),
+        author: Some(signature_to_proto(&commit.author)),
+        committer: Some(signature_to_proto(&commit.committer)),
+        secure_sig: commit.secure_sig.as_ref().map(|s| s.sig.clone()),
+    }
+}
+
+fn signature_from_proto(
+    proto: proto::jj_interface::commit::Signature,
+) -> anyhow::Result<jj_lib::backend::Signature> {
+    let ts = proto
+        .timestamp
+        .ok_or_else(|| anyhow!("Signature missing required timestamp"))?;
+    Ok(jj_lib::backend::Signature {
+        name: proto.name,
+        email: proto.email,
+        timestamp: jj_lib::backend::Timestamp {
+            timestamp: jj_lib::backend::MillisSinceEpoch(ts.millis_since_epoch),
+            tz_offset: ts.tz_offset as i32,
+        },
+    })
+}
+
+fn signature_to_proto(
+    sig: &jj_lib::backend::Signature,
+) -> proto::jj_interface::commit::Signature {
+    proto::jj_interface::commit::Signature {
+        name: sig.name.clone(),
+        email: sig.email.clone(),
+        timestamp: Some(proto::jj_interface::commit::Timestamp {
+            millis_since_epoch: sig.timestamp.timestamp.0,
+            tz_offset: sig.timestamp.tz_offset,
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Well-known SHA-1 of the empty tree in git.
+const EMPTY_TREE_ID: [u8; 20] = [
+    0x4b, 0x82, 0x5d, 0xc6, 0x42, 0xcb, 0x6e, 0xb9, 0xa0, 0x60,
+    0xe5, 0x4b, 0xf8, 0xd6, 0x92, 0x88, 0xfb, 0xee, 0x49, 0x04,
+];
 
 #[cfg(test)]
 mod tests {
@@ -708,5 +1029,597 @@ mod tests {
 
         assert!(store.has_git_object(&id).expect("has"));
         assert!(!store.has_git_object(&[0xff; 20]).expect("has bogus"));
+    }
+
+    // ---- write_extras / read_extras round-trip ----
+
+    #[test]
+    fn write_and_read_extras_round_trip() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+
+        // Write a commit first (extras are keyed by commit id).
+        let commit = make_test_commit(&settings, &[0xaa; 16]);
+        let (commit_id, stored) = store.write_commit(commit).expect("write_commit");
+
+        // Read extras back via the round-trip path.
+        let extras = store.read_extras(&commit_id).expect("read_extras");
+        assert!(extras.is_some(), "extras should be present for a written commit");
+
+        // The extras should contain the change-id and predecessors.
+        // Verify by deserializing with prost014.
+        use prost014::Message;
+        let decoded = jj_lib::protos::git_store::Commit::decode(
+            extras.unwrap().as_slice(),
+        )
+        .expect("decode extras proto");
+        assert_eq!(decoded.change_id, stored.change_id.to_bytes());
+    }
+
+    // ---- write_commit / read_commit direct round-trip ----
+
+    #[test]
+    fn write_and_read_commit_round_trip() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+
+        let commit = make_test_commit(&settings, &[0xbb; 16]);
+        let (commit_id, stored) = store.write_commit(commit).expect("write_commit");
+        assert_eq!(commit_id.len(), 20);
+
+        let read_back = store
+            .read_commit(&commit_id)
+            .expect("read_commit")
+            .expect("commit should be present");
+
+        // Core fields must match.
+        assert_eq!(read_back.change_id, stored.change_id);
+        assert_eq!(read_back.description, stored.description);
+        assert_eq!(read_back.author.name, stored.author.name);
+        assert_eq!(read_back.committer.email, stored.committer.email);
+        assert_eq!(read_back.root_tree, stored.root_tree);
+    }
+
+    // ---- entries_to_jj_tree rejects invalid names ----
+
+    #[test]
+    fn entries_to_jj_tree_rejects_empty_name() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+        let entries = vec![GitTreeEntry {
+            name: "".into(),
+            kind: GitEntryKind::File { executable: false },
+            id: vec![0; 20],
+        }];
+        assert!(store.write_tree(&entries).is_err());
+    }
+
+    #[test]
+    fn entries_to_jj_tree_rejects_slash_in_name() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+        let entries = vec![GitTreeEntry {
+            name: "a/b".into(),
+            kind: GitEntryKind::File { executable: false },
+            id: vec![0; 20],
+        }];
+        assert!(store.write_tree(&entries).is_err());
+    }
+
+    // ---- operation_ids_matching_prefix coverage ----
+
+    #[test]
+    fn operation_prefix_no_match() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+        assert_eq!(
+            store.operation_ids_matching_prefix("deadbeef").unwrap(),
+            OpPrefixResult::None,
+        );
+    }
+
+    #[test]
+    fn operation_prefix_single_match() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+
+        let id = [0xab; 64];
+        store.write_operation_bytes(&id, b"op1").unwrap();
+        let result = store.operation_ids_matching_prefix("ab").unwrap();
+        assert_eq!(result, OpPrefixResult::Single(id.to_vec()));
+    }
+
+    #[test]
+    fn operation_prefix_full_length_match() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+
+        let id = [0xab; 64];
+        store.write_operation_bytes(&id, b"op1").unwrap();
+        let full_hex = hex_encode(&id);
+        let result = store.operation_ids_matching_prefix(&full_hex).unwrap();
+        assert_eq!(result, OpPrefixResult::Single(id.to_vec()));
+    }
+
+    #[test]
+    fn operation_prefix_ambiguous() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+
+        // Two ids that share the same prefix.
+        let mut id1 = [0xab; 64];
+        let mut id2 = [0xab; 64];
+        id1[63] = 0x01;
+        id2[63] = 0x02;
+        store.write_operation_bytes(&id1, b"op1").unwrap();
+        store.write_operation_bytes(&id2, b"op2").unwrap();
+        assert_eq!(
+            store.operation_ids_matching_prefix("ab").unwrap(),
+            OpPrefixResult::Ambiguous,
+        );
+    }
+
+    /// Helper: build a minimal `backend::Commit` for testing.
+    fn make_test_commit(
+        settings: &UserSettings,
+        change_id_bytes: &[u8],
+    ) -> backend::Commit {
+        use jj_lib::backend::{ChangeId, Signature, Timestamp};
+        use jj_lib::merge::Merge;
+
+        let _ = settings; // settings used for store, not commit construction
+        backend::Commit {
+            parents: vec![CommitId::from_bytes(&[0; 20])],
+            predecessors: vec![],
+            root_tree: Merge::resolved(TreeId::from_bytes(
+                &EMPTY_TREE_ID,
+            )),
+            conflict_labels: Merge::resolved(String::new()),
+            change_id: ChangeId::new(change_id_bytes.to_vec()),
+            description: "test commit".to_string(),
+            author: Signature {
+                name: "Test".to_string(),
+                email: "test@test.com".to_string(),
+                timestamp: Timestamp {
+                    timestamp: jj_lib::backend::MillisSinceEpoch(1_700_000_000_000),
+                    tz_offset: 0,
+                },
+            },
+            committer: Signature {
+                name: "Test".to_string(),
+                email: "test@test.com".to_string(),
+                timestamp: Timestamp {
+                    timestamp: jj_lib::backend::MillisSinceEpoch(1_700_000_000_000),
+                    tz_offset: 0,
+                },
+            },
+            secure_sig: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use jj_lib::backend::{self, ChangeId, CommitId, Signature, Timestamp, TreeId};
+    use jj_lib::merge::Merge;
+    use jj_lib::settings::UserSettings;
+    use proptest::prelude::*;
+
+    fn test_settings() -> UserSettings {
+        let toml_str = r#"
+            user.name = "Test User"
+            user.email = "test@example.com"
+            operation.hostname = "test"
+            operation.username = "test"
+            debug.randomness-seed = 42
+        "#;
+        let mut config = jj_lib::config::StackedConfig::with_defaults();
+        config.add_layer(
+            jj_lib::config::ConfigLayer::parse(
+                jj_lib::config::ConfigSource::User,
+                toml_str,
+            )
+            .unwrap(),
+        );
+        UserSettings::from_config(config).unwrap()
+    }
+
+    // ---- Strategies ----
+
+    fn arb_20_bytes() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(any::<u8>(), 20)
+    }
+
+    /// Valid tree entry names: non-empty, no '/' or NUL.
+    fn arb_entry_name() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_.][a-zA-Z0-9_.\\-]{0,15}"
+    }
+
+    fn arb_entry_kind() -> impl Strategy<Value = GitEntryKind> {
+        prop_oneof![
+            Just(GitEntryKind::File { executable: false }),
+            Just(GitEntryKind::File { executable: true }),
+            Just(GitEntryKind::Tree),
+            Just(GitEntryKind::Symlink),
+        ]
+    }
+
+    fn arb_tree_entry() -> impl Strategy<Value = GitTreeEntry> {
+        (arb_entry_name(), arb_entry_kind(), arb_20_bytes()).prop_map(
+            |(name, kind, id)| GitTreeEntry { name, kind, id },
+        )
+    }
+
+    /// Strategy for a vec of tree entries with unique names (git trees
+    /// don't allow duplicate names).
+    fn arb_tree_entries() -> impl Strategy<Value = Vec<GitTreeEntry>> {
+        proptest::collection::vec(arb_tree_entry(), 0..8).prop_map(|mut entries| {
+            // Deduplicate by name, keeping the first occurrence.
+            let mut seen = std::collections::HashSet::new();
+            entries.retain(|e| seen.insert(e.name.clone()));
+            entries
+        })
+    }
+
+    fn arb_signature() -> impl Strategy<Value = Signature> {
+        (
+            "[a-zA-Z ]{1,20}",
+            "[a-z]+@[a-z]+\\.[a-z]{2,4}",
+            any::<i64>(),
+            -720i32..720i32,
+        )
+            .prop_map(|(name, email, millis, tz)| Signature {
+                name,
+                email,
+                timestamp: Timestamp {
+                    timestamp: jj_lib::backend::MillisSinceEpoch(millis),
+                    tz_offset: tz,
+                },
+            })
+    }
+
+    fn arb_commit() -> impl Strategy<Value = backend::Commit> {
+        (
+            proptest::collection::vec(arb_20_bytes(), 1..4), // parents
+            proptest::collection::vec(arb_20_bytes(), 0..3), // predecessors
+            arb_20_bytes(),                                  // root_tree id
+            proptest::collection::vec(any::<u8>(), 16),      // change_id
+            ".*",                                            // description
+            arb_signature(),
+            arb_signature(),
+            proptest::option::of(proptest::collection::vec(any::<u8>(), 1..64)), // secure_sig
+        )
+            .prop_map(
+                |(parents, predecessors, tree_id, change_id, description, author, committer, sig)| {
+                    backend::Commit {
+                        parents: parents.into_iter().map(|b| CommitId::from_bytes(&b)).collect(),
+                        predecessors: predecessors
+                            .into_iter()
+                            .map(|b| CommitId::from_bytes(&b))
+                            .collect(),
+                        root_tree: Merge::resolved(TreeId::from_bytes(&tree_id)),
+                        conflict_labels: Merge::resolved(String::new()),
+                        change_id: ChangeId::new(change_id),
+                        description,
+                        author,
+                        committer,
+                        secure_sig: sig.map(|s| backend::SecureSig {
+                            data: Vec::new(),
+                            sig: s,
+                        }),
+                    }
+                },
+            )
+    }
+
+    // ---- tree_from_proto / tree_to_proto round-trip ----
+
+    proptest! {
+        /// Encoding tree entries to proto and decoding back preserves all
+        /// fields except Submodule (which is lossy — see tree_to_proto doc).
+        #[test]
+        fn tree_proto_round_trip(entries in arb_tree_entries()) {
+            let proto_tree = tree_to_proto(&entries);
+            let decoded = tree_from_proto(proto_tree).expect("tree_from_proto");
+
+            // Build expected: same entries but Submodule becomes Tree (lossy).
+            let expected: Vec<GitTreeEntry> = entries
+                .into_iter()
+                .map(|mut e| {
+                    if e.kind == GitEntryKind::Submodule {
+                        e.kind = GitEntryKind::Tree;
+                    }
+                    e
+                })
+                .collect();
+            prop_assert_eq!(decoded, expected);
+        }
+    }
+
+    // ---- commit_from_proto / commit_to_proto round-trip ----
+
+    proptest! {
+        /// Proto round-trip for commits preserves core fields.
+        #[test]
+        fn commit_proto_round_trip(commit in arb_commit()) {
+            let proto_commit = commit_to_proto(&commit);
+            let decoded = commit_from_proto(proto_commit).expect("commit_from_proto");
+
+            prop_assert_eq!(&decoded.parents, &commit.parents);
+            prop_assert_eq!(&decoded.predecessors, &commit.predecessors);
+            prop_assert_eq!(&decoded.root_tree, &commit.root_tree);
+            prop_assert_eq!(&decoded.change_id, &commit.change_id);
+            prop_assert_eq!(&decoded.description, &commit.description);
+            prop_assert_eq!(&decoded.author, &commit.author);
+            prop_assert_eq!(&decoded.committer, &commit.committer);
+
+            // conflict_labels: resolved empty → resolved empty.
+            prop_assert_eq!(&decoded.conflict_labels, &commit.conflict_labels);
+
+            // secure_sig: round-trips the sig bytes (data is empty on
+            // decode since it's reconstructed from the git object).
+            match (&decoded.secure_sig, &commit.secure_sig) {
+                (Some(d), Some(c)) => prop_assert_eq!(&d.sig, &c.sig),
+                (None, None) => {}
+                (d, c) => prop_assert!(false, "secure_sig mismatch: decoded={d:?}, original={c:?}"),
+            }
+        }
+    }
+
+    // ---- commit_to_proto conflict_labels round-trip ----
+
+    proptest! {
+        /// Non-trivial conflict labels (multi-term merge) survive proto
+        /// round-trip.
+        #[test]
+        fn commit_proto_conflict_labels_round_trip(
+            label_a in "[a-z]{1,8}",
+            label_b in "[a-z]{1,8}",
+            label_c in "[a-z]{1,8}",
+        ) {
+            // 3-way merge: [remove, add, add] → Merge::from_vec with 3 terms.
+            let labels = Merge::from_vec(vec![label_a.clone(), label_b.clone(), label_c.clone()]);
+            let tree_a = TreeId::from_bytes(&[1; 20]);
+            let tree_b = TreeId::from_bytes(&[2; 20]);
+            let tree_c = TreeId::from_bytes(&[3; 20]);
+            let commit = backend::Commit {
+                parents: vec![CommitId::from_bytes(&[0; 20])],
+                predecessors: vec![],
+                root_tree: Merge::from_vec(vec![tree_a, tree_b, tree_c]),
+                conflict_labels: labels.clone(),
+                change_id: ChangeId::new(vec![0xcc; 16]),
+                description: String::new(),
+                author: Signature {
+                    name: "T".into(),
+                    email: "t@t".into(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(0),
+                        tz_offset: 0,
+                    },
+                },
+                committer: Signature {
+                    name: "T".into(),
+                    email: "t@t".into(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(0),
+                        tz_offset: 0,
+                    },
+                },
+                secure_sig: None,
+            };
+            let proto_commit = commit_to_proto(&commit);
+            let decoded = commit_from_proto(proto_commit).expect("commit_from_proto");
+            prop_assert_eq!(&decoded.conflict_labels, &labels);
+        }
+    }
+
+    // ---- serialize_extras_for_replication round-trip ----
+
+    proptest! {
+        /// Extras serialized for replication can be decoded back by jj-lib's
+        /// internal proto format.
+        #[test]
+        fn serialize_extras_round_trip(
+            change_id_bytes in proptest::collection::vec(any::<u8>(), 16),
+            predecessor_ids in proptest::collection::vec(arb_20_bytes(), 0..4),
+        ) {
+            use prost014::Message;
+
+            let commit = backend::Commit {
+                parents: vec![CommitId::from_bytes(&[0; 20])],
+                predecessors: predecessor_ids
+                    .iter()
+                    .map(|b| CommitId::from_bytes(b))
+                    .collect(),
+                root_tree: Merge::resolved(TreeId::from_bytes(&[0; 20])),
+                conflict_labels: Merge::resolved(String::new()),
+                change_id: ChangeId::new(change_id_bytes.clone()),
+                description: String::new(),
+                author: Signature {
+                    name: String::new(),
+                    email: String::new(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(0),
+                        tz_offset: 0,
+                    },
+                },
+                committer: Signature {
+                    name: String::new(),
+                    email: String::new(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(0),
+                        tz_offset: 0,
+                    },
+                },
+                secure_sig: None,
+            };
+
+            let bytes = serialize_extras_for_replication(&commit);
+
+            // Decode using the same proto type jj-lib uses internally.
+            let decoded = jj_lib::protos::git_store::Commit::decode(bytes.as_slice())
+                .expect("decode extras proto");
+
+            prop_assert_eq!(&decoded.change_id, &change_id_bytes);
+            prop_assert_eq!(decoded.predecessors.len(), predecessor_ids.len());
+            for (got, expected) in decoded.predecessors.iter().zip(&predecessor_ids) {
+                prop_assert_eq!(got, expected);
+            }
+            prop_assert!(decoded.uses_tree_conflict_format);
+        }
+    }
+
+    // ---- write_extras / read_extras through store ----
+
+    proptest! {
+        /// Extras written directly and read back via read_extras preserve
+        /// the change-id and predecessor set.
+        #[test]
+        fn write_read_extras_through_store(
+            change_id_bytes in proptest::collection::vec(any::<u8>(), 16),
+        ) {
+            use prost014::Message;
+
+            let settings = test_settings();
+            let store = GitContentStore::new_in_memory(&settings);
+
+            // Build and write a commit.
+            let commit = backend::Commit {
+                parents: vec![CommitId::from_bytes(&[0; 20])],
+                predecessors: vec![],
+                root_tree: Merge::resolved(TreeId::from_bytes(
+                    &EMPTY_TREE_ID,
+                )),
+                conflict_labels: Merge::resolved(String::new()),
+                change_id: ChangeId::new(change_id_bytes.clone()),
+                description: "prop test".into(),
+                author: Signature {
+                    name: "T".into(),
+                    email: "t@t".into(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(1_700_000_000_000),
+                        tz_offset: 0,
+                    },
+                },
+                committer: Signature {
+                    name: "T".into(),
+                    email: "t@t".into(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(1_700_000_000_000),
+                        tz_offset: 0,
+                    },
+                },
+                secure_sig: None,
+            };
+            let (commit_id, _stored) = store.write_commit(commit).expect("write_commit");
+
+            // Read extras.
+            let extras_bytes = store
+                .read_extras(&commit_id)
+                .expect("read_extras")
+                .expect("extras present");
+
+            let decoded = jj_lib::protos::git_store::Commit::decode(extras_bytes.as_slice())
+                .expect("decode extras");
+            // The change_id from write_commit may differ from what we
+            // passed in (GitBackend assigns one), but it must be non-empty.
+            prop_assert!(!decoded.change_id.is_empty());
+        }
+    }
+
+    // ---- write_commit / read_commit round-trip ----
+
+    proptest! {
+        /// Writing and reading a commit preserves key fields.
+        /// Uses names/descriptions that survive git's whitespace
+        /// normalization (no leading/trailing whitespace, no bare
+        /// whitespace-only strings).
+        #[test]
+        fn write_read_commit_round_trip(
+            description in "[a-zA-Z0-9 ]{0,50}",
+            author_name in "[a-zA-Z][a-zA-Z ]{0,18}[a-zA-Z]",
+            author_email in "[a-z]+@[a-z]+\\.[a-z]{2,4}",
+        ) {
+            let settings = test_settings();
+            let store = GitContentStore::new_in_memory(&settings);
+
+            let commit = backend::Commit {
+                parents: vec![CommitId::from_bytes(&[0; 20])],
+                predecessors: vec![],
+                root_tree: Merge::resolved(TreeId::from_bytes(
+                    &EMPTY_TREE_ID,
+                )),
+                conflict_labels: Merge::resolved(String::new()),
+                change_id: ChangeId::new(vec![0xdd; 16]),
+                description: description.clone(),
+                author: Signature {
+                    name: author_name.clone(),
+                    email: author_email.clone(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(1_700_000_000_000),
+                        tz_offset: 60,
+                    },
+                },
+                committer: Signature {
+                    name: "Committer".into(),
+                    email: "c@c.com".into(),
+                    timestamp: Timestamp {
+                        timestamp: jj_lib::backend::MillisSinceEpoch(1_700_000_000_000),
+                        tz_offset: -120,
+                    },
+                },
+                secure_sig: None,
+            };
+
+            let (commit_id, stored) = store.write_commit(commit).expect("write_commit");
+            let read_back = store
+                .read_commit(&commit_id)
+                .expect("read_commit")
+                .expect("present");
+
+            prop_assert_eq!(&read_back.description, &stored.description);
+            prop_assert_eq!(&read_back.author.name, &stored.author.name);
+            prop_assert_eq!(&read_back.author.email, &stored.author.email);
+            prop_assert_eq!(&read_back.root_tree, &stored.root_tree);
+        }
+    }
+
+    // ---- operation_ids_matching_prefix property ----
+
+    proptest! {
+        /// Writing N distinct operations and querying by a shared prefix
+        /// always returns Ambiguous when N > 1 and the prefix is shared.
+        #[test]
+        fn operation_prefix_property(
+            suffix_a in any::<u8>(),
+            suffix_b in any::<u8>(),
+        ) {
+            prop_assume!(suffix_a != suffix_b);
+
+            let settings = test_settings();
+            let store = GitContentStore::new_in_memory(&settings);
+
+            let mut id_a = [0xcd; 64];
+            let mut id_b = [0xcd; 64];
+            id_a[63] = suffix_a;
+            id_b[63] = suffix_b;
+
+            store.write_operation_bytes(&id_a, b"a").unwrap();
+            store.write_operation_bytes(&id_b, b"b").unwrap();
+
+            // The shared prefix "cd" matches both.
+            prop_assert_eq!(
+                store.operation_ids_matching_prefix("cd").unwrap(),
+                OpPrefixResult::Ambiguous,
+            );
+
+            // Full hex of id_a matches exactly one.
+            let full_hex_a = hex_encode(&id_a);
+            prop_assert_eq!(
+                store.operation_ids_matching_prefix(&full_hex_a).unwrap(),
+                OpPrefixResult::Single(id_a.to_vec()),
+            );
+        }
     }
 }

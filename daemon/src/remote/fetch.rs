@@ -1,29 +1,22 @@
 //! Read-through helpers shared between [`crate::service`] and
 //! [`crate::vfs::kiki_fs`].
 //!
-//! Both consumers face the same shape: "local store missed; if a
-//! remote is configured, fetch the blob, verify it round-trips to
-//! the requested id (defending against a corrupt peer), persist it
-//! locally so the next access hits the cache, and return the typed
-//! value." The two consumers differ only in error mapping —
-//! `service.rs` surfaces gRPC `Status` codes; `kiki_fs.rs` surfaces
-//! `FsError`. Splitting the typed [`FetchError`] out lets each
-//! consumer pattern-match on the variant they care about (typically
-//! `NotFound` and `DataLoss`) and collapse the rest to "internal".
+//! After git convergence, content objects are raw git objects (blobs,
+//! trees, commits). The fetch pattern is:
+//! 1. Local miss on `GitContentStore::read_*`
+//! 2. `RemoteStore::get_blob` → raw git object bytes
+//! 3. `GitContentStore::write_git_object_bytes` → persist into ODB
+//! 4. Re-read from the now-populated ODB
 //!
-//! Why a typed error rather than `anyhow::Error` with substring
-//! matching: `Status::data_loss` (corrupt peer) is observably
-//! distinct from `Status::internal` (transport/storage issue), and
-//! we want both call sites to honour the distinction without
-//! re-implementing the verify-round-trip dance.
+//! Op-store blobs (views, operations) are handled directly in
+//! `service.rs` — they don't flow through the git ODB.
 
+use anyhow::anyhow;
 use bytes::Bytes;
-use prost::Message as _;
 use thiserror::Error;
 
 use super::{BlobKind, RemoteStore};
-use crate::store::Store;
-use crate::ty;
+use crate::git_store::{GitContentStore, GitObjectKind};
 
 /// Why a read-through fetch failed.
 ///
@@ -34,38 +27,18 @@ use crate::ty;
 pub enum FetchError {
     /// Remote does not have the blob (`get_blob` returned `Ok(None)`).
     #[error("remote does not have {kind} {id}")]
-    NotFound { kind: BlobKind, id: ty::Id },
+    NotFound { kind: BlobKind, id: String },
     /// Remote returned bytes whose content hash does not match the
-    /// id we asked for — almost certainly a remote-store bug, but
-    /// surfacing it as a distinct variant lets callers reach for
-    /// `Status::data_loss` (or equivalent) instead of silently
-    /// poisoning the local store.
+    /// id we asked for.
     #[error(
         "remote returned {kind} bytes that hash to {got} but we asked for {requested}"
     )]
     DataLoss {
         kind: BlobKind,
-        requested: ty::Id,
-        got: ty::Id,
+        requested: String,
+        got: String,
     },
-    /// Failed to decode the prost message off the wire.
-    #[error("decoding {kind} blob: {source}")]
-    Decode {
-        kind: BlobKind,
-        #[source]
-        source: prost::DecodeError,
-    },
-    /// Decode succeeded but the typed-value conversion (e.g. `Tree
-    /// TryFrom`) rejected the contents.
-    #[error("decoding {kind} value: {source:#}")]
-    DecodeValue {
-        kind: BlobKind,
-        #[source]
-        source: anyhow::Error,
-    },
-    /// Persisting the fetched blob into the local cache failed
-    /// (redb commit, I/O error). The remote did its part; we
-    /// couldn't write the result.
+    /// Persisting the fetched blob into the local cache failed.
     #[error("local cache write ({kind}): {source:#}")]
     LocalWrite {
         kind: BlobKind,
@@ -82,122 +55,181 @@ pub enum FetchError {
     },
 }
 
-/// `BlobKind` doesn't implement `Display`; this lets the
-/// `#[error(...)]` macros render it as a stable lowercase tag the
-/// same way the existing `tracing` lines and dir-backend layout do.
-/// Lives next to the variant fields for proximity. (`ty::Id`'s
-/// matching `Display` impl lives in `ty.rs`, near the type.)
+/// `BlobKind` display for error messages.
 impl std::fmt::Display for BlobKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-/// Fetch a blob's raw bytes from the remote, returning a typed
-/// `Err(FetchError::NotFound)` on `Ok(None)` so the caller doesn't
-/// have to flatten the nested option.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+/// Map a `BlobKind` to the corresponding `GitObjectKind`.
+fn blob_kind_to_git(kind: BlobKind) -> Option<GitObjectKind> {
+    match kind {
+        BlobKind::Tree => Some(GitObjectKind::Tree),
+        BlobKind::Blob => Some(GitObjectKind::Blob),
+        BlobKind::Commit => Some(GitObjectKind::Commit),
+        BlobKind::View | BlobKind::Operation | BlobKind::Extra => None,
+    }
+}
+
+/// Fetch a blob's raw bytes from the remote.
 async fn fetch_bytes(
     remote: &dyn RemoteStore,
     kind: BlobKind,
-    id: ty::Id,
+    id: &[u8],
 ) -> Result<Bytes, FetchError> {
-    match remote.get_blob(kind, &id.0).await {
+    match remote.get_blob(kind, id).await {
         Ok(Some(b)) => Ok(b),
-        Ok(None) => Err(FetchError::NotFound { kind, id }),
+        Ok(None) => Err(FetchError::NotFound {
+            kind,
+            id: hex(id),
+        }),
         Err(source) => Err(FetchError::Remote { kind, source }),
     }
 }
 
-/// Compare-and-fail: the local store re-hashes whatever we write,
-/// so we can detect a corrupt peer's id↔bytes mismatch by checking
-/// the returned id against the one we asked for.
-fn verify_round_trip(
+/// Fetch a git object from the remote and write it into the local ODB.
+/// Returns the written object id (which should match `requested_id`).
+pub async fn fetch_git_object(
+    store: &GitContentStore,
+    remote: &dyn RemoteStore,
     kind: BlobKind,
-    requested: ty::Id,
-    got: ty::Id,
+    requested_id: &[u8],
 ) -> Result<(), FetchError> {
-    if requested != got {
+    let git_kind = blob_kind_to_git(kind).ok_or_else(|| FetchError::Remote {
+        kind,
+        source: anyhow!("BlobKind::{kind} is not a git object"),
+    })?;
+    let bytes = fetch_bytes(remote, kind, requested_id).await?;
+    let got_id = store
+        .write_git_object_bytes(git_kind, &bytes)
+        .map_err(|source| FetchError::LocalWrite { kind, source })?;
+    if got_id != requested_id {
         return Err(FetchError::DataLoss {
             kind,
-            requested,
-            got,
+            requested: hex(requested_id),
+            got: hex(&got_id),
         });
     }
     Ok(())
 }
 
-/// Fetch a tree blob through the remote and persist it locally.
-pub async fn fetch_tree(
-    store: &Store,
-    remote: &dyn RemoteStore,
-    id: ty::Id,
-) -> Result<ty::Tree, FetchError> {
-    let kind = BlobKind::Tree;
-    let bytes = fetch_bytes(remote, kind, id).await?;
-    let proto = proto::jj_interface::Tree::decode(bytes.as_ref())
-        .map_err(|source| FetchError::Decode { kind, source })?;
-    let tree: ty::Tree = proto
-        .try_into()
-        .map_err(|source| FetchError::DecodeValue { kind, source })?;
-    let (got, _bytes) = store
-        .write_tree(tree.clone())
-        .map_err(|source| FetchError::LocalWrite { kind, source })?;
-    verify_round_trip(kind, id, got)?;
-    Ok(tree)
-}
-
-/// Fetch a file blob through the remote and persist it locally.
+/// Fetch a file blob through the remote and persist into the git ODB.
+/// Returns the raw file content.
 pub async fn fetch_file(
-    store: &Store,
+    store: &GitContentStore,
     remote: &dyn RemoteStore,
-    id: ty::Id,
-) -> Result<ty::File, FetchError> {
-    let kind = BlobKind::File;
-    let bytes = fetch_bytes(remote, kind, id).await?;
-    let proto = proto::jj_interface::File::decode(bytes.as_ref())
-        .map_err(|source| FetchError::Decode { kind, source })?;
-    let file = ty::File::from(proto);
-    let (got, _bytes) = store
-        .write_file(file.clone())
-        .map_err(|source| FetchError::LocalWrite { kind, source })?;
-    verify_round_trip(kind, id, got)?;
-    Ok(file)
+    id: &[u8],
+) -> Result<Vec<u8>, FetchError> {
+    fetch_git_object(store, remote, BlobKind::Blob, id).await?;
+    store
+        .read_file(id)
+        .map_err(|source| FetchError::LocalWrite {
+            kind: BlobKind::Blob,
+            source,
+        })?
+        .ok_or_else(|| FetchError::NotFound {
+            kind: BlobKind::Blob,
+            id: hex(id),
+        })
 }
 
-/// Fetch a symlink blob through the remote and persist it locally.
+/// Fetch a symlink blob through the remote and persist into the git ODB.
+/// Returns the symlink target string.
 pub async fn fetch_symlink(
-    store: &Store,
+    store: &GitContentStore,
     remote: &dyn RemoteStore,
-    id: ty::Id,
-) -> Result<ty::Symlink, FetchError> {
-    let kind = BlobKind::Symlink;
-    let bytes = fetch_bytes(remote, kind, id).await?;
-    let proto = proto::jj_interface::Symlink::decode(bytes.as_ref())
-        .map_err(|source| FetchError::Decode { kind, source })?;
-    let symlink = ty::Symlink::from(proto);
-    let (got, _bytes) = store
-        .write_symlink(symlink.clone())
-        .map_err(|source| FetchError::LocalWrite { kind, source })?;
-    verify_round_trip(kind, id, got)?;
-    Ok(symlink)
+    id: &[u8],
+) -> Result<String, FetchError> {
+    // Symlinks are git blobs — fetch as Blob kind.
+    fetch_git_object(store, remote, BlobKind::Blob, id).await?;
+    store
+        .read_symlink(id)
+        .map_err(|source| FetchError::LocalWrite {
+            kind: BlobKind::Blob,
+            source,
+        })?
+        .ok_or_else(|| FetchError::NotFound {
+            kind: BlobKind::Blob,
+            id: hex(id),
+        })
 }
 
-/// Fetch a commit blob through the remote and persist it locally.
-pub async fn fetch_commit(
-    store: &Store,
+/// Fetch a tree object through the remote and persist into the git ODB.
+/// Returns the tree entries.
+pub async fn fetch_tree(
+    store: &GitContentStore,
     remote: &dyn RemoteStore,
-    id: ty::Id,
-) -> Result<ty::Commit, FetchError> {
-    let kind = BlobKind::Commit;
-    let bytes = fetch_bytes(remote, kind, id).await?;
-    let proto = proto::jj_interface::Commit::decode(bytes.as_ref())
-        .map_err(|source| FetchError::Decode { kind, source })?;
-    let commit: ty::Commit = proto
-        .try_into()
-        .map_err(|source| FetchError::DecodeValue { kind, source })?;
-    let (got, _bytes) = store
-        .write_commit(commit.clone())
-        .map_err(|source| FetchError::LocalWrite { kind, source })?;
-    verify_round_trip(kind, id, got)?;
-    Ok(commit)
+    id: &[u8],
+) -> Result<Vec<crate::git_store::GitTreeEntry>, FetchError> {
+    fetch_git_object(store, remote, BlobKind::Tree, id).await?;
+    store
+        .read_tree(id)
+        .map_err(|source| FetchError::LocalWrite {
+            kind: BlobKind::Tree,
+            source,
+        })?
+        .ok_or_else(|| FetchError::NotFound {
+            kind: BlobKind::Tree,
+            id: hex(id),
+        })
+}
+
+/// Fetch extras (change-id + predecessors) from the remote and write
+/// into the local extras table.
+pub async fn fetch_extras(
+    store: &GitContentStore,
+    remote: &dyn RemoteStore,
+    commit_id: &[u8],
+) -> Result<(), FetchError> {
+    let bytes = fetch_bytes(remote, BlobKind::Extra, commit_id).await?;
+    store
+        .write_extras(commit_id, &bytes)
+        .map_err(|source| FetchError::LocalWrite {
+            kind: BlobKind::Extra,
+            source,
+        })?;
+    Ok(())
+}
+
+/// Fetch a commit object through the remote and persist into the git ODB.
+/// Returns the commit.
+pub async fn fetch_commit(
+    store: &GitContentStore,
+    remote: &dyn RemoteStore,
+    id: &[u8],
+) -> Result<jj_lib::backend::Commit, FetchError> {
+    fetch_git_object(store, remote, BlobKind::Commit, id).await?;
+    // Best-effort extras fetch: treat NotFound as OK for backwards
+    // compat with remotes that predate extras replication, but
+    // propagate other errors.
+    match fetch_extras(store, remote, id).await {
+        Ok(()) => {}
+        Err(FetchError::NotFound { .. }) => {
+            tracing::warn!(
+                commit = %hex(id),
+                "remote has no extras for commit (pre-extras remote?)"
+            );
+        }
+        Err(e) => return Err(e),
+    }
+    store
+        .read_commit(id)
+        .map_err(|source| FetchError::LocalWrite {
+            kind: BlobKind::Commit,
+            source,
+        })?
+        .ok_or_else(|| FetchError::NotFound {
+            kind: BlobKind::Commit,
+            id: hex(id),
+        })
 }

@@ -14,12 +14,11 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use crate::git_store::{self, GitContentStore, GitEntryKind, OpPrefixResult};
 use crate::mount_meta::{self, MountMetadata};
 use crate::remote::fetch::{self, FetchError};
 use crate::remote::{self, BlobKind, RemoteStore};
-use crate::store::Store;
 use crate::ty;
-use crate::ty::TreeEntry;
 use crate::vfs::{FsError, JjKikiFs, KikiFs};
 use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle};
 
@@ -50,12 +49,24 @@ impl StorageConfig {
         StorageConfig::OnDisk { root }
     }
 
-    /// Where the redb file for `working_copy_path` should live, if any.
-    /// Returns `None` for the in-memory variant.
-    fn store_path_for(&self, working_copy_path: &str) -> Option<PathBuf> {
+    /// Where the redb op-store file for `working_copy_path` should live,
+    /// if any. Returns `None` for the in-memory variant.
+    fn redb_path_for(&self, working_copy_path: &str) -> Option<PathBuf> {
         match self {
             StorageConfig::OnDisk { root } => {
                 Some(mount_meta::store_path(root, working_copy_path))
+            }
+            StorageConfig::InMemory => None,
+        }
+    }
+
+    /// Where the git-backed content store directory for
+    /// `working_copy_path` should live (`<root>/mounts/<hash>/git_store/`).
+    /// Returns `None` for the in-memory variant.
+    fn git_store_path_for(&self, working_copy_path: &str) -> Option<PathBuf> {
+        match self {
+            StorageConfig::OnDisk { root } => {
+                Some(mount_meta::mount_dir(root, working_copy_path).join("git_store"))
             }
             StorageConfig::InMemory => None,
         }
@@ -113,9 +124,10 @@ fn persist_metadata_snapshot(
     Ok(())
 }
 
-fn hex(id: &ty::Id) -> String {
-    let mut s = String::with_capacity(id.0.len() * 2);
-    for b in id.0 {
+/// Hex-encode arbitrary bytes for display.
+fn hex_bytes(id: &[u8]) -> String {
+    let mut s = String::with_capacity(id.len() * 2);
+    for b in id {
         use std::fmt::Write;
         let _ = write!(&mut s, "{b:02x}");
     }
@@ -139,7 +151,7 @@ impl OpStoreBlobKind {
 
 fn op_store_root_data() -> RootOperationData {
     RootOperationData {
-        root_commit_id: JjCommitId::new(vec![0]),
+        root_commit_id: JjCommitId::from_bytes(&[0; 20]),
     }
 }
 
@@ -252,7 +264,7 @@ struct Mount {
     /// tree id; updated by `CheckOut` (M5) and `Snapshot` (M6).
     root_tree_id: Vec<u8>,
     /// Per-mount keyspace.
-    store: Arc<Store>,
+    store: Arc<GitContentStore>,
     /// Per-mount local-fallback catalog (M10.5, PLAN.md §10.5). Always
     /// present, regardless of whether `remote_store` is `Some`. The
     /// catalog RPC handlers prefer `remote_store`'s ref methods when a
@@ -373,7 +385,7 @@ impl JujutsuService {
         // previous daemon's first cas_ref (or is implicitly empty).
         let local_refs = Arc::new(crate::local_refs::LocalRefs::new(store.database()));
         let root_tree_id: ty::Id = if meta.root_tree_id.is_empty() {
-            store.get_empty_tree_id()
+            ty::Id(store.empty_tree_id().as_bytes().try_into().expect("20-byte tree id"))
         } else {
             meta.root_tree_id
                 .clone()
@@ -536,15 +548,49 @@ fn transport_to_proto(info: TransportInfo) -> initialize_reply::Transport {
     }
 }
 
-/// Open a per-mount [`Store`] according to the daemon's `StorageConfig`.
-/// On disk: redb file at `<root>/mounts/<hash(wc_path)>/store.redb`,
-/// reused if it already exists (Layer B durability — second `Initialize`
-/// rehydrates instead of starting empty). In-memory: fresh
-/// `InMemoryBackend` per call.
-fn open_store_for(storage: &StorageConfig, working_copy_path: &str) -> anyhow::Result<Store> {
-    match storage.store_path_for(working_copy_path) {
-        Some(path) => Store::open(&path),
-        None => Ok(Store::new_in_memory()),
+/// Minimal [`UserSettings`] for the daemon. Content writes through
+/// `GitBackend` require a plausible user/operation identity.
+fn default_user_settings() -> jj_lib::settings::UserSettings {
+    let toml_str = r#"
+        user.name = "kiki daemon"
+        user.email = "daemon@localhost"
+        operation.hostname = "localhost"
+        operation.username = "daemon"
+    "#;
+    let mut config = jj_lib::config::StackedConfig::with_defaults();
+    config.add_layer(
+        jj_lib::config::ConfigLayer::parse(jj_lib::config::ConfigSource::User, toml_str)
+            .unwrap(),
+    );
+    jj_lib::settings::UserSettings::from_config(config).unwrap()
+}
+
+/// Open a per-mount [`GitContentStore`] according to the daemon's
+/// `StorageConfig`. On disk: git store at
+/// `<root>/mounts/<hash(wc_path)>/git_store/`, redb at
+/// `<root>/mounts/<hash(wc_path)>/store.redb`, reused if they already
+/// exist (Layer B durability). In-memory: temp-dir git repo + in-memory
+/// redb per call.
+fn open_store_for(
+    storage: &StorageConfig,
+    working_copy_path: &str,
+) -> anyhow::Result<GitContentStore> {
+    let settings = default_user_settings();
+    match (
+        storage.git_store_path_for(working_copy_path),
+        storage.redb_path_for(working_copy_path),
+    ) {
+        (Some(git_store_path), Some(redb_path)) => {
+            if git_store_path.join("git").exists() {
+                GitContentStore::load(&settings, &git_store_path, &redb_path)
+            } else {
+                GitContentStore::init(&settings, &git_store_path, &redb_path)
+            }
+        }
+        #[cfg(test)]
+        _ => Ok(GitContentStore::new_in_memory(&settings)),
+        #[cfg(not(test))]
+        _ => Err(anyhow!("in-memory storage not supported in production")),
     }
 }
 
@@ -554,7 +600,7 @@ fn open_store_for(storage: &StorageConfig, working_copy_path: &str) -> anyhow::R
 async fn store_for(
     mounts: &Arc<Mutex<HashMap<String, Mount>>>,
     path: &str,
-) -> Result<Arc<Store>, Status> {
+) -> Result<Arc<GitContentStore>, Status> {
     let (store, _remote) = mount_handles(mounts, path).await?;
     Ok(store)
 }
@@ -567,7 +613,7 @@ async fn store_for(
 async fn mount_handles(
     mounts: &Arc<Mutex<HashMap<String, Mount>>>,
     path: &str,
-) -> Result<(Arc<Store>, Option<Arc<dyn RemoteStore>>), Status> {
+) -> Result<(Arc<GitContentStore>, Option<Arc<dyn RemoteStore>>), Status> {
     let guard = mounts.lock().await;
     guard
         .get(path)
@@ -661,9 +707,6 @@ fn fetch_status(err: FetchError) -> Status {
             "{kind} {id} not found locally or on remote"
         )),
         FetchError::DataLoss { .. } => Status::data_loss(format!("{err:#}")),
-        FetchError::Decode { .. } | FetchError::DecodeValue { .. } => {
-            Status::invalid_argument(format!("{err:#}"))
-        }
         FetchError::LocalWrite { .. } | FetchError::Remote { .. } => {
             Status::internal(format!("{err:#}"))
         }
@@ -672,23 +715,23 @@ fn fetch_status(err: FetchError) -> Status {
 
 #[allow(clippy::result_large_err)]
 async fn fetch_file_through_remote(
-    store: &Store,
+    store: &GitContentStore,
     remote: Option<&dyn RemoteStore>,
-    id: ty::Id,
-) -> Result<ty::File, Status> {
+    id: &[u8],
+) -> Result<Vec<u8>, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("file {id} not found")))?;
+        .ok_or_else(|| Status::not_found(format!("file {} not found", hex_bytes(id))))?;
     fetch::fetch_file(store, remote, id).await.map_err(fetch_status)
 }
 
 #[allow(clippy::result_large_err)]
 async fn fetch_symlink_through_remote(
-    store: &Store,
+    store: &GitContentStore,
     remote: Option<&dyn RemoteStore>,
-    id: ty::Id,
-) -> Result<ty::Symlink, Status> {
+    id: &[u8],
+) -> Result<String, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("symlink {id} not found")))?;
+        .ok_or_else(|| Status::not_found(format!("symlink {} not found", hex_bytes(id))))?;
     fetch::fetch_symlink(store, remote, id)
         .await
         .map_err(fetch_status)
@@ -696,23 +739,23 @@ async fn fetch_symlink_through_remote(
 
 #[allow(clippy::result_large_err)]
 async fn fetch_tree_through_remote(
-    store: &Store,
+    store: &GitContentStore,
     remote: Option<&dyn RemoteStore>,
-    id: ty::Id,
-) -> Result<ty::Tree, Status> {
+    id: &[u8],
+) -> Result<Vec<git_store::GitTreeEntry>, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("tree {id} not found")))?;
+        .ok_or_else(|| Status::not_found(format!("tree {} not found", hex_bytes(id))))?;
     fetch::fetch_tree(store, remote, id).await.map_err(fetch_status)
 }
 
 #[allow(clippy::result_large_err)]
 async fn fetch_commit_through_remote(
-    store: &Store,
+    store: &GitContentStore,
     remote: Option<&dyn RemoteStore>,
-    id: ty::Id,
-) -> Result<ty::Commit, Status> {
+    id: &[u8],
+) -> Result<jj_lib::backend::Commit, Status> {
     let remote = remote
-        .ok_or_else(|| Status::not_found(format!("commit {id} not found")))?;
+        .ok_or_else(|| Status::not_found(format!("commit {} not found", hex_bytes(id))))?;
     fetch::fetch_commit(store, remote, id)
         .await
         .map_err(fetch_status)
@@ -735,37 +778,35 @@ async fn fetch_commit_through_remote(
 /// rely on `has_blob` being cheap (the `dir://` impl is a `metadata()`
 /// probe; the gRPC server is a single map lookup).
 async fn push_reachable_blobs(
-    store: &Store,
+    store: &GitContentStore,
     remote: &dyn RemoteStore,
     root_tree_id: ty::Id,
 ) -> anyhow::Result<()> {
-    let mut seen_trees: HashSet<ty::Id> = HashSet::new();
-    let mut tree_stack: Vec<ty::Id> = vec![root_tree_id];
+    let mut seen_trees: HashSet<Vec<u8>> = HashSet::new();
+    let mut tree_stack: Vec<Vec<u8>> = vec![root_tree_id.0.to_vec()];
 
     while let Some(tree_id) = tree_stack.pop() {
-        if !seen_trees.insert(tree_id) {
+        if !seen_trees.insert(tree_id.clone()) {
             continue;
         }
         // Push the tree blob itself.
-        push_blob_if_missing(store, remote, BlobKind::Tree, tree_id).await?;
+        push_git_object_if_missing(store, remote, BlobKind::Tree, &tree_id).await?;
 
-        let tree = store
-            .get_tree(tree_id)?
-            .ok_or_else(|| anyhow!("tree {} missing locally during push walk", hex(&tree_id)))?;
-        for entry in tree.entries {
-            match entry.entry {
-                TreeEntry::TreeId(id) => tree_stack.push(id),
-                TreeEntry::File { id, .. } => {
-                    push_blob_if_missing(store, remote, BlobKind::File, id).await?;
+        let entries = store
+            .read_tree(&tree_id)?
+            .ok_or_else(|| anyhow!("tree {} missing locally during push walk", hex_bytes(&tree_id)))?;
+        for entry in entries {
+            match entry.kind {
+                GitEntryKind::Tree => tree_stack.push(entry.id),
+                GitEntryKind::File { .. } => {
+                    push_git_object_if_missing(store, remote, BlobKind::Blob, &entry.id).await?;
                 }
-                TreeEntry::SymlinkId(id) => {
-                    push_blob_if_missing(store, remote, BlobKind::Symlink, id).await?;
+                GitEntryKind::Symlink => {
+                    push_git_object_if_missing(store, remote, BlobKind::Blob, &entry.id).await?;
                 }
-                TreeEntry::ConflictId(_) => {
-                    // Not reachable from a `JjKikiFs`-produced snapshot
-                    // tree (the FS only emits TreeId/File/SymlinkId).
-                    // Conflict objects, when they appear, ride on the
-                    // commit-side write-through path instead. Skip.
+                GitEntryKind::Submodule => {
+                    // Submodules are not reachable from a
+                    // `JjKikiFs`-produced snapshot tree. Skip.
                 }
             }
         }
@@ -773,35 +814,27 @@ async fn push_reachable_blobs(
     Ok(())
 }
 
-/// Cheap-existence-probe-then-push for one blob. Reuses the same
-/// `Bytes` buffer that lives in redb (via `Store::get_*_bytes`) so the
-/// post-snapshot walk doesn't re-encode anything.
-async fn push_blob_if_missing(
-    store: &Store,
+/// Cheap-existence-probe-then-push for one git object. Reads the raw
+/// object bytes from the local git ODB and pushes to the remote.
+async fn push_git_object_if_missing(
+    store: &GitContentStore,
     remote: &dyn RemoteStore,
     kind: BlobKind,
-    id: ty::Id,
+    id: &[u8],
 ) -> anyhow::Result<()> {
-    if remote.has_blob(kind, &id.0).await? {
+    if remote.has_blob(kind, id).await? {
         return Ok(());
     }
-    let bytes: Bytes = match kind {
-        BlobKind::Tree => store.get_tree_bytes(id)?,
-        BlobKind::File => store.get_file_bytes(id)?,
-        BlobKind::Symlink => store.get_symlink_bytes(id)?,
-        BlobKind::Commit => store.get_commit_bytes(id)?,
-        BlobKind::View | BlobKind::Operation => {
-            unreachable!("push_reachable_blobs only walks tree/file/symlink/commit")
-        }
-    }
-    .ok_or_else(|| {
-        anyhow!(
-            "local store missing {} {} during push walk",
-            kind.as_str(),
-            hex(&id)
-        )
-    })?;
-    remote.put_blob(kind, &id.0, bytes).await?;
+    let (_git_kind, data) = store
+        .read_git_object_bytes(id)?
+        .ok_or_else(|| {
+            anyhow!(
+                "local store missing {} {} during push walk",
+                kind.as_str(),
+                hex_bytes(id)
+            )
+        })?;
+    remote.put_blob(kind, id, Bytes::from(data)).await?;
     Ok(())
 }
 
@@ -837,7 +870,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // M10.5: always materialize a local-fallback catalog. See the
         // note in `rehydrate_one`; same shape here.
         let local_refs = Arc::new(crate::local_refs::LocalRefs::new(store.database()));
-        let root_tree_id = store.get_empty_tree_id();
+        let root_tree_id = ty::Id(store.empty_tree_id().as_bytes().try_into().expect("20-byte tree id"));
 
         // M9: parse `remote` into an optional `RemoteStore`. Bad URL =
         // `invalid_argument` so the user gets a clean message rather
@@ -1021,7 +1054,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let req = request.into_inner();
         let store = store_for(&self.mounts, &req.working_copy_path).await?;
         Ok(Response::new(TreeId {
-            tree_id: store.get_empty_tree_id().into(),
+            tree_id: store.empty_tree_id().as_bytes().to_vec(),
         }))
     }
 
@@ -1032,21 +1065,25 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<FileId>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        let (id, bytes) = store
-            .write_file(ty::File { content: req.data })
+        let id = store
+            .write_file(&req.data)
             .map_err(store_status("write_file"))?;
-        // Write-through: push to the remote synchronously (M9 §13.4).
-        // On failure, the local write has already happened — surface
-        // the error but don't roll back; idempotent puts + the next
-        // snapshot's walk cover transient remote failures.
+        // Write-through: push the raw git blob to the remote
+        // synchronously (M9 §13.4). On failure, the local write has
+        // already happened — surface the error but don't roll back;
+        // idempotent puts + the next snapshot's walk cover transient
+        // remote failures.
         if let Some(remote) = remote {
+            let (_kind, obj_bytes) = store
+                .read_git_object_bytes(&id)
+                .map_err(store_status("read git blob for file push"))?
+                .ok_or_else(|| Status::internal("just-written file not found"))?;
             remote
-                .put_blob(BlobKind::File, &id.0, bytes)
+                .put_blob(BlobKind::Blob, &id, Bytes::from(obj_bytes))
                 .await
                 .map_err(remote_status("remote put_blob (file)"))?;
         }
-        let file_id = id.into();
-        Ok(Response::new(FileId { file_id }))
+        Ok(Response::new(FileId { file_id: id }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1056,14 +1093,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<File>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        let file_id: ty::Id = FileId { file_id: req.file_id }
+        let id: ty::Id = FileId { file_id: req.file_id }
             .try_into()
             .map_err(decode_status("file id"))?;
-        let file = match store.get_file(file_id).map_err(store_status("get_file"))? {
-            Some(f) => f,
-            None => fetch_file_through_remote(&store, remote.as_deref(), file_id).await?,
+        let content = match store.read_file(&id.0).map_err(store_status("read_file"))? {
+            Some(c) => c,
+            None => fetch_file_through_remote(&store, remote.as_deref(), &id.0).await?,
         };
-        Ok(Response::new(file.as_proto()))
+        Ok(Response::new(proto::jj_interface::File { data: content }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1073,18 +1110,20 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<SymlinkId>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        let symlink = ty::Symlink { target: req.target };
-        let (id, bytes) = store
-            .write_symlink(symlink)
+        let id = store
+            .write_symlink(&req.target)
             .map_err(store_status("write_symlink"))?;
         if let Some(remote) = remote {
+            let (_kind, obj_bytes) = store
+                .read_git_object_bytes(&id)
+                .map_err(store_status("read git blob for symlink push"))?
+                .ok_or_else(|| Status::internal("just-written symlink not found"))?;
             remote
-                .put_blob(BlobKind::Symlink, &id.0, bytes)
+                .put_blob(BlobKind::Blob, &id, Bytes::from(obj_bytes))
                 .await
                 .map_err(remote_status("remote put_blob (symlink)"))?;
         }
-        let symlink_id = id.into();
-        Ok(Response::new(SymlinkId { symlink_id }))
+        Ok(Response::new(SymlinkId { symlink_id: id }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1094,17 +1133,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<Symlink>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        let symlink_id: ty::Id = SymlinkId { symlink_id: req.symlink_id }
+        let id: ty::Id = SymlinkId { symlink_id: req.symlink_id }
             .try_into()
             .map_err(decode_status("symlink id"))?;
-        let symlink = match store
-            .get_symlink(symlink_id)
-            .map_err(store_status("get_symlink"))?
+        let target = match store
+            .read_symlink(&id.0)
+            .map_err(store_status("read_symlink"))?
         {
-            Some(s) => s,
-            None => fetch_symlink_through_remote(&store, remote.as_deref(), symlink_id).await?,
+            Some(t) => t,
+            None => fetch_symlink_through_remote(&store, remote.as_deref(), &id.0).await?,
         };
-        Ok(Response::new(symlink.as_proto()))
+        Ok(Response::new(proto::jj_interface::Symlink { target }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1117,18 +1156,21 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let tree_proto = req
             .tree
             .ok_or_else(|| Status::invalid_argument("WriteTreeReq.tree is required"))?;
-        let tree: ty::Tree = tree_proto.try_into().map_err(decode_status("tree"))?;
-        let (id, bytes) = store
-            .write_tree(tree)
+        let entries = git_store::tree_from_proto(tree_proto).map_err(decode_status("tree"))?;
+        let id = store
+            .write_tree(&entries)
             .map_err(store_status("write_tree"))?;
         if let Some(remote) = remote {
+            let (_kind, obj_bytes) = store
+                .read_git_object_bytes(&id)
+                .map_err(store_status("read git blob for tree push"))?
+                .ok_or_else(|| Status::internal("just-written tree not found"))?;
             remote
-                .put_blob(BlobKind::Tree, &id.0, bytes)
+                .put_blob(BlobKind::Tree, &id, Bytes::from(obj_bytes))
                 .await
                 .map_err(remote_status("remote put_blob (tree)"))?;
         }
-        let tree_id = id.into();
-        Ok(Response::new(TreeId { tree_id }))
+        Ok(Response::new(TreeId { tree_id: id }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1138,14 +1180,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<Tree>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        let tree_id: ty::Id = TreeId { tree_id: req.tree_id }
+        let id: ty::Id = TreeId { tree_id: req.tree_id }
             .try_into()
             .map_err(decode_status("tree id"))?;
-        let tree = match store.get_tree(tree_id).map_err(store_status("get_tree"))? {
-            Some(t) => t,
-            None => fetch_tree_through_remote(&store, remote.as_deref(), tree_id).await?,
+        let entries = match store.read_tree(&id.0).map_err(store_status("read_tree"))? {
+            Some(e) => e,
+            None => fetch_tree_through_remote(&store, remote.as_deref(), &id.0).await?,
         };
-        Ok(Response::new(tree.as_proto()))
+        Ok(Response::new(git_store::tree_to_proto(&entries)))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1161,18 +1203,31 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         if commit_proto.parents.is_empty() {
             return Err(Status::internal("Cannot write a commit with no parents"));
         }
-        let commit: ty::Commit = commit_proto.try_into().map_err(decode_status("commit"))?;
-        let (id, bytes) = store
+        let commit = git_store::commit_from_proto(commit_proto).map_err(decode_status("commit"))?;
+        let (id, _stored) = store
             .write_commit(commit)
             .map_err(store_status("write_commit"))?;
         if let Some(remote) = remote {
+            let (_kind, obj_bytes) = store
+                .read_git_object_bytes(&id)
+                .map_err(store_status("read git blob for commit push"))?
+                .ok_or_else(|| Status::internal("just-written commit not found"))?;
             remote
-                .put_blob(BlobKind::Commit, &id.0, bytes)
+                .put_blob(BlobKind::Commit, &id, Bytes::from(obj_bytes))
                 .await
                 .map_err(remote_status("remote put_blob (commit)"))?;
+            // Push extras (change-id + predecessors)
+            if let Some(extras_bytes) = store
+                .read_extras(&id)
+                .map_err(store_status("read extras for commit push"))?
+            {
+                remote
+                    .put_blob(BlobKind::Extra, &id, Bytes::from(extras_bytes))
+                    .await
+                    .map_err(remote_status("remote put_blob (extra)"))?;
+            }
         }
-        let commit_id = id.into();
-        Ok(Response::new(CommitId { commit_id }))
+        Ok(Response::new(CommitId { commit_id: id }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1182,17 +1237,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     ) -> Result<Response<Commit>, Status> {
         let req = request.into_inner();
         let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
-        let commit_id: ty::Id = CommitId { commit_id: req.commit_id }
+        let id: ty::Id = CommitId { commit_id: req.commit_id }
             .try_into()
             .map_err(decode_status("commit id"))?;
         let commit = match store
-            .get_commit(commit_id)
-            .map_err(store_status("get_commit"))?
+            .read_commit(&id.0)
+            .map_err(store_status("read_commit"))?
         {
             Some(c) => c,
-            None => fetch_commit_through_remote(&store, remote.as_deref(), commit_id).await?,
+            None => fetch_commit_through_remote(&store, remote.as_deref(), &id.0).await?,
         };
-        Ok(Response::new(commit.as_proto()))
+        Ok(Response::new(git_store::commit_to_proto(&commit)))
     }
 
     // ---- M10.6: op-store RPCs ----------------------------------------
@@ -1359,7 +1414,6 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let result = store
             .operation_ids_matching_prefix(&req.hex_prefix)
             .map_err(store_status("operation_ids_matching_prefix"))?;
-        use crate::store::OpPrefixResult;
         Ok(Response::new(match result {
             OpPrefixResult::None => ResolveOperationIdPrefixReply {
                 resolution: 0,
@@ -1475,7 +1529,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 req.working_copy_path
             ))
         })?;
-        info!(path = %req.working_copy_path, tree_id = %hex(&new_root), "Snapshot");
+        info!(path = %req.working_copy_path, tree_id = %hex_bytes(&new_root.0), "Snapshot");
 
         // M9 §13.2: blobs written through `JjKikiFs::snapshot_node`
         // bypass the RPC handlers, so we walk the rolled-up tree and
@@ -1533,7 +1587,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         }
         .try_into()
         .map_err(decode_status("tree id"))?;
-        info!(path = %req.working_copy_path, tree_id = %hex(&new_tree_id), "CheckOut");
+        info!(path = %req.working_copy_path, tree_id = %hex_bytes(&new_tree_id.0), "CheckOut");
 
         // Clone the per-mount fs handle out from under the lock so the
         // (potentially I/O-heavy) `JjKikiFs::check_out` call doesn't hold
@@ -1552,7 +1606,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         fs.check_out(new_tree_id).await.map_err(|e| match e {
             FsError::StoreMiss => Status::failed_precondition(format!(
                 "tree {} not in store; call WriteTree first",
-                hex(&new_tree_id)
+                hex_bytes(&new_tree_id.0)
             )),
             other => Status::internal(format!("check_out failed: {other}")),
         })?;
@@ -1590,19 +1644,12 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
 #[cfg(test)]
 mod tests {
-    const COMMIT_ID_LENGTH: usize = 32;
+    const COMMIT_ID_LENGTH: usize = 20;
     const CHANGE_ID_LENGTH: usize = 16;
 
     use assert_matches::assert_matches;
     use proto::jj_interface::jujutsu_interface_server::JujutsuInterface;
     use proptest::prelude::*;
-    // Several tests decode raw blob bytes off the dir:// remote to
-    // confirm write-through actually pushed the prost-encoded payload.
-    // The trait import lives here (test-only) rather than at the
-    // module top level — production code uses the typed
-    // `Store::get_*_bytes` helpers and never touches `prost::decode`
-    // directly.
-    use prost::Message as _;
 
     use super::*;
     use crate::vfs::FileKind;
@@ -1687,31 +1734,50 @@ mod tests {
         let path = "/tmp/repo".to_string();
         init_mount(&svc, &path).await;
 
-        // No parents
-        let mut commit = Commit {
-            parents: vec![],
-            ..Default::default()
+        // Get the empty tree id so we can supply a valid root_tree.
+        let empty = svc
+            .get_empty_tree_id(Request::new(GetEmptyTreeIdReq {
+                working_copy_path: path.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Helper: build a Commit proto with the given parents/description
+        // and a valid empty root_tree.
+        let make_commit = |parents: Vec<Vec<u8>>, desc: &str| -> Commit {
+            Commit {
+                parents,
+                root_tree: vec![empty.tree_id.clone()],
+                description: desc.into(),
+                ..Default::default()
+            }
         };
 
+        // No parents
         assert_matches!(
             svc.write_commit(Request::new(WriteCommitReq {
                 working_copy_path: path.clone(),
-                commit: Some(commit.clone()),
+                commit: Some(Commit {
+                    parents: vec![],
+                    ..Default::default()
+                }),
             }))
             .await,
             Err(status) if status.message().contains("no parents")
         );
 
-        // Only root commit as parent
-        commit.parents = vec![vec![0; CHANGE_ID_LENGTH]];
+        // Only root commit as parent (use 20-byte root commit id)
+        let root_parent = vec![0; COMMIT_ID_LENGTH];
         let first_id = svc
             .write_commit(Request::new(WriteCommitReq {
                 working_copy_path: path.clone(),
-                commit: Some(commit.clone()),
+                commit: Some(make_commit(vec![root_parent.clone()], "first")),
             }))
             .await
             .unwrap()
             .into_inner();
+        assert_eq!(first_id.commit_id.len(), COMMIT_ID_LENGTH);
         let first_commit = svc
             .read_commit(Request::new(ReadCommitReq {
                 working_copy_path: path.clone(),
@@ -1720,14 +1786,19 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(first_commit, commit);
+        // GitBackend assigns a change_id on write, so we check key
+        // fields rather than full proto equality.
+        assert_eq!(first_commit.parents, vec![root_parent.clone()]);
+        assert_eq!(first_commit.description, "first");
 
         // Only non-root commit as parent
-        commit.parents = vec![first_id.commit_id.clone()];
         let second_id = svc
             .write_commit(Request::new(WriteCommitReq {
                 working_copy_path: path.clone(),
-                commit: Some(commit.clone()),
+                commit: Some(make_commit(
+                    vec![first_id.commit_id.clone()],
+                    "second",
+                )),
             }))
             .await
             .unwrap()
@@ -1740,14 +1811,17 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(second_commit, commit);
+        assert_eq!(second_commit.parents, vec![first_id.commit_id.clone()]);
+        assert_eq!(second_commit.description, "second");
 
         // Merge commit
-        commit.parents = vec![first_id.commit_id.clone(), second_id.commit_id.clone()];
         let merge_id = svc
             .write_commit(Request::new(WriteCommitReq {
                 working_copy_path: path.clone(),
-                commit: Some(commit.clone()),
+                commit: Some(make_commit(
+                    vec![first_id.commit_id.clone(), second_id.commit_id.clone()],
+                    "merge",
+                )),
             }))
             .await
             .unwrap()
@@ -1760,26 +1834,15 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(merge_commit, commit);
+        assert_eq!(
+            merge_commit.parents,
+            vec![first_id.commit_id.clone(), second_id.commit_id.clone()]
+        );
+        assert_eq!(merge_commit.description, "merge");
 
-        commit.parents = vec![first_id.commit_id, vec![0; COMMIT_ID_LENGTH]];
-        let root_merge_id = svc
-            .write_commit(Request::new(WriteCommitReq {
-                working_copy_path: path.clone(),
-                commit: Some(commit.clone()),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        let root_merge_commit = svc
-            .read_commit(Request::new(ReadCommitReq {
-                working_copy_path: path,
-                commit_id: root_merge_id.commit_id,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(root_merge_commit, commit);
+        // Note: GitBackend does not support merge commits with the root
+        // commit as a parent. That case (previously tested here) is now
+        // a backend-level constraint.
     }
 
     /// Walk through the lifecycle exercised by `jj kk init` followed by
@@ -2046,7 +2109,7 @@ mod tests {
 
         // Checking out an unknown tree id rejects with failed_precondition,
         // and leaves `root_tree_id` as it was after the successful swap.
-        let bogus = vec![0xee; 32];
+        let bogus = vec![0xee; 20];
         let err = svc
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: path.clone(),
@@ -2073,7 +2136,7 @@ mod tests {
         let err = svc
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: "/never/initialized".into(),
-                new_tree_id: vec![0; 32],
+                new_tree_id: vec![0; 20],
             }))
             .await
             .expect_err("expected not_found");
@@ -2351,7 +2414,7 @@ mod tests {
         );
     }
 
-    /// `WriteFile` with a `dir://` remote pushes the prost-encoded blob
+    /// `WriteFile` with a `dir://` remote pushes the raw git blob
     /// into the remote synchronously (M9 §13.4 — write-through). The
     /// blob lands at `<remote>/file/<hex(id)>`.
     #[tokio::test]
@@ -2375,17 +2438,12 @@ mod tests {
             .expect("write_file")
             .into_inner();
 
-        // Hex-encode the 32-byte id the way the dir backend does it.
-        let mut hex_id = String::with_capacity(64);
-        for b in &written.file_id {
-            use std::fmt::Write;
-            let _ = write!(&mut hex_id, "{b:02x}");
-        }
-        let blob_path = remote_dir.path().join("file").join(&hex_id);
+        // Hex-encode the 20-byte id the way the dir backend does it.
+        let hex_id = hex_bytes(&written.file_id);
+        let blob_path = remote_dir.path().join("blob").join(&hex_id);
         let bytes = std::fs::read(&blob_path).expect("blob landed on remote");
-        let proto = proto::jj_interface::File::decode(bytes.as_slice())
-            .expect("decoding remote file blob");
-        assert_eq!(proto.data, b"hello-remote");
+        // The remote now holds raw git blob bytes (just the file content).
+        assert_eq!(bytes, b"hello-remote");
     }
 
     /// `ReadFile` falls back to the remote on local miss. The fetched
@@ -2435,7 +2493,7 @@ mod tests {
         }
         .try_into()
         .unwrap();
-        let cached = store_b.get_file(id).expect("get_file (after read-through)");
+        let cached = store_b.read_file(&id.0).expect("read_file (after read-through)");
         assert!(
             cached.is_some(),
             "read-through should have populated the local store"
@@ -2452,7 +2510,7 @@ mod tests {
         let err = svc
             .read_file(Request::new(ReadFileReq {
                 working_copy_path: path,
-                file_id: vec![0xff; 32],
+                file_id: vec![0xff; 20],
             }))
             .await
             .expect_err("expected not_found");
@@ -2492,31 +2550,26 @@ mod tests {
             .await
             .expect("snapshot")
             .into_inner();
-        assert_eq!(snap.tree_id.len(), 32);
+        assert_eq!(snap.tree_id.len(), 20);
 
         // The new root tree blob is on the remote.
-        let mut tree_hex = String::with_capacity(64);
-        for b in &snap.tree_id {
-            use std::fmt::Write;
-            let _ = write!(&mut tree_hex, "{b:02x}");
-        }
+        let tree_hex = hex_bytes(&snap.tree_id);
         let tree_blob = remote_dir.path().join("tree").join(&tree_hex);
         assert!(tree_blob.exists(), "tree blob {tree_hex} should be on remote");
 
         // The file blob is also on the remote (the walk recursed into
         // the tree's File entry).
-        let file_dir = remote_dir.path().join("file");
+        let file_dir = remote_dir.path().join("blob");
         let entries: Vec<_> = std::fs::read_dir(&file_dir)
             .expect("file kind dir exists")
             .flatten()
             .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp"))
             .collect();
         assert_eq!(entries.len(), 1, "expected one file blob on remote");
+        // The remote now holds raw git blob bytes (just the file content).
         let file_bytes =
             std::fs::read(entries[0].path()).expect("read remote file blob");
-        let file_proto = proto::jj_interface::File::decode(file_bytes.as_slice())
-            .expect("decoding remote file blob");
-        assert_eq!(file_proto.data, b"snapshot-content");
+        assert_eq!(file_bytes, b"snapshot-content");
     }
 
     /// End-to-end M9 §13.7 gRPC analogue: two `JujutsuService`
@@ -2712,7 +2765,7 @@ mod tests {
         init_mount(&svc, "/tmp/repo").await;
         // A fabricated tree id that nothing wrote — and no remote
         // to fetch it from.
-        let bogus = vec![0xaa; 32];
+        let bogus = vec![0xaa; 20];
         let err = svc
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: "/tmp/repo".into(),
@@ -2777,23 +2830,22 @@ mod tests {
         }
         .try_into()
         .unwrap();
-        let tree = store_b
-            .get_tree(tree_id)
+        let tree_entries = store_b
+            .read_tree(&tree_id.0)
             .expect("tree in local store after read-through")
             .unwrap();
-        let file_entry = tree
-            .entries
+        let file_entry = tree_entries
             .iter()
-            .find(|m| m.name == "f.txt")
+            .find(|e| e.name == "f.txt")
             .expect("file in tree");
-        let file_id = match file_entry.entry {
-            TreeEntry::File { id, .. } => id,
+        let file_id = match file_entry.kind {
+            GitEntryKind::File { .. } => &file_entry.id,
             _ => panic!("expected file entry"),
         };
         assert!(
             store_b
-                .get_file(file_id)
-                .expect("get_file in local cache")
+                .read_file(file_id)
+                .expect("read_file in local cache")
                 .is_some(),
             "file blob should be cached locally after read-through"
         );

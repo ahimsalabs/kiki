@@ -10,8 +10,8 @@ fn test_init() {
     let repo_path = test_env.env_root().join("repo");
 
     let stdout = test_env.jj_cmd_success(&repo_path, &["log"]);
-    insta::assert_snapshot!(stdout, @r"
-    @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 b4e46adb
+    insta::assert_snapshot!(stdout, @"
+    @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 e8849ae1
     │  (empty) (no description set)
     ◆  zzzzzzzz root() 00000000
     ");
@@ -42,8 +42,8 @@ fn test_op_id_round_trip() {
             r#"if(current_operation, "@", " ") ++ " " ++ id.short() ++ " " ++ description.first_line() ++ "\n""#,
         ],
     );
-    insta::assert_snapshot!(stdout, @r"
-    @ e69ffce1f5bb add workspace 'default'
+    insta::assert_snapshot!(stdout, @"
+    @ 90267f31f904 add workspace 'default'
       000000000000
     ");
 }
@@ -64,15 +64,15 @@ fn test_multiple_init() {
     let repo2_path = test_env.env_root().join("repo2");
 
     let stdout = test_env.jj_cmd_success(&repo1_path, &["log"]);
-    insta::assert_snapshot!(stdout, @r"
-    @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 b4e46adb
+    insta::assert_snapshot!(stdout, @"
+    @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 e8849ae1
     │  (empty) (no description set)
     ◆  zzzzzzzz root() 00000000
     ");
 
     let stdout = test_env.jj_cmd_success(&repo2_path, &["log"]);
-    insta::assert_snapshot!(stdout, @r"
-    @  rlvkpnrz test.user@example.com 2001-02-03 08:05:08 029ed36b
+    insta::assert_snapshot!(stdout, @"
+    @  rlvkpnrz test.user@example.com 2001-02-03 08:05:08 7eb1c95e
     │  (empty) (no description set)
     ◆  zzzzzzzz root() 00000000
     ");
@@ -106,25 +106,25 @@ fn test_repos_are_independent() {
     let repo2_path = test_env.env_root().join("repo2");
 
     let stdout = test_env.jj_cmd_success(&repo1_path, &["log"]);
-    insta::assert_snapshot!(stdout, @r"
-    @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 b4e46adb
+    insta::assert_snapshot!(stdout, @"
+    @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 e8849ae1
     │  (empty) (no description set)
     ◆  zzzzzzzz root() 00000000
     ");
 
     let stdout = test_env.jj_cmd_success(&repo2_path, &["log"]);
-    insta::assert_snapshot!(stdout, @r"
-    @  rlvkpnrz test.user@example.com 2001-02-03 08:05:08 029ed36b
+    insta::assert_snapshot!(stdout, @"
+    @  rlvkpnrz test.user@example.com 2001-02-03 08:05:08 7eb1c95e
     │  (empty) (no description set)
     ◆  zzzzzzzz root() 00000000
     ");
 
     test_env.jj_cmd_ok(&repo1_path, &["new"]);
     let stdout = test_env.jj_cmd_success(&repo1_path, &["log"]);
-    insta::assert_snapshot!(stdout, @r"
-    @  mzvwutvl test.user@example.com 2001-02-03 08:05:11 bada728f
+    insta::assert_snapshot!(stdout, @"
+    @  mzvwutvl test.user@example.com 2001-02-03 08:05:11 8afc18ff
     │  (empty) (no description set)
-    ○  qpvuntsm test.user@example.com 2001-02-03 08:05:07 b4e46adb
+    ○  qpvuntsm test.user@example.com 2001-02-03 08:05:07 e8849ae1
     │  (empty) (no description set)
     ◆  zzzzzzzz root() 00000000
     ");

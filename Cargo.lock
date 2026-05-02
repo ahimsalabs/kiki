@@ -736,6 +736,7 @@ dependencies = [
  "pollster",
  "proptest",
  "prost 0.12.6",
+ "prost 0.14.3",
  "proto",
  "rand 0.9.4",
  "redb",

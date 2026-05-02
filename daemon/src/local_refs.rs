@@ -45,7 +45,7 @@ pub struct LocalRefs {
 
 impl LocalRefs {
     /// Construct over an existing [`redb::Database`] handle (typically
-    /// the one [`crate::store::Store::database`] hands out). The
+    /// the one [`crate::git_store::GitContentStore::database`] hands out). The
     /// table is created lazily on first write, so a fresh instance is
     /// always valid even before any ref has been set.
     pub fn new(db: Arc<Database>) -> Self {
@@ -130,11 +130,11 @@ impl LocalRefs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
-
     fn refs() -> LocalRefs {
-        let store = Store::new_in_memory();
-        LocalRefs::new(store.database())
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("in-memory redb");
+        LocalRefs::new(std::sync::Arc::new(db))
     }
 
     #[test]
@@ -285,8 +285,10 @@ mod tests {
         // Cloning is cheap and shares the same Database — operations
         // on one clone are visible on the other (one writer, many
         // readers serialization is per-Database, not per-clone).
-        let store = Store::new_in_memory();
-        let r1 = LocalRefs::new(store.database());
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("in-memory redb");
+        let r1 = LocalRefs::new(std::sync::Arc::new(db));
         let r2 = r1.clone();
         r1.cas_ref("k", None, Some(&Bytes::from_static(b"v"))).unwrap();
         assert_eq!(r2.get_ref("k").unwrap().as_deref(), Some(&b"v"[..]));
@@ -297,7 +299,6 @@ mod tests {
 mod proptests {
     use super::*;
     use crate::remote::validate_ref_name;
-    use crate::store::Store;
     use proptest::prelude::*;
 
     /// Strategy for valid ref names: non-empty, no NUL, no '/',
@@ -308,8 +309,10 @@ mod proptests {
     }
 
     fn refs() -> LocalRefs {
-        let store = Store::new_in_memory();
-        LocalRefs::new(store.database())
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("in-memory redb");
+        LocalRefs::new(std::sync::Arc::new(db))
     }
 
     // ---- validate_ref_name never panics ----

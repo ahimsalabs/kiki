@@ -233,7 +233,7 @@ mod tests {
         let (_dir, svc) = service_with_tempdir();
         let id = id_of(0x42);
         svc.put_blob(Request::new(PutBlobReq {
-            kind: ProtoBlobKind::File as i32,
+            kind: ProtoBlobKind::Blob as i32,
             id: id.clone(),
             bytes: b"server-side-hello".to_vec(),
         }))
@@ -242,7 +242,7 @@ mod tests {
 
         let resp = svc
             .get_blob(Request::new(GetBlobReq {
-                kind: ProtoBlobKind::File as i32,
+                kind: ProtoBlobKind::Blob as i32,
                 id: id.clone(),
             }))
             .await
@@ -299,7 +299,7 @@ mod tests {
         let id = id_of(7);
         let resp = svc
             .has_blob(Request::new(HasBlobReq {
-                kind: ProtoBlobKind::Symlink as i32,
+                kind: ProtoBlobKind::Blob as i32,
                 id: id.clone(),
             }))
             .await
@@ -307,7 +307,7 @@ mod tests {
             .into_inner();
         assert!(!resp.found);
         svc.put_blob(Request::new(PutBlobReq {
-            kind: ProtoBlobKind::Symlink as i32,
+            kind: ProtoBlobKind::Blob as i32,
             id: id.clone(),
             bytes: Bytes::from_static(b"x").to_vec(),
         }))
@@ -315,7 +315,7 @@ mod tests {
         .unwrap();
         let resp = svc
             .has_blob(Request::new(HasBlobReq {
-                kind: ProtoBlobKind::Symlink as i32,
+                kind: ProtoBlobKind::Blob as i32,
                 id: id.clone(),
             }))
             .await

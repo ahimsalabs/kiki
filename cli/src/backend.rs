@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::blocking_client::BlockingJujutsuInterfaceClient;
 
-const COMMIT_ID_LENGTH: usize = 32;
+const COMMIT_ID_LENGTH: usize = 20;
 const CHANGE_ID_LENGTH: usize = 16;
 
 #[derive(Debug)]
@@ -566,9 +566,9 @@ mod tests {
     #[test]
     fn commit_conflict_labels_round_trip() {
         let root_tree = Merge::from_vec(vec![
-            TreeId::new(vec![1; 32]),
-            TreeId::new(vec![2; 32]),
-            TreeId::new(vec![3; 32]),
+            TreeId::new(vec![1; 20]),
+            TreeId::new(vec![2; 20]),
+            TreeId::new(vec![3; 20]),
         ]);
         let conflict_labels = Merge::from_vec(vec![
             "left".to_string(),
@@ -576,7 +576,7 @@ mod tests {
             "right".to_string(),
         ]);
         let commit = Commit {
-            parents: vec![CommitId::new(vec![4; 32])],
+            parents: vec![CommitId::new(vec![4; 20])],
             predecessors: vec![],
             root_tree: root_tree.clone(),
             conflict_labels: conflict_labels.clone(),
@@ -601,7 +601,7 @@ mod tests {
     fn file_copy_id_round_trip() {
         let copy_id = CopyId::new(vec![9, 8, 7]);
         let value = TreeValue::File {
-            id: FileId::new(vec![1; 32]),
+            id: FileId::new(vec![1; 20]),
             executable: true,
             copy_id: copy_id.clone(),
         };
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn tree_value_legacy_conflict_id_is_unsupported() {
         let proto = proto::jj_interface::TreeValue {
-            value: Some(proto::jj_interface::tree_value::Value::ConflictId(vec![1; 32])),
+            value: Some(proto::jj_interface::tree_value::Value::ConflictId(vec![1; 20])),
         };
         let err = tree_value_from_proto(proto).expect_err("expected decode error");
         assert!(matches!(err, BackendError::Unsupported(_)), "got {err:?}");
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn tree_value_git_submodule_is_unsupported() {
         use jj_lib::backend::CommitId;
-        let value = TreeValue::GitSubmodule(CommitId::new(vec![1; 32]));
+        let value = TreeValue::GitSubmodule(CommitId::new(vec![1; 20]));
         let err = tree_value_to_proto(&value).expect_err("expected encode error");
         assert!(matches!(err, BackendError::Unsupported(_)), "got {err:?}");
     }

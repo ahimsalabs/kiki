@@ -359,31 +359,43 @@ const _: fn() = || {
 mod tests {
     use std::sync::Arc;
 
-    use crate::store::{Store, StoreTestExt as _};
-    use crate::ty::{File, Tree, TreeEntry, TreeEntryMapping};
+    use crate::git_store::{GitContentStore, GitTreeEntry, GitEntryKind};
+    use crate::ty::Id;
     use crate::vfs::kiki_fs::KikiFs;
 
     use super::*;
+
+    fn test_settings() -> jj_lib::settings::UserSettings {
+        let toml_str = r#"
+            user.name = "Test User"
+            user.email = "test@example.com"
+            operation.hostname = "test"
+            operation.username = "test"
+            debug.randomness-seed = 42
+        "#;
+        let mut config = jj_lib::config::StackedConfig::with_defaults();
+        config.add_layer(jj_lib::config::ConfigLayer::parse(
+            jj_lib::config::ConfigSource::User,
+            toml_str,
+        ).unwrap());
+        jj_lib::settings::UserSettings::from_config(config).unwrap()
+    }
 
     /// Build the same tiny tree the KikiFs tests use, scaled down. Verifies
     /// the NFS adapter passes through to the trait without losing fidelity
     /// (kind, size, exec bit) and that attribute conversion is consistent.
     fn build_adapter() -> NfsAdapter {
-        let store = Arc::new(Store::new_in_memory());
-        let hello_id = store.put_file(File {
-            content: b"hi".to_vec(),
-        });
-        let root = Tree {
-            entries: vec![TreeEntryMapping {
+        let store = Arc::new(GitContentStore::new_in_memory(&test_settings()));
+        let hello_id_bytes = store.write_file(b"hi").unwrap();
+        let entries = vec![
+            GitTreeEntry {
                 name: "hello.txt".into(),
-                entry: TreeEntry::File {
-                    id: hello_id,
-                    executable: false,
-                    copy_id: Vec::new(),
-                },
-            }],
-        };
-        let root_id = store.put_tree(root);
+                kind: GitEntryKind::File { executable: false },
+                id: hello_id_bytes.clone(),
+            },
+        ];
+        let root_id_bytes = store.write_tree(&entries).unwrap();
+        let root_id = Id(root_id_bytes.try_into().expect("20-byte tree id"));
         let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None));
         NfsAdapter::new(kiki)
     }

@@ -15,7 +15,6 @@ mod local_refs;
 mod mount_meta;
 mod remote;
 mod service;
-mod store;
 mod ty;
 mod vfs;
 mod vfs_mgr;

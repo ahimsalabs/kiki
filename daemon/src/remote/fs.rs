@@ -374,8 +374,8 @@ mod tests {
         let (_dir, s) = make_store();
         let id = id_of(0xab);
         let bytes = Bytes::from_static(b"hello blob");
-        s.put_blob(BlobKind::File, &id, bytes.clone()).await.unwrap();
-        let got = s.get_blob(BlobKind::File, &id).await.unwrap();
+        s.put_blob(BlobKind::Blob, &id, bytes.clone()).await.unwrap();
+        let got = s.get_blob(BlobKind::Blob, &id).await.unwrap();
         assert_eq!(got.as_deref(), Some(bytes.as_ref()));
     }
 
@@ -390,11 +390,11 @@ mod tests {
     async fn has_blob_tracks_state() {
         let (_dir, s) = make_store();
         let id = id_of(7);
-        assert!(!s.has_blob(BlobKind::Symlink, &id).await.unwrap());
-        s.put_blob(BlobKind::Symlink, &id, Bytes::from_static(b"x"))
+        assert!(!s.has_blob(BlobKind::Blob, &id).await.unwrap());
+        s.put_blob(BlobKind::Blob, &id, Bytes::from_static(b"x"))
             .await
             .unwrap();
-        assert!(s.has_blob(BlobKind::Symlink, &id).await.unwrap());
+        assert!(s.has_blob(BlobKind::Blob, &id).await.unwrap());
         // Different kind, same id: distinct keyspace.
         assert!(!s.has_blob(BlobKind::Tree, &id).await.unwrap());
     }
@@ -417,14 +417,14 @@ mod tests {
     async fn kinds_are_partitioned() {
         let (_dir, s) = make_store();
         let id = id_of(0xff);
-        s.put_blob(BlobKind::File, &id, Bytes::from_static(b"file-bytes"))
+        s.put_blob(BlobKind::Blob, &id, Bytes::from_static(b"file-bytes"))
             .await
             .unwrap();
         s.put_blob(BlobKind::Tree, &id, Bytes::from_static(b"tree-bytes"))
             .await
             .unwrap();
         assert_eq!(
-            s.get_blob(BlobKind::File, &id).await.unwrap().as_deref(),
+            s.get_blob(BlobKind::Blob, &id).await.unwrap().as_deref(),
             Some(b"file-bytes".as_ref())
         );
         assert_eq!(
@@ -440,11 +440,11 @@ mod tests {
         let root = parent.path().join("does/not/exist/yet");
         let s = FsRemoteStore::new(root.clone());
         let id = id_of(2);
-        s.put_blob(BlobKind::File, &id, Bytes::from_static(b"x"))
+        s.put_blob(BlobKind::Blob, &id, Bytes::from_static(b"x"))
             .await
             .expect("put creates root + kind dir");
         assert!(
-            root.join("file").join(hex_bytes(&id)).exists(),
+            root.join("blob").join(hex_bytes(&id)).exists(),
             "blob should be at <root>/<kind>/<hex>"
         );
     }

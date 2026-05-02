@@ -1,12 +1,12 @@
 //! Layer C — remote blob CAS (PLAN.md §13).
 //!
-//! Byte-typed content-addressed store. The local [`crate::store::Store`]
-//! stays jj-typed (`get_tree`, `write_file`, ...) because it round-trips
-//! prost messages. A *remote* doesn't need to know about jj types at all
+//! Byte-typed content-addressed store. The local
+//! [`crate::git_store::GitContentStore`] stays jj-typed (`get_tree`,
+//! `write_file`, ...) because it round-trips through jj-lib's
+//! `GitBackend`. A *remote* doesn't need to know about jj types at all
 //! — it's just bytes keyed by `(BlobKind, Id)`. Decoupling at the byte
-//! boundary means the wire protocol survives prost schema evolution and
-//! lets every backend (fs, gRPC, S3, ...) implement the same three
-//! methods.
+//! boundary means the wire protocol survives schema evolution and lets
+//! every backend (fs, gRPC, S3, ...) implement the same three methods.
 //!
 //! Backends ship in [`fs`] (filesystem, `dir://` scheme) and [`grpc`]
 //! (peer daemon, `grpc://` scheme) — see PLAN.md §13.3. Two impls is the
@@ -25,26 +25,26 @@ pub mod grpc;
 pub mod server;
 
 /// Which content-addressed table the (id, bytes) pair belongs to.
-/// Mirrors the redb tables in [`crate::store::Store`]
-/// (`commits_v1`, `files_v1`, `symlinks_v1`, `trees_v1`,
-/// `views_v1`, `operations_v1`).
+/// Mirrors the object kinds in
+/// [`crate::git_store::GitContentStore`] (git blobs, trees, commits
+/// plus redb views/operations).
 ///
 /// Carrying the kind through the trait — not implicit in the bytes —
-/// lets backends route by table the same way redb does locally and
-/// avoids confusing-but-benign content-hash collisions across kinds
-/// (two different blob types happening to hash to the same id).
+/// lets backends route by table the same way the local store does
+/// and avoids confusing-but-benign content-hash collisions across
+/// kinds (two different blob types happening to hash to the same id).
 ///
 /// M10.6: `View` and `Operation` added for op-store data. These use
-/// 64-byte BLAKE2b-512 ids (vs 32-byte BLAKE3 for the others); the
+/// 64-byte BLAKE2b-512 ids (vs 20-byte SHA-1 for git objects); the
 /// trait's blob methods accept `&[u8]` to accommodate both.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BlobKind {
     Tree,
-    File,
-    Symlink,
+    Blob,
     Commit,
     View,
     Operation,
+    Extra,
 }
 
 impl BlobKind {
@@ -54,11 +54,11 @@ impl BlobKind {
     pub fn as_str(self) -> &'static str {
         match self {
             BlobKind::Tree => "tree",
-            BlobKind::File => "file",
-            BlobKind::Symlink => "symlink",
+            BlobKind::Blob => "blob",
             BlobKind::Commit => "commit",
             BlobKind::View => "view",
             BlobKind::Operation => "operation",
+            BlobKind::Extra => "extra",
         }
     }
 
@@ -67,11 +67,11 @@ impl BlobKind {
     pub fn as_proto(self) -> proto::jj_interface::BlobKind {
         match self {
             BlobKind::Tree => proto::jj_interface::BlobKind::Tree,
-            BlobKind::File => proto::jj_interface::BlobKind::File,
-            BlobKind::Symlink => proto::jj_interface::BlobKind::Symlink,
+            BlobKind::Blob => proto::jj_interface::BlobKind::Blob,
             BlobKind::Commit => proto::jj_interface::BlobKind::Commit,
             BlobKind::View => proto::jj_interface::BlobKind::View,
             BlobKind::Operation => proto::jj_interface::BlobKind::Operation,
+            BlobKind::Extra => proto::jj_interface::BlobKind::Extra,
         }
     }
 
@@ -84,11 +84,11 @@ impl BlobKind {
         match p {
             P::Unspecified => None,
             P::Tree => Some(BlobKind::Tree),
-            P::File => Some(BlobKind::File),
-            P::Symlink => Some(BlobKind::Symlink),
+            P::Blob => Some(BlobKind::Blob),
             P::Commit => Some(BlobKind::Commit),
             P::View => Some(BlobKind::View),
             P::Operation => Some(BlobKind::Operation),
+            P::Extra => Some(BlobKind::Extra),
         }
     }
 }
@@ -361,11 +361,11 @@ mod tests {
     fn blob_kind_proto_round_trip() {
         for k in [
             BlobKind::Tree,
-            BlobKind::File,
-            BlobKind::Symlink,
+            BlobKind::Blob,
             BlobKind::Commit,
             BlobKind::View,
             BlobKind::Operation,
+            BlobKind::Extra,
         ] {
             assert_eq!(BlobKind::from_proto(k.as_proto()), Some(k));
         }

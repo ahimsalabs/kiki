@@ -366,9 +366,12 @@ jj-lib's `backend::Commit`, `backend::Tree`, etc. directly.
 ### Proto wire format
 
 The proto messages (`jj_interface.proto`) use `bytes` for IDs and
-content — variable-length, no schema change needed. The actual bytes
-on the wire change (20-byte IDs instead of 32-byte, git-format content
-instead of prost), but the proto schema is identical.
+content — variable-length, no schema change needed for the `bytes`
+fields. The `BlobKind` enum did change: `FILE` (2) became `BLOB` (2,
+numeric-compatible), `SYMLINK` (3) was removed, and `EXTRA` (7) was
+added. The actual bytes on the wire change (20-byte IDs instead of
+32-byte, git-format content instead of prost), but the message
+structure is otherwise identical.
 
 The `service.rs` RPC handlers change from:
 1. Decode proto → `ty::*` → `store.write_*()` → return BLAKE3 ID

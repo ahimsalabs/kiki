@@ -218,8 +218,8 @@ mod tests {
         // round-trips through the wire correctly.
         for (kind, payload) in [
             (BlobKind::Tree, b"tree-bytes".as_ref()),
-            (BlobKind::File, b"file-bytes".as_ref()),
-            (BlobKind::Symlink, b"symlink-bytes".as_ref()),
+            (BlobKind::Blob, b"file-bytes".as_ref()),
+            (BlobKind::Extra, b"symlink-bytes".as_ref()),
             (BlobKind::Commit, b"commit-bytes".as_ref()),
         ] {
             client
@@ -278,11 +278,11 @@ mod tests {
 
         let id = [0x77_u8; 32];
         client_a
-            .put_blob(BlobKind::File, &id, Bytes::from_static(b"shared"))
+            .put_blob(BlobKind::Blob, &id, Bytes::from_static(b"shared"))
             .await
             .unwrap();
         let got = client_b
-            .get_blob(BlobKind::File, &id)
+            .get_blob(BlobKind::Blob, &id)
             .await
             .unwrap()
             .expect("client B sees blob written by client A");
@@ -350,7 +350,7 @@ mod tests {
         let mut raw = client.client.clone();
         let err = raw
             .put_blob(PutBlobReq {
-                kind: BlobKind::File.as_proto() as i32,
+                kind: BlobKind::Blob.as_proto() as i32,
                 id: vec![],
                 bytes: vec![],
             })

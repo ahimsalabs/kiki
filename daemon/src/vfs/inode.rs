@@ -21,9 +21,9 @@
 //! [`NodeRef`] grew three "dirty" variants (`DirtyTree`, `DirtyFile`,
 //! `DirtySymlink`) at M6 to support the VFS write path. The split mirrors
 //! jj's content-addressed model: clean nodes point at an `Id` in the
-//! per-mount [`Store`](crate::store::Store) and are immutable; dirty
-//! nodes hold the in-memory representation that VFS writes mutate. A
-//! dirty node is "promoted" back to a clean reference on
+//! per-mount [`GitContentStore`](crate::git_store::GitContentStore) and
+//! are immutable; dirty nodes hold the in-memory representation that VFS
+//! writes mutate. A dirty node is "promoted" back to a clean reference on
 //! [`crate::vfs::JjKikiFs::snapshot`], which writes the in-memory blob
 //! into the store and updates the slab to point at the resulting id.
 //!
@@ -410,7 +410,7 @@ mod tests {
     use super::*;
 
     fn id(byte: u8) -> Id {
-        Id([byte; 32])
+        Id([byte; 20])
     }
 
     #[test]
@@ -712,11 +712,11 @@ mod proptests {
     use proptest::prelude::*;
 
     fn id(byte: u8) -> Id {
-        Id([byte; 32])
+        Id([byte; 20])
     }
 
     fn arb_id() -> impl Strategy<Value = Id> {
-        any::<[u8; 32]>().prop_map(Id)
+        any::<[u8; 20]>().prop_map(Id)
     }
 
     /// Strategy for valid child names (non-empty, no '/' or NUL).
@@ -743,7 +743,7 @@ mod proptests {
             });
             for _ in 1..n {
                 let again = slab.intern_child(ROOT_INODE, &name, || NodeRef::File {
-                    id: Id([0xff; 32]), // different — must not be observed
+                    id: Id([0xff; 20]), // different — must not be observed
                     executable: true,
                 });
                 prop_assert_eq!(first, again);

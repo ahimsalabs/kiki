@@ -123,7 +123,7 @@ impl Default for TestEnvironment {
 
 impl TestEnvironment {
     pub fn jj_cmd(&self, current_dir: &Path, args: &[&str]) -> assert_cmd::Command {
-        let mut cmd = assert_cmd::Command::cargo_bin("cli").unwrap();
+        let mut cmd = assert_cmd::Command::cargo_bin("kiki").unwrap();
         cmd.current_dir(current_dir);
         cmd.args(args);
 

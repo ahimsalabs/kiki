@@ -1,5 +1,5 @@
 //! `JjKikiFs` — the read+write trait the per-mount filesystem exposes — and
-//! `KikiFs`, its concrete implementation backed by [`crate::store::Store`].
+//! `KikiFs`, its concrete implementation backed by [`crate::git_store::GitContentStore`].
 //!
 //! The trait exists so the NFS and FUSE adapters can share a single
 //! tree-walking codebase: `daemon/src/vfs/{nfs_adapter,fuse_adapter}.rs`
@@ -9,7 +9,7 @@
 //! ## Read path (M3) and check-out (M5)
 //!
 //! `lookup` / `getattr` / `read` / `readdir` / `readlink` walk the
-//! per-mount [`Store`] starting from the inode the kernel passed in.
+//! per-mount [`GitContentStore`] starting from the inode the kernel passed in.
 //! `check_out` re-roots the slab at a new tree id (M5).
 //!
 //! ## Write path (M6)
@@ -20,7 +20,7 @@
 //! lazily promotes the affected inode from clean to dirty by loading the
 //! current content from the store; subsequent writes mutate the in-memory
 //! buffer in place. `snapshot` walks the slab, persists every dirty blob
-//! into the per-mount [`Store`], and returns the rolled-up root tree id.
+//! into the per-mount [`GitContentStore`], and returns the rolled-up root tree id.
 //! It also "cleans" the slab by replacing the now-persisted dirty refs
 //! with their content-addressed ids, so kernel reads after snapshot
 //! continue to work and memory doesn't accumulate stale buffers.
@@ -34,11 +34,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use crate::remote::fetch::{self, FetchError};
-use crate::remote::RemoteStore;
-use crate::store::Store;
-use crate::ty::{File, Id, Symlink, Tree, TreeEntry, TreeEntryMapping};
-use crate::vfs::inode::{Inode, InodeId, InodeSlab, NodeRef, ROOT_INODE};
+use crate::{
+    git_store::{GitContentStore, GitEntryKind, GitTreeEntry},
+    remote::{
+        RemoteStore,
+        fetch::{self, FetchError},
+    },
+    ty::Id,
+    vfs::inode::{Inode, InodeId, InodeSlab, NodeRef, ROOT_INODE},
+};
 
 /// Reserved name for jj's metadata directory at the root of the working
 /// copy. Pinned by `KikiFs` outside the content-addressed user tree:
@@ -65,7 +69,7 @@ pub struct Attr {
     /// Byte size: file content length, or 0 for directories. Symlink size
     /// is the target string's byte length, per POSIX.
     pub size: u64,
-    /// Only meaningful for `Regular`. Mirrors `TreeEntry::File.executable`.
+    /// Only meaningful for `Regular`. Mirrors `GitEntryKind::File.executable`.
     pub executable: bool,
 }
 
@@ -103,14 +107,14 @@ pub enum FsError {
     /// `rmdir` on a directory that still has children.
     NotEmpty,
     /// A tree, file, or symlink id present in an inode is missing from
-    /// the store. With the redb-backed Store (M8) this only happens
-    /// after a check_out into a tree whose blobs aren't reachable —
-    /// either a remote pull failure (Layer C) or an out-of-band db
-    /// mutation. Adapters map it to EIO/NFS3ERR_IO.
+    /// the store. With the GitContentStore this only happens after a
+    /// check_out into a tree whose blobs aren't reachable — either a
+    /// remote pull failure or an out-of-band db mutation. Adapters map
+    /// it to EIO/NFS3ERR_IO.
     StoreMiss,
-    /// The store returned an I/O error (redb commit/read failure,
-    /// disk full, file backend EIO). Stringified at the boundary so
-    /// `FsError: PartialEq + Eq` still works for tests.
+    /// The store returned an I/O error (git ODB failure, disk full,
+    /// etc.). Stringified at the boundary so `FsError: PartialEq + Eq`
+    /// still works for tests.
     StoreError(String),
 }
 
@@ -133,7 +137,7 @@ impl std::error::Error for FsError {}
 
 /// Wrap an `anyhow::Error` from the store layer as an `FsError` suitable
 /// for adapter return paths. Uses the chained formatter so the root cause
-/// (e.g. "redb commit: …") survives the conversion.
+/// (e.g. "git ODB: ...") survives the conversion.
 fn store_err(e: anyhow::Error) -> FsError {
     FsError::StoreError(format!("{e:#}"))
 }
@@ -170,12 +174,8 @@ pub trait JjKikiFs: Send + Sync + std::fmt::Debug {
     /// Read up to `count` bytes starting at `offset`. Returns `(data, eof)`,
     /// where `eof` is true when the read consumed the rest of the file
     /// (matching `nfsserve::vfs::NFSFileSystem::read`'s contract).
-    async fn read(
-        &self,
-        ino: InodeId,
-        offset: u64,
-        count: u32,
-    ) -> Result<(Vec<u8>, bool), FsError>;
+    async fn read(&self, ino: InodeId, offset: u64, count: u32)
+    -> Result<(Vec<u8>, bool), FsError>;
 
     /// Full child listing of a directory. Adapters paginate as required
     /// by their wire protocol; `JjKikiFs` always returns everything in
@@ -270,8 +270,8 @@ pub trait JjKikiFs: Send + Sync + std::fmt::Debug {
         new_name: &str,
     ) -> Result<(), FsError>;
 
-    /// Walk the slab, persisting every dirty blob into the [`Store`], and
-    /// return the rolled-up root tree id. After a successful `snapshot`,
+    /// Walk the slab, persisting every dirty blob into the [`GitContentStore`],
+    /// and return the rolled-up root tree id. After a successful `snapshot`,
     /// every previously-dirty inode is replaced with its clean content-
     /// addressed counterpart so the slab doesn't accumulate stale buffers
     /// — but inode ids are preserved so the kernel doesn't see them
@@ -281,7 +281,7 @@ pub trait JjKikiFs: Send + Sync + std::fmt::Debug {
     async fn snapshot(&self) -> Result<Id, FsError>;
 }
 
-/// Concrete `JjKikiFs` backed by a [`Store`] and the inode slab.
+/// Concrete `JjKikiFs` backed by a [`GitContentStore`] and the inode slab.
 ///
 /// ## Pinned `.jj/` subtree (M7)
 ///
@@ -301,9 +301,9 @@ pub trait JjKikiFs: Send + Sync + std::fmt::Debug {
 /// `.jj/` matter (PLAN §10.1 option (a) → (b) migration).
 #[derive(Debug)]
 pub struct KikiFs {
-    store: Arc<Store>,
+    store: Arc<GitContentStore>,
     /// M10 §10.6: lazy remote read-through. When set, a local
-    /// [`Store`] miss in [`Self::read_tree`] / [`Self::read_file`] /
+    /// [`GitContentStore`] miss in [`Self::read_tree`] / [`Self::read_file`] /
     /// [`Self::read_symlink`] falls through to `RemoteStore::get_blob`
     /// and persists the result into `store` so subsequent accesses
     /// hit the cache. `None` preserves pre-M10 behavior (miss surfaces
@@ -319,8 +319,8 @@ pub struct KikiFs {
 impl KikiFs {
     /// Build a new mount-side filesystem rooted at `root_tree`.
     ///
-    /// The root tree must already be in `store` — `Store::get_tree` is
-    /// called lazily on the first `lookup`/`readdir`. Constructing with
+    /// The root tree must already be in `store` — `GitContentStore::read_tree`
+    /// is called lazily on the first `lookup`/`readdir`. Constructing with
     /// the store's empty tree id (the M1 default for a fresh mount) is
     /// the common case and yields an empty directory.
     ///
@@ -330,7 +330,11 @@ impl KikiFs {
     /// the typed value. `remote = None` preserves pre-M10 behavior —
     /// a miss surfaces as `FsError::StoreMiss` and the kernel sees
     /// `EIO`.
-    pub fn new(store: Arc<Store>, root_tree: Id, remote: Option<Arc<dyn RemoteStore>>) -> Self {
+    pub fn new(
+        store: Arc<GitContentStore>,
+        root_tree: Id,
+        remote: Option<Arc<dyn RemoteStore>>,
+    ) -> Self {
         KikiFs {
             store,
             remote,
@@ -355,8 +359,8 @@ impl KikiFs {
     /// verify the bytes round-trip to the requested id, persist into
     /// the local store, and return. On miss with no remote, surfaces
     /// `FsError::StoreMiss` (mapped to `EIO` by the adapters).
-    async fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
-        match self.store.get_tree(id) {
+    async fn read_tree(&self, id: Id) -> Result<Vec<GitTreeEntry>, FsError> {
+        match self.store.read_tree(&id.0) {
             Ok(Some(t)) => return Ok(t),
             Ok(None) => {}
             Err(e) => return Err(store_err(e)),
@@ -364,13 +368,13 @@ impl KikiFs {
         let Some(remote) = &self.remote else {
             return Err(FsError::StoreMiss);
         };
-        fetch::fetch_tree(&self.store, remote.as_ref(), id)
+        fetch::fetch_tree(&self.store, remote.as_ref(), &id.0)
             .await
             .map_err(fetch_err)
     }
 
-    async fn read_file(&self, id: Id) -> Result<File, FsError> {
-        match self.store.get_file(id) {
+    async fn read_file(&self, id: Id) -> Result<Vec<u8>, FsError> {
+        match self.store.read_file(&id.0) {
             Ok(Some(f)) => return Ok(f),
             Ok(None) => {}
             Err(e) => return Err(store_err(e)),
@@ -378,13 +382,13 @@ impl KikiFs {
         let Some(remote) = &self.remote else {
             return Err(FsError::StoreMiss);
         };
-        fetch::fetch_file(&self.store, remote.as_ref(), id)
+        fetch::fetch_file(&self.store, remote.as_ref(), &id.0)
             .await
             .map_err(fetch_err)
     }
 
-    async fn read_symlink(&self, id: Id) -> Result<Symlink, FsError> {
-        match self.store.get_symlink(id) {
+    async fn read_symlink(&self, id: Id) -> Result<String, FsError> {
+        match self.store.read_symlink(&id.0) {
             Ok(Some(s)) => return Ok(s),
             Ok(None) => {}
             Err(e) => return Err(store_err(e)),
@@ -392,37 +396,37 @@ impl KikiFs {
         let Some(remote) = &self.remote else {
             return Err(FsError::StoreMiss);
         };
-        fetch::fetch_symlink(&self.store, remote.as_ref(), id)
+        fetch::fetch_symlink(&self.store, remote.as_ref(), &id.0)
             .await
             .map_err(fetch_err)
     }
 
-    /// Map a `TreeEntry` (jj's on-tree type) to a `NodeRef` (our slab type).
-    /// Conflict entries are surfaced as opaque files for now — making them
-    /// addressable is a real fix that should land alongside conflict
-    /// rendering, well after M3.
-    fn entry_to_node(entry: &TreeEntry) -> NodeRef {
-        match entry {
-            TreeEntry::File {
-                id, executable, ..
-            } => NodeRef::File {
-                id: *id,
-                executable: *executable,
+    /// Map a `GitTreeEntry` to a `NodeRef` (our slab type).
+    /// Submodule entries are surfaced as non-executable files for now.
+    fn entry_to_node(entry: &GitTreeEntry) -> NodeRef {
+        match entry.kind {
+            GitEntryKind::File { executable } => NodeRef::File {
+                id: Id(entry.id.as_slice().try_into().expect("20-byte id")),
+                executable,
             },
-            TreeEntry::TreeId(id) => NodeRef::Tree(*id),
-            TreeEntry::SymlinkId(id) => NodeRef::Symlink(*id),
-            TreeEntry::ConflictId(id) => NodeRef::File {
-                id: *id,
+            GitEntryKind::Tree => {
+                NodeRef::Tree(Id(entry.id.as_slice().try_into().expect("20-byte id")))
+            }
+            GitEntryKind::Symlink => {
+                NodeRef::Symlink(Id(entry.id.as_slice().try_into().expect("20-byte id")))
+            }
+            GitEntryKind::Submodule => NodeRef::File {
+                id: Id(entry.id.as_slice().try_into().expect("20-byte id")),
                 executable: false,
             },
         }
     }
 
-    fn entry_kind(entry: &TreeEntry) -> FileKind {
-        match entry {
-            TreeEntry::TreeId(_) => FileKind::Directory,
-            TreeEntry::SymlinkId(_) => FileKind::Symlink,
-            TreeEntry::File { .. } | TreeEntry::ConflictId(_) => FileKind::Regular,
+    fn entry_kind(entry: &GitTreeEntry) -> FileKind {
+        match entry.kind {
+            GitEntryKind::Tree => FileKind::Directory,
+            GitEntryKind::Symlink => FileKind::Symlink,
+            GitEntryKind::File { .. } | GitEntryKind::Submodule => FileKind::Regular,
         }
     }
 
@@ -433,7 +437,7 @@ impl KikiFs {
     ///
     /// Async since M10 §10.6: the underlying [`Self::read_tree`] may
     /// fall through to a remote fetch on local-store miss.
-    async fn dir_tree(&self, inode: &Inode) -> Result<Tree, FsError> {
+    async fn dir_tree(&self, inode: &Inode) -> Result<Vec<GitTreeEntry>, FsError> {
         match inode.node {
             NodeRef::Tree(id) => self.read_tree(id).await,
             _ => Err(FsError::NotADirectory),
@@ -518,9 +522,8 @@ impl KikiFs {
             NodeRef::Tree(id) => {
                 let tree = self.read_tree(id).await?;
                 let entries: Vec<(String, NodeRef)> = tree
-                    .entries
-                    .into_iter()
-                    .map(|m| (m.name, Self::entry_to_node(&m.entry)))
+                    .iter()
+                    .map(|e| (e.name.clone(), Self::entry_to_node(e)))
                     .collect();
                 self.slab
                     .materialize_dir_for_mutation(dir, move || entries.into_iter())
@@ -539,11 +542,11 @@ impl KikiFs {
         match inode.node {
             NodeRef::DirtyFile { .. } => Ok(()),
             NodeRef::File { id, executable } => {
-                let file = self.read_file(id).await?;
+                let content = self.read_file(id).await?;
                 self.slab.replace_node(
                     ino,
                     NodeRef::DirtyFile {
-                        content: file.content,
+                        content,
                         executable,
                     },
                 );
@@ -571,10 +574,9 @@ impl KikiFs {
         // and we'd still need the same data.
         let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
         let child_id = match parent_inode.node {
-            NodeRef::DirtyTree { ref children } => children
-                .get(name)
-                .copied()
-                .ok_or(FsError::NotFound)?,
+            NodeRef::DirtyTree { ref children } => {
+                children.get(name).copied().ok_or(FsError::NotFound)?
+            }
             // Parent was just materialized; anything else is a bug.
             _ => return Err(FsError::NotADirectory),
         };
@@ -595,7 +597,7 @@ impl KikiFs {
             // tree (possibly via remote read-through) without
             // materializing.
             let tree = self.read_tree(id).await?;
-            if !tree.entries.is_empty() {
+            if !tree.is_empty() {
                 return Err(FsError::NotEmpty);
             }
         }
@@ -621,7 +623,7 @@ impl KikiFs {
             NodeRef::DirtyTree { children } => Ok(children.contains_key(name)),
             NodeRef::Tree(id) => {
                 let tree = self.read_tree(id).await?;
-                Ok(tree.entries.iter().any(|m| m.name == name))
+                Ok(tree.iter().any(|e| e.name == name))
             }
             _ => Err(FsError::NotADirectory),
         }
@@ -644,11 +646,11 @@ impl KikiFs {
                 executable: false,
             }),
             NodeRef::File { id, executable } => {
-                let file = self.read_file(id).await?;
+                let content = self.read_file(id).await?;
                 Ok(Attr {
                     inode: ino,
                     kind: FileKind::Regular,
-                    size: file.content.len() as u64,
+                    size: content.len() as u64,
                     executable,
                 })
             }
@@ -662,11 +664,11 @@ impl KikiFs {
                 executable,
             }),
             NodeRef::Symlink(id) => {
-                let symlink = self.read_symlink(id).await?;
+                let target = self.read_symlink(id).await?;
                 Ok(Attr {
                     inode: ino,
                     kind: FileKind::Symlink,
-                    size: symlink.target.len() as u64,
+                    size: target.len() as u64,
                     executable: false,
                 })
             }
@@ -700,22 +702,22 @@ impl KikiFs {
                 content,
                 executable,
             } => {
-                // `write_file` also returns the prost-encoded bytes for
-                // remote-store push (M9), but the snapshot walk runs
-                // bypassing the RPC layer — service.rs walks the rolled-up
-                // tree post-snapshot and pushes any blobs the remote
-                // doesn't have. So we discard the bytes here.
-                let (id, _bytes) =
-                    self.store.write_file(File { content }).map_err(store_err)?;
-                self.slab.replace_node(ino, NodeRef::File { id, executable });
+                let id_bytes = self.store.write_file(&content).map_err(store_err)?;
+                let id = Id(id_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| store_err(anyhow::anyhow!("bad id len")))?);
+                self.slab
+                    .replace_node(ino, NodeRef::File { id, executable });
                 Ok(id)
             }
 
             NodeRef::DirtySymlink { target } => {
-                let (id, _bytes) = self
-                    .store
-                    .write_symlink(Symlink { target })
-                    .map_err(store_err)?;
+                let id_bytes = self.store.write_symlink(&target).map_err(store_err)?;
+                let id = Id(id_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| store_err(anyhow::anyhow!("bad id len")))?);
                 self.slab.replace_node(ino, NodeRef::Symlink(id));
                 Ok(id)
             }
@@ -723,9 +725,8 @@ impl KikiFs {
             NodeRef::DirtyTree { children } => {
                 // Recurse first, gather the canonical entries, then write
                 // the tree. BTreeMap iteration is name-sorted, which is
-                // also the order we hash entries in (see Tree::ContentHash
-                // derivation in ty.rs) — so two equivalent dirty trees
-                // produce identical tree ids.
+                // also the order git stores tree entries — so two
+                // equivalent dirty trees produce identical tree ids.
                 let is_root = ino == self.root();
                 let mut entries = Vec::with_capacity(children.len());
                 for (name, child_id) in children {
@@ -737,33 +738,32 @@ impl KikiFs {
                         continue;
                     }
                     let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
-                    let entry = match child.node {
-                        NodeRef::Tree(id) => TreeEntry::TreeId(id),
+                    let (kind, child_content_id) = match child.node {
+                        NodeRef::Tree(id) => (GitEntryKind::Tree, id),
                         NodeRef::DirtyTree { .. } => {
-                            TreeEntry::TreeId(self.snapshot_node(child_id)?)
+                            (GitEntryKind::Tree, self.snapshot_node(child_id)?)
                         }
-                        NodeRef::File { id, executable } => TreeEntry::File {
-                            id,
-                            executable,
-                            copy_id: Vec::new(),
-                        },
+                        NodeRef::File { id, executable } => (GitEntryKind::File { executable }, id),
                         NodeRef::DirtyFile { executable, .. } => {
                             let id = self.snapshot_node(child_id)?;
-                            TreeEntry::File {
-                                id,
-                                executable,
-                                copy_id: Vec::new(),
-                            }
+                            (GitEntryKind::File { executable }, id)
                         }
-                        NodeRef::Symlink(id) => TreeEntry::SymlinkId(id),
+                        NodeRef::Symlink(id) => (GitEntryKind::Symlink, id),
                         NodeRef::DirtySymlink { .. } => {
-                            TreeEntry::SymlinkId(self.snapshot_node(child_id)?)
+                            (GitEntryKind::Symlink, self.snapshot_node(child_id)?)
                         }
                     };
-                    entries.push(TreeEntryMapping { name, entry });
+                    entries.push(GitTreeEntry {
+                        name,
+                        kind,
+                        id: child_content_id.0.to_vec(),
+                    });
                 }
-                let (id, _bytes) =
-                    self.store.write_tree(Tree { entries }).map_err(store_err)?;
+                let id_bytes = self.store.write_tree(&entries).map_err(store_err)?;
+                let id = Id(id_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| store_err(anyhow::anyhow!("bad id len")))?);
                 self.slab.replace_node(ino, NodeRef::Tree(id));
                 Ok(id)
             }
@@ -785,17 +785,14 @@ impl JjKikiFs for KikiFs {
         }
         let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
         match parent_inode.node {
-            NodeRef::DirtyTree { children } => {
-                children.get(name).copied().ok_or(FsError::NotFound)
-            }
+            NodeRef::DirtyTree { children } => children.get(name).copied().ok_or(FsError::NotFound),
             NodeRef::Tree(id) => {
                 let tree = self.read_tree(id).await?;
-                let mapping = tree
-                    .entries
+                let entry = tree
                     .iter()
-                    .find(|m| m.name == name)
+                    .find(|e| e.name == name)
                     .ok_or(FsError::NotFound)?;
-                let node = Self::entry_to_node(&mapping.entry);
+                let node = Self::entry_to_node(entry);
                 Ok(self.slab.intern_child(parent, name, || node))
             }
             _ => Err(FsError::NotADirectory),
@@ -822,7 +819,7 @@ impl JjKikiFs for KikiFs {
         // the slice borrow below; this also moves the (possibly
         // remote-fetching) `read_file` outside the match-by-ref.
         let owned_content: Option<Vec<u8>> = if let NodeRef::File { id, .. } = inode.node {
-            Some(self.read_file(id).await?.content)
+            Some(self.read_file(id).await?)
         } else {
             None
         };
@@ -884,17 +881,17 @@ impl JjKikiFs for KikiFs {
             }
             NodeRef::Tree(_) => {
                 let tree = self.dir_tree(&inode).await?;
-                let mut out = Vec::with_capacity(tree.entries.len() + pinned_jj.is_some() as usize);
-                for mapping in &tree.entries {
-                    if pinned_jj.is_some() && mapping.name == JJ_DIR {
+                let mut out = Vec::with_capacity(tree.len() + pinned_jj.is_some() as usize);
+                for entry in &tree {
+                    if pinned_jj.is_some() && entry.name == JJ_DIR {
                         continue;
                     }
-                    let kind = Self::entry_kind(&mapping.entry);
-                    let node = Self::entry_to_node(&mapping.entry);
-                    let id = self.slab.intern_child(dir, &mapping.name, || node);
+                    let kind = Self::entry_kind(entry);
+                    let node = Self::entry_to_node(entry);
+                    let id = self.slab.intern_child(dir, &entry.name, || node);
                     out.push(DirEntry {
                         inode: id,
-                        name: mapping.name.clone(),
+                        name: entry.name.clone(),
                         kind,
                     });
                 }
@@ -914,7 +911,7 @@ impl JjKikiFs for KikiFs {
     async fn readlink(&self, ino: InodeId) -> Result<String, FsError> {
         let inode = self.slab.get(ino).ok_or(FsError::NotFound)?;
         match inode.node {
-            NodeRef::Symlink(id) => self.read_symlink(id).await.map(|s| s.target),
+            NodeRef::Symlink(id) => self.read_symlink(id).await,
             NodeRef::DirtySymlink { target } => Ok(target),
             _ => Err(FsError::NotASymlink),
         }
@@ -1143,7 +1140,7 @@ impl JjKikiFs for KikiFs {
                 PinShape::NotADir => return Err(FsError::NotADirectory),
                 PinShape::CleanTree(id) => {
                     let tree = self.read_tree(id).await?;
-                    if !tree.entries.is_empty() {
+                    if !tree.is_empty() {
                         return Err(FsError::NotEmpty);
                     }
                 }
@@ -1200,10 +1197,9 @@ impl JjKikiFs for KikiFs {
         let src_inode_id = {
             let parent_inode = self.slab.get(parent).ok_or(FsError::NotFound)?;
             match parent_inode.node {
-                NodeRef::DirtyTree { ref children } => children
-                    .get(name)
-                    .copied()
-                    .ok_or(FsError::NotFound)?,
+                NodeRef::DirtyTree { ref children } => {
+                    children.get(name).copied().ok_or(FsError::NotFound)?
+                }
                 _ => return Err(FsError::NotADirectory),
             }
         };
@@ -1255,7 +1251,7 @@ impl JjKikiFs for KikiFs {
                     // Clean dst may need a remote fetch on M10
                     // §10.6's read-through path.
                     let empty = if let Some(id) = dst_clean_tree_id {
-                        self.read_tree(id).await?.entries.is_empty()
+                        self.read_tree(id).await?.is_empty()
                     } else {
                         dst_dirty_empty.expect("dirty branch sets dst_dirty_empty")
                     };
@@ -1316,10 +1312,39 @@ impl JjKikiFs for KikiFs {
 mod tests {
     use std::sync::Arc;
 
-    use crate::store::{Store, StoreTestExt as _};
-    use crate::ty::{File, Symlink, Tree, TreeEntry, TreeEntryMapping};
+    use jj_lib::object_id::ObjectId as _;
 
     use super::*;
+    use crate::{
+        git_store::{GitContentStore, GitEntryKind, GitTreeEntry},
+        ty::Id,
+    };
+
+    fn test_settings() -> jj_lib::settings::UserSettings {
+        let toml_str = r#"
+            user.name = "Test User"
+            user.email = "test@example.com"
+            operation.hostname = "test"
+            operation.username = "test"
+            debug.randomness-seed = 42
+        "#;
+        let mut config = jj_lib::config::StackedConfig::with_defaults();
+        config.add_layer(
+            jj_lib::config::ConfigLayer::parse(jj_lib::config::ConfigSource::User, toml_str)
+                .unwrap(),
+        );
+        jj_lib::settings::UserSettings::from_config(config).unwrap()
+    }
+
+    /// Helper: convert a Vec<u8> id from the store into our Id type.
+    fn vec_to_id(v: &[u8]) -> Id {
+        Id(v.try_into().expect("20-byte id"))
+    }
+
+    /// Helper: get the empty tree Id from a store.
+    fn empty_tree_id(store: &GitContentStore) -> Id {
+        Id(store.empty_tree_id().as_bytes().try_into().unwrap())
+    }
 
     /// Build a small synthetic repo on a fresh store:
     /// ```text
@@ -1330,56 +1355,45 @@ mod tests {
     /// └── link               symlink -> "hello.txt"
     /// ```
     /// Returns `(store, root_tree_id)`.
-    fn build_synthetic_tree() -> (Arc<Store>, Id) {
-        let store = Arc::new(Store::new_in_memory());
-        let hello_id = store.put_file(File {
-            content: b"hi\n".to_vec(),
-        });
-        let tool_id = store.put_file(File {
-            content: b"x".to_vec(),
-        });
-        let link_id = store.put_symlink(Symlink {
-            target: "hello.txt".into(),
-        });
-        let bin_tree = Tree {
-            entries: vec![TreeEntryMapping {
-                name: "tool".into(),
-                entry: TreeEntry::File {
-                    id: tool_id,
-                    executable: true,
-                    copy_id: Vec::new(),
-                },
-            }],
-        };
-        let bin_id = store.put_tree(bin_tree);
-        let root = Tree {
-            entries: vec![
-                TreeEntryMapping {
-                    name: "bin".into(),
-                    entry: TreeEntry::TreeId(bin_id),
-                },
-                TreeEntryMapping {
-                    name: "hello.txt".into(),
-                    entry: TreeEntry::File {
-                        id: hello_id,
-                        executable: false,
-                        copy_id: Vec::new(),
-                    },
-                },
-                TreeEntryMapping {
-                    name: "link".into(),
-                    entry: TreeEntry::SymlinkId(link_id),
-                },
-            ],
-        };
-        let root_id = store.put_tree(root);
+    fn build_synthetic_tree() -> (Arc<GitContentStore>, Id) {
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let hello_id = store.write_file(b"hi\n").unwrap();
+        let tool_id = store.write_file(b"x").unwrap();
+        let link_id = store.write_symlink("hello.txt").unwrap();
+        let bin_entries = vec![GitTreeEntry {
+            name: "tool".into(),
+            kind: GitEntryKind::File { executable: true },
+            id: tool_id,
+        }];
+        let bin_id = store.write_tree(&bin_entries).unwrap();
+        let root_entries = vec![
+            GitTreeEntry {
+                name: "bin".into(),
+                kind: GitEntryKind::Tree,
+                id: bin_id,
+            },
+            GitTreeEntry {
+                name: "hello.txt".into(),
+                kind: GitEntryKind::File { executable: false },
+                id: hello_id,
+            },
+            GitTreeEntry {
+                name: "link".into(),
+                kind: GitEntryKind::Symlink,
+                id: link_id,
+            },
+        ];
+        let root_id_bytes = store.write_tree(&root_entries).unwrap();
+        let root_id = vec_to_id(&root_id_bytes);
         (store, root_id)
     }
 
     #[tokio::test]
     async fn empty_repo_has_only_root() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let entries = fs.readdir(fs.root()).await.expect("readdir empty root");
         assert!(entries.is_empty(), "got {entries:?}");
         let attr = fs.getattr(fs.root()).await.expect("getattr root");
@@ -1501,34 +1515,27 @@ mod tests {
     /// must see the new tree's children and not the old's.
     #[tokio::test]
     async fn check_out_swaps_visible_tree() {
-        let store = Arc::new(Store::new_in_memory());
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
         // Build two distinct one-file root trees.
-        let a_id = store.put_file(File {
-            content: b"a-content".to_vec(),
-        });
-        let b_id = store.put_file(File {
-            content: b"b-content".to_vec(),
-        });
-        let tree_a = store.put_tree(Tree {
-            entries: vec![TreeEntryMapping {
+        let a_content_id = store.write_file(b"a-content").unwrap();
+        let b_content_id = store.write_file(b"b-content").unwrap();
+        let tree_a_bytes = store
+            .write_tree(&[GitTreeEntry {
                 name: "only-in-a.txt".into(),
-                entry: TreeEntry::File {
-                    id: a_id,
-                    executable: false,
-                    copy_id: Vec::new(),
-                },
-            }],
-        });
-        let tree_b = store.put_tree(Tree {
-            entries: vec![TreeEntryMapping {
+                kind: GitEntryKind::File { executable: false },
+                id: a_content_id,
+            }])
+            .unwrap();
+        let tree_a = vec_to_id(&tree_a_bytes);
+        let tree_b_bytes = store
+            .write_tree(&[GitTreeEntry {
                 name: "only-in-b.txt".into(),
-                entry: TreeEntry::File {
-                    id: b_id,
-                    executable: false,
-                    copy_id: Vec::new(),
-                },
-            }],
-        });
+                kind: GitEntryKind::File { executable: false },
+                id: b_content_id,
+            }])
+            .unwrap();
+        let tree_b = vec_to_id(&tree_b_bytes);
 
         let fs = KikiFs::new(store, tree_a, None);
         // Tree A is visible.
@@ -1554,13 +1561,47 @@ mod tests {
     async fn check_out_unknown_tree_is_store_miss() {
         let (store, root) = build_synthetic_tree();
         let fs = KikiFs::new(store, root, None);
-        let err = fs.check_out(Id([0xff; 32])).await.unwrap_err();
+        let err = fs.check_out(Id([0xff; 20])).await.unwrap_err();
         assert_eq!(err, FsError::StoreMiss);
         // Original tree is still visible.
         fs.lookup(fs.root(), "hello.txt").await.expect("still A");
     }
 
     // ----- M6 write-path tests -----------------------------------------
+
+    /// Helper: read a tree from the store and return it as Vec<GitTreeEntry>.
+    fn read_tree(store: &GitContentStore, id: Id) -> Vec<GitTreeEntry> {
+        store
+            .read_tree(&id.0)
+            .expect("read_tree")
+            .expect("tree present")
+    }
+
+    /// Helper: read a file from the store and return its content.
+    fn read_file_content(store: &GitContentStore, id: Id) -> Vec<u8> {
+        store
+            .read_file(&id.0)
+            .expect("read_file")
+            .expect("file present")
+    }
+
+    /// Helper: read a symlink from the store and return the target.
+    fn read_symlink_target(store: &GitContentStore, id: Id) -> String {
+        store
+            .read_symlink(&id.0)
+            .expect("read_symlink")
+            .expect("symlink present")
+    }
+
+    /// Helper: find a tree entry by name.
+    fn find_entry<'a>(entries: &'a [GitTreeEntry], name: &str) -> &'a GitTreeEntry {
+        entries.iter().find(|e| e.name == name).expect(name)
+    }
+
+    /// Helper: extract the Id from a tree entry.
+    fn entry_id(entry: &GitTreeEntry) -> Id {
+        vec_to_id(&entry.id)
+    }
 
     /// `create_file` + `write` + `read` round-trip on an empty repo.
     /// Snapshot afterward produces a tree that contains the new file at
@@ -1569,8 +1610,9 @@ mod tests {
     /// hit the right content.
     #[tokio::test]
     async fn create_write_read_round_trips() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (file_ino, attr) = fs
             .create_file(fs.root(), "hello.txt", false)
             .await
@@ -1589,14 +1631,10 @@ mod tests {
         // Snapshot persists the dirty buffer; the returned root tree id
         // resolves through the per-mount store.
         let new_root = fs.snapshot().await.expect("snapshot");
-        assert_ne!(new_root, store.get_empty_tree_id());
-        let tree = store.read_tree(new_root);
-        let entry = tree
-            .entries
-            .iter()
-            .find(|m| m.name == "hello.txt")
-            .expect("hello.txt entry");
-        assert!(matches!(entry.entry, TreeEntry::File { .. }));
+        assert_ne!(new_root, empty_tree_id(&store));
+        let tree = read_tree(&store, new_root);
+        let entry = find_entry(&tree, "hello.txt");
+        assert!(matches!(entry.kind, GitEntryKind::File { .. }));
 
         // After snapshot the inode survives + still reads correctly
         // (the slab cleaned up dirty content, but the file is now
@@ -1609,8 +1647,9 @@ mod tests {
     /// matching the standard test_nested_tree_round_trips fixture.
     #[tokio::test]
     async fn mkdir_then_create_inside_round_trips() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.expect("mkdir");
         let (file_ino, _) = fs
@@ -1621,37 +1660,26 @@ mod tests {
 
         let new_root = fs.snapshot().await.expect("snapshot");
 
-        // Walk the tree: root → "dir" → "file".
-        let root_tree = store.read_tree(new_root);
-        let dir_entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "dir")
-            .expect("dir entry");
-        let dir_id = match &dir_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected dir to be a Tree, got {other:?}"),
-        };
-        let dir_tree = store.read_tree(dir_id);
-        let file_entry = dir_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "file")
-            .expect("file entry");
-        let file_id = match &file_entry.entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected file to be a File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert_eq!(f.content, b"content");
+        // Walk the tree: root -> "dir" -> "file".
+        let root_tree = read_tree(&store, new_root);
+        let dir_entry = find_entry(&root_tree, "dir");
+        assert!(matches!(dir_entry.kind, GitEntryKind::Tree));
+        let dir_id = entry_id(dir_entry);
+        let dir_tree = read_tree(&store, dir_id);
+        let file_entry = find_entry(&dir_tree, "file");
+        assert!(matches!(file_entry.kind, GitEntryKind::File { .. }));
+        let file_id = entry_id(file_entry);
+        let content = read_file_content(&store, file_id);
+        assert_eq!(content, b"content");
     }
 
-    /// `symlink` + snapshot produces a SymlinkId entry whose target is
+    /// `symlink` + snapshot produces a Symlink entry whose target is
     /// readable through the store.
     #[tokio::test]
     async fn symlink_round_trips() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (link_ino, attr) = fs
             .symlink(fs.root(), "link", "target")
             .await
@@ -1660,29 +1688,24 @@ mod tests {
         assert_eq!(fs.readlink(link_ino).await.unwrap(), "target");
 
         let new_root = fs.snapshot().await.expect("snapshot");
-        let root_tree = store.read_tree(new_root);
-        let link_entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "link")
-            .expect("link entry");
-        let symlink_id = match &link_entry.entry {
-            TreeEntry::SymlinkId(id) => *id,
-            other => panic!("expected SymlinkId, got {other:?}"),
-        };
-        let sym = store.read_symlink(symlink_id);
-        assert_eq!(sym.target, "target");
+        let root_tree = read_tree(&store, new_root);
+        let link_entry = find_entry(&root_tree, "link");
+        assert!(matches!(link_entry.kind, GitEntryKind::Symlink));
+        let symlink_id = entry_id(link_entry);
+        let target = read_symlink_target(&store, symlink_id);
+        assert_eq!(target, "target");
 
         // After snapshot the symlink reads back through the clean path
-        // (NodeRef::Symlink → store).
+        // (NodeRef::Symlink -> store).
         assert_eq!(fs.readlink(link_ino).await.unwrap(), "target");
     }
 
     /// Duplicate `create_file` on the same name returns AlreadyExists.
     #[tokio::test]
     async fn create_collision_is_already_exists() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         fs.create_file(fs.root(), "a", false).await.unwrap();
         let err = fs
             .create_file(fs.root(), "a", false)
@@ -1695,8 +1718,9 @@ mod tests {
     /// past the new EOF return empty.
     #[tokio::test]
     async fn setattr_truncates_file() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1715,8 +1739,9 @@ mod tests {
     /// content, and the new bit survives a snapshot round-trip.
     #[tokio::test]
     async fn setattr_chmod_preserves_content() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1724,11 +1749,11 @@ mod tests {
         assert!(attr.executable);
 
         let new_root = fs.snapshot().await.expect("snapshot");
-        let tree = store.read_tree(new_root);
-        let entry = tree.entries.iter().find(|m| m.name == "f").unwrap();
+        let tree = read_tree(&store, new_root);
+        let entry = find_entry(&tree, "f");
         assert!(matches!(
-            entry.entry,
-            TreeEntry::File { executable: true, .. }
+            entry.kind,
+            GitEntryKind::File { executable: true }
         ));
     }
 
@@ -1737,8 +1762,9 @@ mod tests {
     /// monotonic (non-reused).
     #[tokio::test]
     async fn remove_file_then_lookup_is_not_found() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.remove(fs.root(), "f").await.expect("remove");
         let err = fs.lookup(fs.root(), "f").await.unwrap_err();
@@ -1749,8 +1775,9 @@ mod tests {
     /// stays attached after the failure.
     #[tokio::test]
     async fn remove_non_empty_directory_is_not_empty() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (dir, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         fs.create_file(dir, "f", false).await.unwrap();
 
@@ -1775,14 +1802,15 @@ mod tests {
     /// ordering keeps content hashing stable.
     #[tokio::test]
     async fn snapshot_is_deterministic_under_insertion_order() {
-        let store_a = Arc::new(Store::new_in_memory());
-        let fs_a = KikiFs::new(store_a.clone(), store_a.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store_a = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs_a = KikiFs::new(store_a.clone(), empty_tree_id(&store_a), None);
         fs_a.create_file(fs_a.root(), "a", false).await.unwrap();
         fs_a.create_file(fs_a.root(), "b", false).await.unwrap();
         let id_a = fs_a.snapshot().await.unwrap();
 
-        let store_b = Arc::new(Store::new_in_memory());
-        let fs_b = KikiFs::new(store_b.clone(), store_b.get_empty_tree_id(), None);
+        let store_b = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs_b = KikiFs::new(store_b.clone(), empty_tree_id(&store_b), None);
         // Inserted in the opposite order — final tree should hash the same.
         fs_b.create_file(fs_b.root(), "b", false).await.unwrap();
         fs_b.create_file(fs_b.root(), "a", false).await.unwrap();
@@ -1796,8 +1824,9 @@ mod tests {
     /// doesn't ESTALE on cached handles after the daemon-side snapshot.
     #[tokio::test]
     async fn snapshot_preserves_inode_ids() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"x").await.unwrap();
         fs.snapshot().await.unwrap();
@@ -1812,8 +1841,9 @@ mod tests {
     /// lookup/readdir but does NOT appear in the rolled-up snapshot tree.
     #[tokio::test]
     async fn jj_dir_excluded_from_snapshot() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         // Create `.jj/` and a file inside it (matches what jj-lib does
         // during `init_with_factories`).
@@ -1843,8 +1873,8 @@ mod tests {
 
         // Snapshot rolls up the user tree and excludes `.jj/`.
         let new_root = fs.snapshot().await.expect("snapshot");
-        let tree = store.read_tree(new_root);
-        let names: Vec<_> = tree.entries.iter().map(|e| e.name.as_str()).collect();
+        let tree = read_tree(&store, new_root);
+        let names: Vec<_> = tree.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["README"], "snapshot must not contain .jj");
 
         // Post-snapshot: `.jj/` is still visible and its file still reads.
@@ -1857,8 +1887,9 @@ mod tests {
     /// tree. The user tree changes; the daemon-managed metadata stays.
     #[tokio::test]
     async fn jj_dir_survives_check_out() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         // Set up a `.jj/` with some content.
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
@@ -1866,19 +1897,15 @@ mod tests {
         fs.write(jj_file, 0, b"present").await.unwrap();
 
         // Build a user tree separately and check it out.
-        let only_a = store.put_file(File {
-            content: b"a".to_vec(),
-        });
-        let tree_a = store.put_tree(Tree {
-            entries: vec![TreeEntryMapping {
+        let only_a_id = store.write_file(b"a").unwrap();
+        let tree_a_bytes = store
+            .write_tree(&[GitTreeEntry {
                 name: "only-a.txt".into(),
-                entry: TreeEntry::File {
-                    id: only_a,
-                    executable: false,
-                    copy_id: Vec::new(),
-                },
-            }],
-        });
+                kind: GitEntryKind::File { executable: false },
+                id: only_a_id,
+            }])
+            .unwrap();
+        let tree_a = vec_to_id(&tree_a_bytes);
         fs.check_out(tree_a).await.expect("check_out");
 
         // After check_out: user content reflects tree_a; `.jj/` still
@@ -1901,8 +1928,9 @@ mod tests {
     /// `create_file` / `symlink` against the pinned name.
     #[tokio::test]
     async fn jj_dir_pin_is_unique() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         fs.mkdir(fs.root(), ".jj").await.expect("mkdir .jj");
         let err = fs.mkdir(fs.root(), ".jj").await.expect_err("dup mkdir");
         assert_eq!(err, FsError::AlreadyExists);
@@ -1919,21 +1947,18 @@ mod tests {
     /// before M7.
     #[tokio::test]
     async fn pre_existing_jj_is_shadowed_by_pin() {
-        let store = Arc::new(Store::new_in_memory());
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
         // Build a synthetic legacy tree containing `.jj` as a file.
-        let legacy_id = store.put_file(File {
-            content: b"legacy".to_vec(),
-        });
-        let legacy_tree = store.put_tree(Tree {
-            entries: vec![TreeEntryMapping {
+        let legacy_content_id = store.write_file(b"legacy").unwrap();
+        let legacy_tree_bytes = store
+            .write_tree(&[GitTreeEntry {
                 name: ".jj".into(),
-                entry: TreeEntry::File {
-                    id: legacy_id,
-                    executable: false,
-                    copy_id: Vec::new(),
-                },
-            }],
-        });
+                kind: GitEntryKind::File { executable: false },
+                id: legacy_content_id,
+            }])
+            .unwrap();
+        let legacy_tree = vec_to_id(&legacy_tree_bytes);
         let fs = KikiFs::new(store.clone(), legacy_tree, None);
 
         // Without a pin, lookup of `.jj` falls through to the user tree
@@ -1951,8 +1976,9 @@ mod tests {
     /// and refuses with NotEmpty when it isn't.
     #[tokio::test]
     async fn jj_dir_remove_respects_rmdir_empty() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         fs.create_file(jj_ino, "f", false).await.unwrap();
         let err = fs.remove(fs.root(), ".jj").await.unwrap_err();
@@ -1970,15 +1996,16 @@ mod tests {
     /// across many `.jj/` writes.
     #[tokio::test]
     async fn jj_dir_dirty_buffers_cleaned_on_snapshot() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         let (file_ino, _) = fs.create_file(jj_ino, "config", false).await.unwrap();
         fs.write(file_ino, 0, b"settings").await.unwrap();
 
         // Snapshot returns the empty user tree (no `.jj/` rolled up).
         let new_root = fs.snapshot().await.unwrap();
-        assert_eq!(new_root, store.get_empty_tree_id());
+        assert_eq!(new_root, empty_tree_id(&store));
 
         // The pinned subtree's slab entry is now clean (NodeRef::Tree
         // resp. NodeRef::File). We assert this indirectly by checking
@@ -1987,8 +2014,8 @@ mod tests {
         let inode = fs.slab.get(file_ino).expect("inode survives");
         match inode.node {
             NodeRef::File { id, .. } => {
-                let f = store.read_file(id);
-                assert_eq!(f.content, b"settings");
+                let content = read_file_content(&store, id);
+                assert_eq!(content, b"settings");
             }
             other => panic!("expected clean File after snapshot, got {other:?}"),
         }
@@ -2004,25 +2031,23 @@ mod tests {
     /// short-circuit on the clean root and return the stale tree id.
     #[tokio::test]
     async fn write_after_snapshot_deep_in_tree_is_visible() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         // Build /dir/subdir/file with initial content.
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         let (subdir_ino, _) = fs.mkdir(dir_ino, "subdir").await.unwrap();
-        let (file_ino, _) = fs
-            .create_file(subdir_ino, "file", false)
-            .await
-            .unwrap();
+        let (file_ino, _) = fs.create_file(subdir_ino, "file", false).await.unwrap();
         fs.write(file_ino, 0, b"original").await.unwrap();
 
         // First snapshot — cleans the entire tree.
         let snap1 = fs.snapshot().await.unwrap();
-        assert_ne!(snap1, store.get_empty_tree_id());
+        assert_ne!(snap1, empty_tree_id(&store));
 
         // Modify the deep file after snapshot has cleaned everything.
         // This is the exact scenario Bug 2 broke: the root is clean
-        // Tree, and the write needs to dirty root → dir → subdir.
+        // Tree, and the write needs to dirty root -> dir -> subdir.
         fs.write(file_ino, 0, b"modified").await.unwrap();
 
         // Second snapshot must pick up the modification.
@@ -2030,38 +2055,17 @@ mod tests {
         assert_ne!(snap2, snap1, "snapshot must detect the deep write");
 
         // Walk the tree to verify the content is "modified".
-        let root_tree = store.read_tree(snap2);
-        let dir_entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "dir")
-            .expect("dir entry");
-        let dir_id = match &dir_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected TreeId, got {other:?}"),
-        };
-        let dir_tree = store.read_tree(dir_id);
-        let subdir_entry = dir_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "subdir")
-            .expect("subdir entry");
-        let subdir_id = match &subdir_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected TreeId, got {other:?}"),
-        };
-        let subdir_tree = store.read_tree(subdir_id);
-        let file_entry = subdir_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "file")
-            .expect("file entry");
-        let file_id = match &file_entry.entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert_eq!(f.content, b"modified");
+        let root_tree = read_tree(&store, snap2);
+        let dir_entry = find_entry(&root_tree, "dir");
+        let dir_id = entry_id(dir_entry);
+        let dir_tree = read_tree(&store, dir_id);
+        let subdir_entry = find_entry(&dir_tree, "subdir");
+        let subdir_id = entry_id(subdir_entry);
+        let subdir_tree = read_tree(&store, subdir_id);
+        let file_entry = find_entry(&subdir_tree, "file");
+        let file_id = entry_id(file_entry);
+        let content = read_file_content(&store, file_id);
+        assert_eq!(content, b"modified");
     }
 
     /// Regression test for Bug 2 (variant): `remove` after snapshot.
@@ -2071,8 +2075,9 @@ mod tests {
     /// propagation, the removal is invisible to the next snapshot.
     #[tokio::test]
     async fn remove_after_snapshot_deep_in_tree_is_visible() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         let (file_ino, _) = fs.create_file(dir_ino, "inner", false).await.unwrap();
@@ -2087,19 +2092,12 @@ mod tests {
         assert_ne!(snap2, snap1, "snapshot must detect the removal");
 
         // The dir tree should now be empty.
-        let root_tree = store.read_tree(snap2);
-        let dir_entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "dir")
-            .expect("dir entry");
-        let dir_id = match &dir_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected TreeId, got {other:?}"),
-        };
-        let dir_tree = store.read_tree(dir_id);
+        let root_tree = read_tree(&store, snap2);
+        let dir_entry = find_entry(&root_tree, "dir");
+        let dir_id = entry_id(dir_entry);
+        let dir_tree = read_tree(&store, dir_id);
         assert!(
-            dir_tree.entries.is_empty(),
+            dir_tree.is_empty(),
             "dir should be empty after removing its only child"
         );
     }
@@ -2108,8 +2106,9 @@ mod tests {
     /// snapshot must also propagate dirty state to ancestors.
     #[tokio::test]
     async fn setattr_after_snapshot_is_visible() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         let (file_ino, _) = fs.create_file(dir_ino, "f", false).await.unwrap();
@@ -2124,28 +2123,14 @@ mod tests {
         assert_ne!(snap2, snap1, "snapshot must detect the truncation");
 
         // Verify the file is now empty.
-        let root_tree = store.read_tree(snap2);
-        let dir_entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "dir")
-            .expect("dir entry");
-        let dir_id = match &dir_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected TreeId, got {other:?}"),
-        };
-        let dir_tree = store.read_tree(dir_id);
-        let file_entry = dir_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "f")
-            .expect("file entry");
-        let file_id = match &file_entry.entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert!(f.content.is_empty());
+        let root_tree = read_tree(&store, snap2);
+        let dir_entry = find_entry(&root_tree, "dir");
+        let dir_id = entry_id(dir_entry);
+        let dir_tree = read_tree(&store, dir_id);
+        let file_entry = find_entry(&dir_tree, "f");
+        let file_id = entry_id(file_entry);
+        let content = read_file_content(&store, file_id);
+        assert!(content.is_empty());
     }
 
     /// Regression test for Bug 3: writing to a child of an existing
@@ -2165,8 +2150,8 @@ mod tests {
         let hello_ino = fs.lookup(fs.root(), "hello.txt").await.unwrap();
 
         // Write new content. Internally this does:
-        //   ensure_dirty_file(hello_ino) → DirtyFile
-        //   ensure_dirty_tree(root)      → materialize root
+        //   ensure_dirty_file(hello_ino) -> DirtyFile
+        //   ensure_dirty_tree(root)      -> materialize root
         // Before the fix, materializing root would overwrite hello_ino
         // back to its clean File variant.
         fs.write(hello_ino, 0, b"new content").await.unwrap();
@@ -2178,31 +2163,25 @@ mod tests {
         // Snapshot must capture the modified content.
         let snap = fs.snapshot().await.unwrap();
         assert_ne!(snap, root_id);
-        let root_tree = store.read_tree(snap);
-        let entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "hello.txt")
-            .expect("hello.txt entry");
-        let file_id = match &entry.entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert_eq!(f.content, b"new content");
+        let root_tree = read_tree(&store, snap);
+        let entry = find_entry(&root_tree, "hello.txt");
+        let file_id = entry_id(entry);
+        let content = read_file_content(&store, file_id);
+        assert_eq!(content, b"new content");
     }
 
     // ----- Editor atomic-save pattern test ---------------------------------
 
-    /// Editors typically save via write(tmp) → rename(tmp, real). This
+    /// Editors typically save via write(tmp) -> rename(tmp, real). This
     /// exercises that pattern: create "foo.rs" with original content,
     /// snapshot, then simulate an editor save by writing to "foo.rs.tmp"
     /// and renaming over "foo.rs". The final snapshot must contain only
     /// "foo.rs" with the new content.
     #[tokio::test]
     async fn rename_atomic_save_pattern() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         // Original file.
         let (orig_ino, _) = fs.create_file(fs.root(), "foo.rs", false).await.unwrap();
@@ -2218,7 +2197,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Atomic rename: foo.rs.tmp → foo.rs (overwrites original).
+        // Atomic rename: foo.rs.tmp -> foo.rs (overwrites original).
         fs.rename(fs.root(), "foo.rs.tmp", fs.root(), "foo.rs")
             .await
             .unwrap();
@@ -2235,16 +2214,13 @@ mod tests {
         // Snapshot captures the rename.
         let snap2 = fs.snapshot().await.unwrap();
         assert_ne!(snap2, snap1);
-        let tree = store.read_tree(snap2);
+        let tree = read_tree(&store, snap2);
         // Only "foo.rs" should be present (no "foo.rs.tmp").
-        let names: Vec<&str> = tree.entries.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["foo.rs"]);
-        let file_id = match &tree.entries[0].entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert_eq!(f.content, b"fn main() { println!(\"hello\"); }");
+        let file_id = entry_id(&tree[0]);
+        let content = read_file_content(&store, file_id);
+        assert_eq!(content, b"fn main() { println!(\"hello\"); }");
     }
 
     /// Bug: rename doesn't update the child inode's `parent` pointer.
@@ -2255,8 +2231,9 @@ mod tests {
     /// snapshot misses the modification.
     #[tokio::test]
     async fn write_to_cross_dir_renamed_file_after_snapshot() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         // Create /a/file and /b/.
         let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
@@ -2267,7 +2244,7 @@ mod tests {
         // Snapshot — cleans everything.
         let snap1 = fs.snapshot().await.unwrap();
 
-        // Rename /a/file → /b/file.
+        // Rename /a/file -> /b/file.
         fs.rename(a_ino, "file", b_ino, "file").await.unwrap();
 
         // Snapshot — captures the rename.
@@ -2284,28 +2261,14 @@ mod tests {
         assert_ne!(snap3, snap2, "snapshot must detect write to renamed file");
 
         // Verify /b/file has "v2".
-        let root_tree = store.read_tree(snap3);
-        let b_entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "b")
-            .expect("b entry");
-        let b_id = match &b_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected TreeId, got {other:?}"),
-        };
-        let b_tree = store.read_tree(b_id);
-        let file_entry = b_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "file")
-            .expect("file entry in /b/");
-        let file_id = match &file_entry.entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert_eq!(f.content, b"v2");
+        let root_tree = read_tree(&store, snap3);
+        let b_entry = find_entry(&root_tree, "b");
+        let b_id = entry_id(b_entry);
+        let b_tree = read_tree(&store, b_id);
+        let file_entry = find_entry(&b_tree, "file");
+        let file_id = entry_id(file_entry);
+        let content = read_file_content(&store, file_id);
+        assert_eq!(content, b"v2");
     }
 
     /// After a cross-directory rename, creating a new file at the old
@@ -2314,15 +2277,16 @@ mod tests {
     /// after rename (detach_child removes the old entry).
     #[tokio::test]
     async fn create_at_old_name_after_rename() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
         let (b_ino, _) = fs.mkdir(fs.root(), "b").await.unwrap();
         let (old_file, _) = fs.create_file(a_ino, "f", false).await.unwrap();
         fs.write(old_file, 0, b"old").await.unwrap();
 
-        // Rename /a/f → /b/f.
+        // Rename /a/f -> /b/f.
         fs.rename(a_ino, "f", b_ino, "f").await.unwrap();
 
         // Create a new file at the old name /a/f.
@@ -2341,8 +2305,8 @@ mod tests {
 
         // Snapshot should capture both.
         let snap = fs.snapshot().await.unwrap();
-        let root_tree = store.read_tree(snap);
-        assert_eq!(root_tree.entries.len(), 2, "root should have a/ and b/");
+        let root_tree = read_tree(&store, snap);
+        assert_eq!(root_tree.len(), 2, "root should have a/ and b/");
     }
 
     /// Same-directory rename (the common editor case) followed by write.
@@ -2350,8 +2314,9 @@ mod tests {
     /// should be updated so that readdir/debug output stays consistent.
     #[tokio::test]
     async fn same_dir_rename_then_write() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         let (file_ino, _) = fs.create_file(fs.root(), "old_name", false).await.unwrap();
         fs.write(file_ino, 0, b"content").await.unwrap();
@@ -2368,23 +2333,21 @@ mod tests {
         let snap2 = fs.snapshot().await.unwrap();
         assert_ne!(snap2, snap1);
 
-        let tree = store.read_tree(snap2);
-        let names: Vec<&str> = tree.entries.iter().map(|m| m.name.as_str()).collect();
+        let tree = read_tree(&store, snap2);
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["new_name"]);
-        let file_id = match &tree.entries[0].entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert_eq!(f.content, b"updated");
+        let file_id = entry_id(&tree[0]);
+        let content = read_file_content(&store, file_id);
+        assert_eq!(content, b"updated");
     }
 
     /// Variant: editor atomic-save inside a subdirectory. Exercises the
     /// ancestor-dirty propagation together with rename.
     #[tokio::test]
     async fn rename_atomic_save_in_subdirectory() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         let (src_ino, _) = fs.mkdir(fs.root(), "src").await.unwrap();
         let (orig_ino, _) = fs.create_file(src_ino, "lib.rs", false).await.unwrap();
@@ -2403,37 +2366,28 @@ mod tests {
         let snap2 = fs.snapshot().await.unwrap();
         assert_ne!(snap2, snap1, "rename in subdir must dirty ancestors");
 
-        // Walk tree: root → src → lib.rs
-        let root_tree = store.read_tree(snap2);
-        let src_entry = root_tree
-            .entries
-            .iter()
-            .find(|m| m.name == "src")
-            .expect("src entry");
-        let src_id = match &src_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected TreeId, got {other:?}"),
-        };
-        let src_tree = store.read_tree(src_id);
-        let names: Vec<&str> = src_tree.entries.iter().map(|m| m.name.as_str()).collect();
+        // Walk tree: root -> src -> lib.rs
+        let root_tree = read_tree(&store, snap2);
+        let src_entry = find_entry(&root_tree, "src");
+        let src_id = entry_id(src_entry);
+        let src_tree = read_tree(&store, src_id);
+        let names: Vec<&str> = src_tree.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["lib.rs"], "swap file should not persist");
-        let file_id = match &src_tree.entries[0].entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        let f = store.read_file(file_id);
-        assert_eq!(f.content, b"// v2");
+        let file_id = entry_id(&src_tree[0]);
+        let content = read_file_content(&store, file_id);
+        assert_eq!(content, b"// v2");
     }
 
     // ----- Multi-cycle and check_out tests ---------------------------------
 
     /// Three snapshot cycles with modifications between each.
-    /// Verifies the snapshot→clean→modify→snapshot cycle is reliable
+    /// Verifies the snapshot->clean->modify->snapshot cycle is reliable
     /// when repeated.
     #[tokio::test]
     async fn three_snapshot_cycles() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         let (file_ino, _) = fs.create_file(fs.root(), "counter", false).await.unwrap();
         fs.write(file_ino, 0, b"1").await.unwrap();
@@ -2449,13 +2403,11 @@ mod tests {
         assert_ne!(snap3, snap1);
 
         // All three snapshots should have distinct content.
-        let tree3 = store.read_tree(snap3);
-        let entry = tree3.entries.iter().find(|m| m.name == "counter").unwrap();
-        let fid = match &entry.entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        assert_eq!(store.read_file(fid).content, b"3");
+        let tree3 = read_tree(&store, snap3);
+        let entry = find_entry(&tree3, "counter");
+        let fid = entry_id(entry);
+        let content = read_file_content(&store, fid);
+        assert_eq!(content, b"3");
     }
 
     /// Modify a file, check_out to a different tree, then modify
@@ -2463,8 +2415,9 @@ mod tests {
     /// not the old one.
     #[tokio::test]
     async fn modify_after_check_out_to_different_tree() {
-        let store = Arc::new(Store::new_in_memory());
-        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
 
         // Build tree A: /file with "aaa".
         let (file_ino, _) = fs.create_file(fs.root(), "file", false).await.unwrap();
@@ -2472,32 +2425,23 @@ mod tests {
         let _tree_a = fs.snapshot().await.unwrap();
 
         // Build tree B externally: /file with "bbb", /extra with "xxx".
-        let file_b_id = store.put_file(crate::ty::File {
-            content: b"bbb".to_vec(),
-        });
-        let extra_id = store.put_file(crate::ty::File {
-            content: b"xxx".to_vec(),
-        });
-        let tree_b_id = store.put_tree(crate::ty::Tree {
-            entries: vec![
-                TreeEntryMapping {
+        let file_b_id = store.write_file(b"bbb").unwrap();
+        let extra_id = store.write_file(b"xxx").unwrap();
+        let tree_b_bytes = store
+            .write_tree(&[
+                GitTreeEntry {
                     name: "extra".into(),
-                    entry: TreeEntry::File {
-                        id: extra_id,
-                        executable: false,
-                        copy_id: Vec::new(),
-                    },
+                    kind: GitEntryKind::File { executable: false },
+                    id: extra_id,
                 },
-                TreeEntryMapping {
+                GitTreeEntry {
                     name: "file".into(),
-                    entry: TreeEntry::File {
-                        id: file_b_id,
-                        executable: false,
-                        copy_id: Vec::new(),
-                    },
+                    kind: GitEntryKind::File { executable: false },
+                    id: file_b_id,
                 },
-            ],
-        });
+            ])
+            .unwrap();
+        let tree_b_id = vec_to_id(&tree_b_bytes);
 
         // Check out to tree B.
         fs.check_out(tree_b_id).await.unwrap();
@@ -2518,14 +2462,12 @@ mod tests {
         assert_ne!(snap, tree_b_id);
 
         // Snapshot should have /file="ccc" and /extra="xxx".
-        let tree = store.read_tree(snap);
-        assert_eq!(tree.entries.len(), 2);
-        let file_entry = tree.entries.iter().find(|m| m.name == "file").unwrap();
-        let fid = match &file_entry.entry {
-            TreeEntry::File { id, .. } => *id,
-            other => panic!("expected File, got {other:?}"),
-        };
-        assert_eq!(store.read_file(fid).content, b"ccc");
+        let tree = read_tree(&store, snap);
+        assert_eq!(tree.len(), 2);
+        let file_entry = find_entry(&tree, "file");
+        let fid = entry_id(file_entry);
+        let content = read_file_content(&store, fid);
+        assert_eq!(content, b"ccc");
     }
 
     /// Create a file inside a subdirectory of a pre-existing tree.
@@ -2539,10 +2481,7 @@ mod tests {
         let bin_ino = fs.lookup(fs.root(), "bin").await.unwrap();
 
         // Create a new file inside bin/ alongside the existing "tool".
-        let (new_file, _) = fs
-            .create_file(bin_ino, "helper", false)
-            .await
-            .unwrap();
+        let (new_file, _) = fs.create_file(bin_ino, "helper", false).await.unwrap();
         fs.write(new_file, 0, b"helper script").await.unwrap();
 
         // Existing "tool" should still be readable.
@@ -2553,14 +2492,11 @@ mod tests {
         // Snapshot should capture the new file alongside the old one.
         let snap = fs.snapshot().await.unwrap();
         assert_ne!(snap, root_id);
-        let root_tree = store.read_tree(snap);
-        let bin_entry = root_tree.entries.iter().find(|m| m.name == "bin").unwrap();
-        let bin_id = match &bin_entry.entry {
-            TreeEntry::TreeId(id) => *id,
-            other => panic!("expected TreeId, got {other:?}"),
-        };
-        let bin_tree = store.read_tree(bin_id);
-        let names: Vec<&str> = bin_tree.entries.iter().map(|m| m.name.as_str()).collect();
+        let root_tree = read_tree(&store, snap);
+        let bin_entry = find_entry(&root_tree, "bin");
+        let bin_id = entry_id(bin_entry);
+        let bin_tree = read_tree(&store, bin_id);
+        let names: Vec<&str> = bin_tree.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["helper", "tool"]);
     }
 
@@ -2582,8 +2518,8 @@ mod tests {
         let snap2 = fs.snapshot().await.unwrap();
         assert_ne!(snap2, root_id, "snapshot must detect deletion");
 
-        let tree = store.read_tree(snap2);
-        let names: Vec<&str> = tree.entries.iter().map(|m| m.name.as_str()).collect();
+        let tree = read_tree(&store, snap2);
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["bin", "link"], "hello.txt should be gone");
     }
 }
