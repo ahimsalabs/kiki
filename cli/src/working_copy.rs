@@ -101,11 +101,10 @@ impl KikiWorkingCopy {
     }
 
     fn connect_client(
-        _settings: &UserSettings,
+        settings: &UserSettings,
     ) -> Result<BlockingJujutsuInterfaceClient, WorkingCopyStateError> {
-        let socket = store::paths::socket_path();
-        BlockingJujutsuInterfaceClient::connect_uds(socket)
-            .map_err(|e| wc_state_err("failed to connect to kiki daemon via UDS", e))
+        crate::daemon_client::connect_or_start(settings)
+            .map_err(|e| wc_state_err("failed to connect to kiki daemon", e))
     }
 
     fn init(

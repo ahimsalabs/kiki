@@ -248,24 +248,40 @@ async fn kiki_git_import_hook(
     old_dispatch: BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
     if is_kiki_backend(command_helper) {
-        if let Err(e) = maybe_import_git_changes(ui, command_helper).await {
-            // Non-fatal: log and continue. The user can reconcile manually.
-            writeln!(ui.warning_default(), "git import failed: {e:?}")?;
+        match detect_git_changes(command_helper) {
+            Ok(None) => {} // No changes detected — nothing to do.
+            Ok(Some(changes)) => {
+                // Transaction phase: failures here are fatal (could leave
+                // partial state).
+                apply_git_imports(ui, command_helper, changes).await?;
+            }
+            Err(e) => {
+                // Detection phase failure (daemon unreachable, RPC error,
+                // mount doesn't have git colocated). Non-fatal: warn and
+                // let the command proceed.
+                writeln!(ui.warning_default(), "git import failed: {e:?}")?;
+            }
         }
     }
     old_dispatch.call(ui, command_helper).await
 }
 
-/// Check if git HEAD or refs/heads/* were moved externally and, if so,
-/// import the changes into jj's graph so the next snapshot sees the
-/// correct state.
-async fn maybe_import_git_changes(
-    ui: &mut Ui,
+/// Detected git changes ready to be applied as a jj transaction.
+struct GitChanges {
+    new_head_commit_id: Vec<u8>,
+    bookmark_changes: Vec<proto::jj_interface::GitBookmarkChange>,
+}
+
+/// Detection phase: query the daemon for external git changes.
+///
+/// Returns `Ok(None)` if no changes detected or not in a workspace.
+/// Returns `Err` for daemon/RPC failures (safe to swallow as a warning).
+fn detect_git_changes(
     command_helper: &CommandHelper,
-) -> Result<(), CommandError> {
+) -> Result<Option<GitChanges>, CommandError> {
     let wc_path = match workspace_path(command_helper) {
         Ok(p) => p,
-        Err(_) => return Ok(()), // Not in a workspace — nothing to import.
+        Err(_) => return Ok(None), // Not in a workspace — nothing to import.
     };
     let settings = command_helper.settings();
     let client = daemon_client::connect_or_start(settings)
@@ -282,10 +298,28 @@ async fn maybe_import_git_changes(
     let has_bookmark_changes = !reply.bookmark_changes.is_empty();
 
     if !has_head_change && !has_bookmark_changes {
-        return Ok(()); // Nothing changed — nothing to do.
+        return Ok(None);
     }
 
+    Ok(Some(GitChanges {
+        new_head_commit_id: reply.new_head_commit_id,
+        bookmark_changes: reply.bookmark_changes,
+    }))
+}
+
+/// Application phase: apply detected git changes as a jj transaction.
+///
+/// Failures here are fatal — a partially-committed transaction could
+/// leave the repo in an inconsistent state.
+async fn apply_git_imports(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    changes: GitChanges,
+) -> Result<(), CommandError> {
     use jj_lib::object_id::ObjectId as _;
+
+    let has_head_change = !changes.new_head_commit_id.is_empty();
+    let has_bookmark_changes = !changes.bookmark_changes.is_empty();
 
     // Load workspace without triggering snapshot (we need to import first).
     let mut ws_helper = command_helper.workspace_helper_no_snapshot(ui)?;
@@ -298,7 +332,7 @@ async fn maybe_import_git_changes(
         // Import external HEAD change (e.g. `git commit` from the mount).
         if has_head_change {
             let new_head_id =
-                jj_lib::backend::CommitId::from_bytes(&reply.new_head_commit_id);
+                jj_lib::backend::CommitId::from_bytes(&changes.new_head_commit_id);
             writeln!(
                 ui.status(),
                 "Importing external git commit: {}",
@@ -330,7 +364,7 @@ async fn maybe_import_git_changes(
             use jj_lib::op_store::RefTarget;
             use jj_lib::ref_name::RefName;
 
-            for change in &reply.bookmark_changes {
+            for change in &changes.bookmark_changes {
                 let bookmark_name = RefName::new(&change.name);
                 if change.commit_id.is_empty() {
                     // Bookmark was deleted externally.
