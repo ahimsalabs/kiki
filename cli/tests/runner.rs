@@ -5,3 +5,4 @@ mod test_e2e_regression;
 mod test_git_ops;
 mod test_init;
 mod test_op_store_sharing;
+mod test_shared_workspace;

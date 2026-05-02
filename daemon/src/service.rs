@@ -450,7 +450,7 @@ impl JujutsuService {
     /// creating real directories or spinning up a real VFS manager.
     /// Always uses in-memory storage so tests don't litter the disk.
     #[cfg(test)]
-    fn bare() -> Self {
+    pub(crate) fn bare() -> Self {
         JujutsuService {
             mounts: Arc::new(Mutex::new(HashMap::new())),
             vfs_handle: None,
@@ -463,7 +463,7 @@ impl JujutsuService {
     /// through a real FUSE/NFS adapter — e.g. to seed a dirty file, then
     /// confirm the `Snapshot` RPC turns it into a real tree id.
     #[cfg(test)]
-    async fn fs_for_test(&self, path: &str) -> Option<Arc<dyn JjKikiFs>> {
+    pub(crate) async fn fs_for_test(&self, path: &str) -> Option<Arc<dyn JjKikiFs>> {
         let mounts = self.mounts.lock().await;
         mounts.get(path).map(|m| m.fs.clone())
     }
@@ -792,9 +792,20 @@ async fn push_reachable_blobs(
         // Push the tree blob itself.
         push_git_object_if_missing(store, remote, BlobKind::Tree, &tree_id).await?;
 
-        let entries = store
-            .read_tree(&tree_id)?
-            .ok_or_else(|| anyhow!("tree {} missing locally during push walk", hex_bytes(&tree_id)))?;
+        let entries = match store.read_tree(&tree_id)? {
+            Some(e) => e,
+            None => {
+                // The tree blob isn't in the local git ODB yet — this
+                // happens when the tree was checked out from a remote
+                // (check_out only fetches the root tree lazily; subtrees
+                // stay as NodeRef::Tree references in the slab until the
+                // kernel walks into them). Fetch + persist now so the
+                // push walk can continue.
+                fetch::fetch_tree(store, remote, &tree_id).await.map_err(|e| {
+                    anyhow!("tree {} missing locally and remote fetch failed: {e}", hex_bytes(&tree_id))
+                })?
+            }
+        };
         for entry in entries {
             match entry.kind {
                 GitEntryKind::Tree => tree_stack.push(entry.id),

@@ -24,6 +24,9 @@ pub mod fs;
 pub mod grpc;
 pub mod server;
 
+#[cfg(test)]
+mod sync_sim_tests;
+
 /// Which content-addressed table the (id, bytes) pair belongs to.
 /// Mirrors the object kinds in
 /// [`crate::git_store::GitContentStore`] (git blobs, trees, commits
