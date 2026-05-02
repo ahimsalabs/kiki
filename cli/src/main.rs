@@ -508,8 +508,9 @@ async fn run_git_command(
                 }
             }
 
-            // Update jj's View: set remote-tracking bookmarks so that
-            // `jj log` shows e.g. `main@origin` at the fetched commits.
+            // Update jj's View: index fetched commits, set remote-tracking
+            // bookmarks so `jj log` shows e.g. `main@origin`, and
+            // fast-forward local bookmarks where possible.
             use jj_lib::backend::CommitId;
             use jj_lib::op_store::{RemoteRef, RemoteRefState, RefTarget};
             use jj_lib::ref_name::{RefName, RemoteName};
@@ -517,6 +518,27 @@ async fn run_git_command(
             let mut workspace_command = command_helper.workspace_helper(ui)?;
             let mut tx = workspace_command.start_transaction();
 
+            // Index the fetched commits so jj's index knows about them.
+            // The commits live in the daemon's git ODB (accessible via
+            // KikiBackend); add_head walks ancestors and indexes them.
+            let store = tx.repo().store().clone();
+            for b in &fetched {
+                let commit_id = CommitId::new(b.commit_id.clone());
+                let commit = store.get_commit(&commit_id).map_err(|e| {
+                    internal_error_with_message(
+                        format!("fetched commit for '{}' not readable", b.name),
+                        e,
+                    )
+                })?;
+                tx.repo_mut().add_head(&commit).await.map_err(|e| {
+                    internal_error_with_message(
+                        format!("failed to index fetched commit for '{}'", b.name),
+                        e,
+                    )
+                })?;
+            }
+
+            // Set remote-tracking bookmarks.
             let remote_name = RemoteName::new(fetch_args.remote.as_str());
             for b in &fetched {
                 let bookmark_name = RefName::new(b.name.as_str());
