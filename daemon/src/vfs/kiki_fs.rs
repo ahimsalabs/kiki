@@ -1,9 +1,9 @@
-//! `JjYakFs` — the read+write trait the per-mount filesystem exposes — and
-//! `YakFs`, its concrete implementation backed by [`crate::store::Store`].
+//! `JjKikiFs` — the read+write trait the per-mount filesystem exposes — and
+//! `KikiFs`, its concrete implementation backed by [`crate::store::Store`].
 //!
 //! The trait exists so the NFS and FUSE adapters can share a single
 //! tree-walking codebase: `daemon/src/vfs/{nfs_adapter,fuse_adapter}.rs`
-//! both wrap an `Arc<dyn JjYakFs>` and translate between the wire
+//! both wrap an `Arc<dyn JjKikiFs>` and translate between the wire
 //! protocol's reply types and the domain types defined here.
 //!
 //! ## Read path (M3) and check-out (M5)
@@ -41,9 +41,9 @@ use crate::ty::{File, Id, Symlink, Tree, TreeEntry, TreeEntryMapping};
 use crate::vfs::inode::{Inode, InodeId, InodeSlab, NodeRef, ROOT_INODE};
 
 /// Reserved name for jj's metadata directory at the root of the working
-/// copy. Pinned by `YakFs` outside the content-addressed user tree:
+/// copy. Pinned by `KikiFs` outside the content-addressed user tree:
 /// created on first access, preserved across `check_out`, and excluded
-/// from `snapshot`'s rollup. See `YakFs::jj_subtree`.
+/// from `snapshot`'s rollup. See `KikiFs::jj_subtree`.
 const JJ_DIR: &str = ".jj";
 
 /// Kind of filesystem object. Smaller than the NFS `ftype3` and FUSE
@@ -153,7 +153,7 @@ fn fetch_err(e: FetchError) -> FsError {
 }
 
 #[async_trait]
-pub trait JjYakFs: Send + Sync + std::fmt::Debug {
+pub trait JjKikiFs: Send + Sync + std::fmt::Debug {
     /// Inode id for the root directory. Always `ROOT_INODE` for the
     /// default impl; exposed on the trait so adapters needn't import the
     /// constant directly.
@@ -162,7 +162,7 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
     }
 
     /// Resolve `name` within `parent`. On success the returned inode id
-    /// is stable for the lifetime of this `JjYakFs` instance.
+    /// is stable for the lifetime of this `JjKikiFs` instance.
     async fn lookup(&self, parent: InodeId, name: &str) -> Result<InodeId, FsError>;
 
     async fn getattr(&self, ino: InodeId) -> Result<Attr, FsError>;
@@ -178,7 +178,7 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
     ) -> Result<(Vec<u8>, bool), FsError>;
 
     /// Full child listing of a directory. Adapters paginate as required
-    /// by their wire protocol; `JjYakFs` always returns everything in
+    /// by their wire protocol; `JjKikiFs` always returns everything in
     /// one shot since per-mount trees are small (a workspace, not a
     /// crawl target).
     async fn readdir(&self, dir: InodeId) -> Result<Vec<DirEntry>, FsError>;
@@ -186,7 +186,7 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
     async fn readlink(&self, ino: InodeId) -> Result<String, FsError>;
 
     /// Re-root the filesystem at `new_root_tree`. Subsequent reads through
-    /// this `JjYakFs` (and through any kernel mount the adapters expose)
+    /// this `JjKikiFs` (and through any kernel mount the adapters expose)
     /// see the new tree.
     ///
     /// `new_root_tree` must already be present in the backing store —
@@ -261,7 +261,7 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
     ///
     /// Required for jj-lib's atomic-write-via-temp-then-rename pattern
     /// (used by index segments, opheads, refs, etc.). Without this,
-    /// `jj yak init` fails halfway through populating `.jj/`.
+    /// `jj kk init` fails halfway through populating `.jj/`.
     async fn rename(
         &self,
         parent: InodeId,
@@ -281,7 +281,7 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
     async fn snapshot(&self) -> Result<Id, FsError>;
 }
 
-/// Concrete `JjYakFs` backed by a [`Store`] and the inode slab.
+/// Concrete `JjKikiFs` backed by a [`Store`] and the inode slab.
 ///
 /// ## Pinned `.jj/` subtree (M7)
 ///
@@ -300,7 +300,7 @@ pub trait JjYakFs: Send + Sync + std::fmt::Debug {
 /// stack — the right shape until Layer C makes the storage location of
 /// `.jj/` matter (PLAN §10.1 option (a) → (b) migration).
 #[derive(Debug)]
-pub struct YakFs {
+pub struct KikiFs {
     store: Arc<Store>,
     /// M10 §10.6: lazy remote read-through. When set, a local
     /// [`Store`] miss in [`Self::read_tree`] / [`Self::read_file`] /
@@ -316,7 +316,7 @@ pub struct YakFs {
     jj_subtree: Mutex<Option<InodeId>>,
 }
 
-impl YakFs {
+impl KikiFs {
     /// Build a new mount-side filesystem rooted at `root_tree`.
     ///
     /// The root tree must already be in `store` — `Store::get_tree` is
@@ -331,7 +331,7 @@ impl YakFs {
     /// a miss surfaces as `FsError::StoreMiss` and the kernel sees
     /// `EIO`.
     pub fn new(store: Arc<Store>, root_tree: Id, remote: Option<Arc<dyn RemoteStore>>) -> Self {
-        YakFs {
+        KikiFs {
             store,
             remote,
             slab: InodeSlab::new(root_tree),
@@ -772,7 +772,7 @@ impl YakFs {
 }
 
 #[async_trait]
-impl JjYakFs for YakFs {
+impl JjKikiFs for KikiFs {
     async fn lookup(&self, parent: InodeId, name: &str) -> Result<InodeId, FsError> {
         // Pinned `.jj/` shadows whatever the user tree has at the same
         // name. If unpinned we fall through; legacy trees that contain
@@ -1379,7 +1379,7 @@ mod tests {
     #[tokio::test]
     async fn empty_repo_has_only_root() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let entries = fs.readdir(fs.root()).await.expect("readdir empty root");
         assert!(entries.is_empty(), "got {entries:?}");
         let attr = fs.getattr(fs.root()).await.expect("getattr root");
@@ -1389,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_finds_top_level_file() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.expect("lookup");
         let attr = fs.getattr(id).await.expect("getattr");
         assert_eq!(attr.kind, FileKind::Regular);
@@ -1400,7 +1400,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_traverses_subdirectory() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let bin_id = fs.lookup(fs.root(), "bin").await.expect("bin");
         let bin_attr = fs.getattr(bin_id).await.expect("getattr bin");
         assert_eq!(bin_attr.kind, FileKind::Directory);
@@ -1413,7 +1413,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_is_idempotent() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let a = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         let b = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         assert_eq!(a, b);
@@ -1422,7 +1422,7 @@ mod tests {
     #[tokio::test]
     async fn read_returns_file_content_with_eof_flag() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.unwrap();
 
         // Whole file in one shot.
@@ -1444,7 +1444,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_lists_all_top_level_entries_with_kind() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let mut entries = fs.readdir(fs.root()).await.unwrap();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -1459,7 +1459,7 @@ mod tests {
     #[tokio::test]
     async fn readlink_returns_target() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "link").await.unwrap();
         assert_eq!(fs.readlink(id).await.unwrap(), "hello.txt");
     }
@@ -1467,7 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_unknown_name_is_not_found() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let err = fs.lookup(fs.root(), "missing").await.unwrap_err();
         assert_eq!(err, FsError::NotFound);
     }
@@ -1475,7 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn read_on_directory_is_not_a_file() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let err = fs.read(fs.root(), 0, 16).await.unwrap_err();
         assert_eq!(err, FsError::NotAFile);
     }
@@ -1483,7 +1483,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_on_file_is_not_a_directory() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         let err = fs.readdir(id).await.unwrap_err();
         assert_eq!(err, FsError::NotADirectory);
@@ -1492,7 +1492,7 @@ mod tests {
     #[tokio::test]
     async fn getattr_on_unknown_inode_is_not_found() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let err = fs.getattr(99_999).await.unwrap_err();
         assert_eq!(err, FsError::NotFound);
     }
@@ -1530,7 +1530,7 @@ mod tests {
             }],
         });
 
-        let fs = YakFs::new(store, tree_a, None);
+        let fs = KikiFs::new(store, tree_a, None);
         // Tree A is visible.
         fs.lookup(fs.root(), "only-in-a.txt").await.expect("A");
         assert_eq!(
@@ -1553,7 +1553,7 @@ mod tests {
     #[tokio::test]
     async fn check_out_unknown_tree_is_store_miss() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None);
         let err = fs.check_out(Id([0xff; 32])).await.unwrap_err();
         assert_eq!(err, FsError::StoreMiss);
         // Original tree is still visible.
@@ -1570,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn create_write_read_round_trips() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (file_ino, attr) = fs
             .create_file(fs.root(), "hello.txt", false)
             .await
@@ -1610,7 +1610,7 @@ mod tests {
     #[tokio::test]
     async fn mkdir_then_create_inside_round_trips() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.expect("mkdir");
         let (file_ino, _) = fs
@@ -1651,7 +1651,7 @@ mod tests {
     #[tokio::test]
     async fn symlink_round_trips() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (link_ino, attr) = fs
             .symlink(fs.root(), "link", "target")
             .await
@@ -1682,7 +1682,7 @@ mod tests {
     #[tokio::test]
     async fn create_collision_is_already_exists() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         fs.create_file(fs.root(), "a", false).await.unwrap();
         let err = fs
             .create_file(fs.root(), "a", false)
@@ -1696,7 +1696,7 @@ mod tests {
     #[tokio::test]
     async fn setattr_truncates_file() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1716,7 +1716,7 @@ mod tests {
     #[tokio::test]
     async fn setattr_chmod_preserves_content() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1738,7 +1738,7 @@ mod tests {
     #[tokio::test]
     async fn remove_file_then_lookup_is_not_found() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.remove(fs.root(), "f").await.expect("remove");
         let err = fs.lookup(fs.root(), "f").await.unwrap_err();
@@ -1750,7 +1750,7 @@ mod tests {
     #[tokio::test]
     async fn remove_non_empty_directory_is_not_empty() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (dir, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         fs.create_file(dir, "f", false).await.unwrap();
 
@@ -1765,7 +1765,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_clean_returns_existing_root() {
         let (store, root) = build_synthetic_tree();
-        let fs = YakFs::new(store.clone(), root, None);
+        let fs = KikiFs::new(store.clone(), root, None);
         let id = fs.snapshot().await.expect("snapshot");
         assert_eq!(id, root);
     }
@@ -1776,13 +1776,13 @@ mod tests {
     #[tokio::test]
     async fn snapshot_is_deterministic_under_insertion_order() {
         let store_a = Arc::new(Store::new_in_memory());
-        let fs_a = YakFs::new(store_a.clone(), store_a.get_empty_tree_id(), None);
+        let fs_a = KikiFs::new(store_a.clone(), store_a.get_empty_tree_id(), None);
         fs_a.create_file(fs_a.root(), "a", false).await.unwrap();
         fs_a.create_file(fs_a.root(), "b", false).await.unwrap();
         let id_a = fs_a.snapshot().await.unwrap();
 
         let store_b = Arc::new(Store::new_in_memory());
-        let fs_b = YakFs::new(store_b.clone(), store_b.get_empty_tree_id(), None);
+        let fs_b = KikiFs::new(store_b.clone(), store_b.get_empty_tree_id(), None);
         // Inserted in the opposite order — final tree should hash the same.
         fs_b.create_file(fs_b.root(), "b", false).await.unwrap();
         fs_b.create_file(fs_b.root(), "a", false).await.unwrap();
@@ -1797,7 +1797,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_preserves_inode_ids() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"x").await.unwrap();
         fs.snapshot().await.unwrap();
@@ -1813,7 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_excluded_from_snapshot() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Create `.jj/` and a file inside it (matches what jj-lib does
         // during `init_with_factories`).
@@ -1858,7 +1858,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_survives_check_out() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Set up a `.jj/` with some content.
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
@@ -1902,7 +1902,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_pin_is_unique() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         fs.mkdir(fs.root(), ".jj").await.expect("mkdir .jj");
         let err = fs.mkdir(fs.root(), ".jj").await.expect_err("dup mkdir");
         assert_eq!(err, FsError::AlreadyExists);
@@ -1934,7 +1934,7 @@ mod tests {
                 },
             }],
         });
-        let fs = YakFs::new(store.clone(), legacy_tree, None);
+        let fs = KikiFs::new(store.clone(), legacy_tree, None);
 
         // Without a pin, lookup of `.jj` falls through to the user tree
         // and returns the legacy file.
@@ -1952,7 +1952,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_remove_respects_rmdir_empty() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         fs.create_file(jj_ino, "f", false).await.unwrap();
         let err = fs.remove(fs.root(), ".jj").await.unwrap_err();
@@ -1971,7 +1971,7 @@ mod tests {
     #[tokio::test]
     async fn jj_dir_dirty_buffers_cleaned_on_snapshot() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         let (file_ino, _) = fs.create_file(jj_ino, "config", false).await.unwrap();
         fs.write(file_ino, 0, b"settings").await.unwrap();
@@ -2005,7 +2005,7 @@ mod tests {
     #[tokio::test]
     async fn write_after_snapshot_deep_in_tree_is_visible() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Build /dir/subdir/file with initial content.
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
@@ -2072,7 +2072,7 @@ mod tests {
     #[tokio::test]
     async fn remove_after_snapshot_deep_in_tree_is_visible() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         let (file_ino, _) = fs.create_file(dir_ino, "inner", false).await.unwrap();
@@ -2109,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn setattr_after_snapshot_is_visible() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         let (file_ino, _) = fs.create_file(dir_ino, "f", false).await.unwrap();
@@ -2159,7 +2159,7 @@ mod tests {
     #[tokio::test]
     async fn write_to_existing_tree_child_survives_materialization() {
         let (store, root_id) = build_synthetic_tree();
-        let fs = YakFs::new(store.clone(), root_id, None);
+        let fs = KikiFs::new(store.clone(), root_id, None);
 
         // Look up the existing "hello.txt" (clean File from the store).
         let hello_ino = fs.lookup(fs.root(), "hello.txt").await.unwrap();
@@ -2202,7 +2202,7 @@ mod tests {
     #[tokio::test]
     async fn rename_atomic_save_pattern() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Original file.
         let (orig_ino, _) = fs.create_file(fs.root(), "foo.rs", false).await.unwrap();
@@ -2256,7 +2256,7 @@ mod tests {
     #[tokio::test]
     async fn write_to_cross_dir_renamed_file_after_snapshot() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Create /a/file and /b/.
         let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
@@ -2315,7 +2315,7 @@ mod tests {
     #[tokio::test]
     async fn create_at_old_name_after_rename() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
         let (b_ino, _) = fs.mkdir(fs.root(), "b").await.unwrap();
@@ -2351,7 +2351,7 @@ mod tests {
     #[tokio::test]
     async fn same_dir_rename_then_write() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (file_ino, _) = fs.create_file(fs.root(), "old_name", false).await.unwrap();
         fs.write(file_ino, 0, b"content").await.unwrap();
@@ -2384,7 +2384,7 @@ mod tests {
     #[tokio::test]
     async fn rename_atomic_save_in_subdirectory() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (src_ino, _) = fs.mkdir(fs.root(), "src").await.unwrap();
         let (orig_ino, _) = fs.create_file(src_ino, "lib.rs", false).await.unwrap();
@@ -2433,7 +2433,7 @@ mod tests {
     #[tokio::test]
     async fn three_snapshot_cycles() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         let (file_ino, _) = fs.create_file(fs.root(), "counter", false).await.unwrap();
         fs.write(file_ino, 0, b"1").await.unwrap();
@@ -2464,7 +2464,7 @@ mod tests {
     #[tokio::test]
     async fn modify_after_check_out_to_different_tree() {
         let store = Arc::new(Store::new_in_memory());
-        let fs = YakFs::new(store.clone(), store.get_empty_tree_id(), None);
+        let fs = KikiFs::new(store.clone(), store.get_empty_tree_id(), None);
 
         // Build tree A: /file with "aaa".
         let (file_ino, _) = fs.create_file(fs.root(), "file", false).await.unwrap();
@@ -2533,7 +2533,7 @@ mod tests {
     #[tokio::test]
     async fn create_file_in_existing_subdirectory() {
         let (store, root_id) = build_synthetic_tree();
-        let fs = YakFs::new(store.clone(), root_id, None);
+        let fs = KikiFs::new(store.clone(), root_id, None);
 
         // Look up the existing "bin/" directory.
         let bin_ino = fs.lookup(fs.root(), "bin").await.unwrap();
@@ -2570,7 +2570,7 @@ mod tests {
     #[tokio::test]
     async fn delete_from_existing_subtree_after_snapshot() {
         let (store, root_id) = build_synthetic_tree();
-        let fs = YakFs::new(store.clone(), root_id, None);
+        let fs = KikiFs::new(store.clone(), root_id, None);
 
         // Snapshot should be a no-op on a clean tree.
         let snap1 = fs.snapshot().await.unwrap();

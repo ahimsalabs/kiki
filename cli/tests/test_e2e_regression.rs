@@ -1,7 +1,7 @@
 //! Regression tests for the three bugs found during the first e2e
 //! smoke test (2026-05-01):
 //!
-//! 1. zstd compression mismatch in YakBackend (read_file/write_file)
+//! 1. zstd compression mismatch in KikiBackend (read_file/write_file)
 //! 2. Missing ancestor-dirty propagation after snapshot
 //! 3. Dirty nodes clobbered by tree materialization
 //!
@@ -21,7 +21,7 @@ use crate::common::TestEnvironment;
 #[test]
 fn test_modify_file_after_new() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create a file via FUSE.
@@ -60,7 +60,7 @@ fn test_modify_file_after_new() {
 #[test]
 fn test_delete_file_after_new() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create two files so the directory isn't empty after deletion.
@@ -91,7 +91,7 @@ fn test_delete_file_after_new() {
 #[test]
 fn test_modify_deep_file_after_new() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create nested structure via FUSE.
@@ -118,7 +118,7 @@ fn test_modify_deep_file_after_new() {
 #[test]
 fn test_editor_atomic_save() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create original file.
@@ -155,7 +155,7 @@ fn test_editor_atomic_save() {
 #[test]
 fn test_cross_dir_rename_then_modify() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create /src/main.rs and /dst/.
@@ -188,7 +188,7 @@ fn test_cross_dir_rename_then_modify() {
 #[test]
 fn test_jj_restore() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create a file and commit.
@@ -210,7 +210,7 @@ fn test_jj_restore() {
 #[test]
 fn test_jj_squash() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create a file.
@@ -238,7 +238,7 @@ fn test_jj_squash() {
 #[test]
 fn test_jj_abandon() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Create a file and commit.

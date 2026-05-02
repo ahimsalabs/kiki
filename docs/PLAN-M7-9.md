@@ -1,4 +1,4 @@
-# jj-yak: Archive — M7 through M9
+# kiki: Archive — M7 through M9
 
 This document is the archived implementation log for milestones M7–M9
 plus the "Ship (d)" interim that landed between M6 and M7. The main
@@ -34,7 +34,7 @@ Goal was: flip `TTL: Duration::ZERO` in the FUSE adapter and
   `readdirplus` is a real impl (the kernel falls back to `readdir`
   imperfectly when readdirplus returns ENOSYS), looking like
   `readdir` + `getattr` per entry.
-- **`JjYakFs::rename`** (new trait method) + impl on `YakFs`. POSIX
+- **`JjKikiFs::rename`** (new trait method) + impl on `KikiFs`. POSIX
   semantics: existing destination atomic-replace, empty-dir-rmdir
   for dir-over-dir, type-match guards. Required because jj-lib's
   index/op-heads writes use the standard
@@ -63,16 +63,16 @@ Both landed; integration tests now run end-to-end on a real FUSE mount.
 
 ### 10.1 `.jj/` separation (M7.1, landed)
 
-**Problem:** `JjYakFs::snapshot` walked the slab from `ROOT_INODE`
+**Problem:** `JjKikiFs::snapshot` walked the slab from `ROOT_INODE`
 and included every child — including `.jj/`, which jj-lib creates
-inside the mount during `jj yak init`. So the tree returned to
+inside the mount during `jj kk init`. So the tree returned to
 jj-lib for the WC commit contained `.jj/repo/index/segments/…`,
 `.jj/working_copy/…`, etc. as if they were user content. `jj log`
 showed `(empty)` flipping off because the WC commit had ~14
 `.jj/…` entries.
 
 **Adopted: option (a) refined** — pin `.jj/` outside the slab's
-root children. `YakFs` grew `jj_subtree: Mutex<Option<InodeId>>`;
+root children. `KikiFs` grew `jj_subtree: Mutex<Option<InodeId>>`;
 `mkdir(root, ".jj")` populates it; `lookup`/`readdir`/`remove`/
 `rename` short-circuit on `(ROOT_INODE, ".jj")`; `child_exists`
 treats the pin as occupied; `snapshot_node`'s root iteration
@@ -98,7 +98,7 @@ Two coupled bugs surfaced once §10.1 was in place and the M7-gated
 tests started running.
 
 **Bug A — `swap_root` cleared the entire `by_parent` cache.**
-`InodeSlab::swap_root` (called by `JjYakFs::check_out`) used to
+`InodeSlab::swap_root` (called by `JjKikiFs::check_out`) used to
 do `inner.by_parent.clear()`, which inadvertently severed the
 chain through the pinned `.jj/`: a subsequent lookup of
 `.jj/repo/op_heads/heads` re-walked the (now-stale) snapshotted
@@ -114,7 +114,7 @@ survive — they're either reachable through the pinned `.jj/` (in
 which case we *want* stable inode ids) or orphaned (harmless).
 Test: `swap_root_preserves_subtree_cache` in `inode.rs`.
 
-**Bug B — `LockedYakWorkingCopy::finish` didn't propagate the
+**Bug B — `LockedKikiWorkingCopy::finish` didn't propagate the
 new operation_id back to the daemon.** The local-disk working
 copy writes `.jj/working_copy/checkout` at this point; the
 daemon-backed equivalent is `SetCheckoutState`. Without it, the
@@ -126,7 +126,7 @@ Visible as: `jj new` printed "Working copy now at: <new>" but
 
 **Fix:** `finish` now sends `SetCheckoutStateReq` with the new
 `operation_id`, then invalidates the cached `checkout_state`
-`OnceCell`. Code in `cli/src/working_copy.rs:LockedYakWorkingCopy::finish`.
+`OnceCell`. Code in `cli/src/working_copy.rs:LockedKikiWorkingCopy::finish`.
 
 **Diagnostic that found the bugs:** `RUST_LOG=daemon=info` plus
 explicit `info!` in the snapshot/check_out/SetCheckoutState
@@ -191,11 +191,11 @@ What was checked and intentionally **not** changed:
 - The 6 `todo!()`s in `cli/src/working_copy.rs` (`recover`,
   `rename_workspace`, `reset`, `sparse_patterns`,
   `set_sparse_patterns`). All cold paths requiring explicit
-  uncommon user actions; none on the `jj yak init` / `jj log` /
+  uncommon user actions; none on the `jj kk init` / `jj log` /
   `jj diff` hot paths. Tracked in PLAN.md §5.
-- `async_trait` on `JjYakFs`. Native `async fn` in traits is
+- `async_trait` on `JjKikiFs`. Native `async fn` in traits is
   Rust-1.75+; the indirection is fine until we bump MSRV.
-- `YakBackend::working_copy_path()` clones a `String` per RPC.
+- `KikiBackend::working_copy_path()` clones a `String` per RPC.
   Method sugar over `self.working_copy_path.clone()`; the clone
   itself is unavoidable because the value goes into a proto by
   value. Not worth churning every call site.
@@ -372,17 +372,17 @@ themselves.
 `Store`. The original spec (a draft of this section) had `Store::
 open_with_remote` wrap a `RemoteStore` directly, but `Store` is
 sync by design (§12.1 — methods open a redb transaction
-without `.await` so `JjYakFs::snapshot_node` can recurse without
+without `.await` so `JjKikiFs::snapshot_node` can recurse without
 `Box::pin`). Composing an async `RemoteStore` inside a sync
 `Store` would force one of: (a) make `Store` async (ripples
-through ~10 sync helpers in `vfs/yak_fs.rs` and ~30 call sites);
+through ~10 sync helpers in `vfs/kiki_fs.rs` and ~30 call sites);
 (b) hide a dedicated tokio runtime inside `Store` to bridge
 sync→async (adds threads per remote-equipped mount and a non-obvious
 re-entry hazard); (c) push integration up to a layer that's
 already async. Option (c) — service.rs — has the smallest blast
 radius and the cleanest seam; the remote becomes an "RPC layer"
 concern that doesn't touch storage internals. The cost is: the
-FUSE-side store-miss path in `vfs/yak_fs.rs` doesn't get
+FUSE-side store-miss path in `vfs/kiki_fs.rs` doesn't get
 read-through automatically (see §13.5 — deferred to M10).
 
 `Mount` (in `service.rs`) gains
@@ -404,7 +404,7 @@ read-through automatically (see §13.5 — deferred to M10).
   construction), return. On local miss with no remote: existing
   `not_found` path.
 - **post-snapshot push (in `Snapshot` handler).** Blobs written
-  through `JjYakFs::snapshot_node` bypass the RPC handlers, so
+  through `JjKikiFs::snapshot_node` bypass the RPC handlers, so
   `service.rs::Snapshot`, after `fs.snapshot().await` returns
   the new root, walks the tree from that id and pushes every
   reachable blob whose `has_blob` says the remote doesn't have
@@ -473,12 +473,12 @@ inlining them.
 - **Stable inode ids across restarts (PLAN.md §7 decision 6).**
   Still deferred; lands with the `fuser` migration (PLAN.md §9).
 - **FUSE-side read-through on `StoreMiss`.** The `lookup` /
-  `read` / `readdir` paths in `vfs/yak_fs.rs` continue to map
+  `read` / `readdir` paths in `vfs/kiki_fs.rs` continue to map
   `StoreMiss` to `EIO`. The §13.2 decision (orchestrate at
-  `service.rs`) means yak_fs.rs doesn't see the remote without
+  `service.rs`) means kiki_fs.rs doesn't see the remote without
   duplicating fetch logic. The M9 demo — two daemons sharing
   blobs via the gRPC store RPCs — is fully covered without it.
-  M10 is the right milestone to thread the remote into yak_fs.rs
+  M10 is the right milestone to thread the remote into kiki_fs.rs
   (clone-style workflows where a checked-out tree's blobs aren't
   all local) once we know whether to take the orchestration cost
   there or upgrade `Store` to async.
@@ -557,7 +557,7 @@ Decisions made on the way:
 - **Composition at `service.rs`, not `Store` (§13.2 amendment).** The
   draft originally had `Store::open_with_remote` wrap a `RemoteStore`
   directly, but `Store` is sync by design (§12.1 — methods open
-  a redb txn without `.await` so `JjYakFs::snapshot_node` can recurse
+  a redb txn without `.await` so `JjKikiFs::snapshot_node` can recurse
   without `Box::pin`). Composing an async `RemoteStore` inside a sync
   `Store` would force one of: make `Store` async (ripples through
   ~10 sync helpers + ~30 call sites), hide a tokio runtime inside
@@ -618,7 +618,7 @@ Decisions made on the way:
   label. M9's strict `dir://…|grpc://…|""` parse rejects that. CLI
   tests switched to `""` (back-compat path); service tests use a
   real `dir://<tempdir>` URL where they exercise the rehydrate
-  round-trip. The `yak status` formatter now drops `- <remote>`
+  round-trip. The `kk status` formatter now drops `- <remote>`
   when `remote` is empty (was `path - ` with trailing whitespace).
 
 What this milestone explicitly does **not** do (preserved from
@@ -632,7 +632,7 @@ What this milestone explicitly does **not** do (preserved from
 - Stable inode ids across restarts (PLAN.md §7 decision 6). With the
   `fuser` migration (PLAN.md §9).
 - FUSE-side read-through on `StoreMiss`. The §13.2 decision means
-  yak_fs.rs doesn't see the remote without duplicating the
+  kiki_fs.rs doesn't see the remote without duplicating the
   orchestration cost. M10 is the right milestone to thread it
   through (clone-style flows are when the kernel actually asks for
   blobs the local store doesn't have).

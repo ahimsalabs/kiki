@@ -1,12 +1,12 @@
-# Git Remote Support for jj-yak
+# Git Remote Support for kiki
 
-Research and design notes for adding GitHub/git remote support to jj-yak.
+Research and design notes for adding GitHub/git remote support to kiki.
 
 ## Problem statement
 
-jj-yak uses a custom `YakBackend` with its own object format (prost-encoded,
+kiki uses a custom `KikiBackend` with its own object format (prost-encoded,
 BLAKE3-addressed, stored in redb). It has no connection to git's object model.
-This means jj-yak repos can't push to or fetch from GitHub or any git remote.
+This means kiki repos can't push to or fetch from GitHub or any git remote.
 
 The goal is to enable a workflow where:
 
@@ -24,7 +24,7 @@ translation.
 
 ```
 daemon storage_dir/mounts/<hash>/
-├── store.redb          # existing yak store (primary, BLAKE3)
+├── store.redb          # existing kiki store (primary, BLAKE3)
 ├── git/                # bare git repo (shadow, SHA-1)         ← NEW
 └── git-jj/             # jj metadata for the shadow git repo   ← NEW
     └── .jj/repo/
@@ -68,7 +68,7 @@ and every API we need (`push_refs`, `GitFetch`, `export_refs`, `import_refs`)
 takes `&mut MutableRepo`.
 
 However, this op log is **purely local bookkeeping**. It is never synced to
-the git remote or to the yak remote. Operations only flow through the native
+the git remote or to the kiki remote. Operations only flow through the native
 `grpc://` / `dir://` channel. The shadow repo's op log tracks its own state
 transitions (each push/fetch) and nothing else. This matches standard jj
 behavior — `jj git push` has never synced the operation log.
@@ -80,17 +80,17 @@ behavior — `jj git push` has never synced the operation log.
 The design's central challenge is **not** just commit ID rewriting — it's
 translating the entire object graph. `GitBackend::write_commit` expects
 every referenced tree and blob to **already exist** in the git object store
-with valid 20-byte SHA-1 IDs. A yak `TreeId` is 32 bytes (BLAKE3) and will
+with valid 20-byte SHA-1 IDs. A kiki `TreeId` is 32 bytes (BLAKE3) and will
 fail `validate_git_object_id`.
 
 The translation is a recursive walk:
 
 ```
-blob (file/symlink)  →  read from yak redb
+blob (file/symlink)  →  read from kiki redb
                      →  write to git ODB via Store::write_file
                      →  get SHA-1 FileId, record mapping
 
-tree (bottom-up)     →  read from yak redb
+tree (bottom-up)     →  read from kiki redb
                      →  rewrite every child entry ID (file→SHA-1, subtree→SHA-1)
                      →  write to git ODB via Store::write_tree
                      →  get SHA-1 TreeId, record mapping
@@ -109,12 +109,12 @@ the mapping established by the layer below.
 Six redb tables provide bidirectional mapping for three object types:
 
 ```rust
-// BLAKE3 (yak) → SHA-1 (git)
+// BLAKE3 (kiki) → SHA-1 (git)
 const GIT_COMMIT_MAP:  TableDefinition<&[u8; 32], &[u8; 20]> = TableDefinition::new("git_commit_map_v1");
 const GIT_TREE_MAP:    TableDefinition<&[u8; 32], &[u8; 20]> = TableDefinition::new("git_tree_map_v1");
 const GIT_BLOB_MAP:    TableDefinition<&[u8; 32], &[u8; 20]> = TableDefinition::new("git_blob_map_v1");
 
-// SHA-1 (git) → BLAKE3 (yak), for the fetch direction
+// SHA-1 (git) → BLAKE3 (kiki), for the fetch direction
 const GIT_COMMIT_MAP_REV: TableDefinition<&[u8; 20], &[u8; 32]> = TableDefinition::new("git_commit_map_rev_v1");
 const GIT_TREE_MAP_REV:   TableDefinition<&[u8; 20], &[u8; 32]> = TableDefinition::new("git_tree_map_rev_v1");
 const GIT_BLOB_MAP_REV:   TableDefinition<&[u8; 20], &[u8; 32]> = TableDefinition::new("git_blob_map_rev_v1");
@@ -129,32 +129,32 @@ Seeded with the root commit mapping on first push or fetch
 parentless) on write, and injects `root_commit_id` on read.
 
 The mapping is rebuildable: walk all git objects, re-hash content as
-BLAKE3 via the yak store, and reconstruct.
+BLAKE3 via the kiki store, and reconstruct.
 
-### Push flow (`cli yak git push`)
+### Push flow (`cli kk git push`)
 
 ```
 1. CLI sends GitPush RPC to daemon (with remote name, bookmark patterns)
 
 2. Daemon opens/loads shadow repo, starts transaction → MutableRepo
 
-3. Walk yak commit graph — ancestors of bookmarked heads, bottom-up:
+3. Walk kiki commit graph — ancestors of bookmarked heads, bottom-up:
 
    For each commit not already in the mapping table:
 
    a. Copy blobs:
-      - Read yak root tree, recurse into subtrees
+      - Read kiki root tree, recurse into subtrees
       - For each file/symlink entry not in blob mapping:
-        read content from yak store, write via shadow Store::write_file
+        read content from kiki store, write via shadow Store::write_file
       - Record BLAKE3 ↔ SHA-1 blob mapping
 
    b. Copy trees (bottom-up, leaves first):
-      - Read yak tree entries, translate child IDs via mapping
+      - Read kiki tree entries, translate child IDs via mapping
       - Write via shadow Store::write_tree
       - Record BLAKE3 ↔ SHA-1 tree mapping
 
    c. Copy commit:
-      - Read backend::Commit from yak redb
+      - Read backend::Commit from kiki redb
       - Rewrite parent/predecessor CommitIds: BLAKE3 → SHA-1
       - Rewrite root_tree Merge<TreeId>: BLAKE3 → SHA-1
       - Write via shadow Store::write_commit
@@ -173,7 +173,7 @@ BLAKE3 via the yak store, and reconstruct.
 6. Commit transaction: tx.commit("push to <remote>")
 ```
 
-### Fetch flow (`cli yak git fetch`)
+### Fetch flow (`cli kk git fetch`)
 
 ```
 1. CLI sends GitFetch RPC to daemon
@@ -193,27 +193,27 @@ BLAKE3 via the yak store, and reconstruct.
 
 4. Walk new commits in shadow repo (ones not yet in mapping table):
 
-   For each new commit (reverse of push, git→yak):
+   For each new commit (reverse of push, git→kiki):
 
-   a. Copy blobs (git→yak):
+   a. Copy blobs (git→kiki):
       - Read git blobs via shadow Store::read_file
-      - Write to yak redb store
+      - Write to kiki redb store
       - Record SHA-1 ↔ BLAKE3 blob mapping
 
-   b. Copy trees bottom-up (git→yak):
+   b. Copy trees bottom-up (git→kiki):
       - Read git tree entries, translate child IDs via mapping
-      - Write to yak redb store
+      - Write to kiki redb store
       - Record SHA-1 ↔ BLAKE3 tree mapping
 
-   c. Copy commit (git→yak):
+   c. Copy commit (git→kiki):
       - Read backend::Commit via shadow Store::get_commit
         (GitBackend handles git→jj translation: change-id from header,
          predecessors from extras, conflicts from jj:trees header)
       - Rewrite parent/predecessor/root_tree IDs: SHA-1 → BLAKE3
-      - Write to yak redb store
+      - Write to kiki redb store
       - Record SHA-1 ↔ BLAKE3 commit mapping
 
-5. Sync bookmarks/tags from shadow repo's view into yak's catalog refs
+5. Sync bookmarks/tags from shadow repo's view into kiki's catalog refs
 
 6. Commit transaction: tx.commit("fetch from <remote>")
 ```
@@ -279,7 +279,7 @@ tx.commit("add remote").await?;
 
 ### Ref and bookmark mapping
 
-Yak's `RemoteStore` ref namespace is flat (no `/` allowed by
+Kiki's `RemoteStore` ref namespace is flat (no `/` allowed by
 `validate_ref_name`). Git refs are hierarchical. The shadow repo handles this
 internally — jj-lib's `export_refs` / `import_refs` manage the
 `refs/heads/<bookmark>` ↔ jj bookmark mapping.
@@ -463,9 +463,9 @@ and editor compatibility. The header is the authoritative source.
 jj's test suite (`write_tree_conflicts`) asserts `write_commit` → `read_commit`
 produces identical `Merge<TreeId>`. No normalization or canonicalization happens.
 
-### YakBackend compatibility
+### KikiBackend compatibility
 
-YakBackend uses the same `Merge<TreeId>` type with the same proto wire
+KikiBackend uses the same `Merge<TreeId>` type with the same proto wire
 format (`repeated bytes root_tree` in alternating order, with
 `uses_tree_conflict_format = true`). The only translation needed is
 BLAKE3 → SHA-1 ID substitution. Structure, ordering, and semantics are
@@ -501,7 +501,7 @@ When you call `GitBackend::write_commit(contents)`, it:
 
 ### Root commit
 
-Yak root commit: `[0u8; 32]`. Git root commit: `[0u8; 20]`.
+Kiki root commit: `[0u8; 32]`. Git root commit: `[0u8; 20]`.
 `GitBackend::write_commit` silently drops root-commit parents (making the
 git commit parentless). `read_commit` injects `root_commit_id` for
 parentless commits. Mapping `[0u8; 32]` ↔ `[0u8; 20]` is all that's needed.
@@ -520,29 +520,29 @@ protobuf, never in git commit headers. Handled transparently by
 
 ## CLI command design
 
-### `jj yak git push` / `jj yak git fetch`
+### `jj kk git push` / `jj kk git fetch`
 
 ```bash
-# Add a git remote to an existing yak repo
-jj yak git remote add origin https://github.com/user/repo.git
+# Add a git remote to an existing kiki repo
+jj kk git remote add origin https://github.com/user/repo.git
 
 # Push bookmarks to GitHub
-jj yak git push --remote origin
-jj yak git push --remote origin --bookmark main
+jj kk git push --remote origin
+jj kk git push --remote origin --bookmark main
 
 # Fetch from GitHub
-jj yak git fetch --remote origin
+jj kk git fetch --remote origin
 
 # List git remotes
-jj yak git remote list
+jj kk git remote list
 ```
 
-The `jj yak git` subcommand tree mirrors `jj git` as closely as possible.
+The `jj kk git` subcommand tree mirrors `jj git` as closely as possible.
 
 ### Why not `jj git push` directly
 
 `jj git push` calls `git::get_git_backend(store)` which downcasts to
-`GitBackend`. Since yak repos use `YakBackend`, the downcast fails with
+`GitBackend`. Since kiki repos use `KikiBackend`, the downcast fails with
 `UnexpectedGitBackendError`. There is no extension point in jj-cli to
 intercept this.
 
@@ -550,7 +550,7 @@ intercept this.
 
 The right long-term fix is an upstream contribution to jj: a trait like
 `GitSyncable` that any backend can implement, replacing the hard downcast
-to `GitBackend`. A working jj-yak implementation would strengthen that
+to `GitBackend`. A working kiki implementation would strengthen that
 proposal with a concrete use case.
 
 ## Scope estimate
@@ -566,7 +566,7 @@ proposal with a concrete use case.
 | Graph walker (fetch direction) | ~50 | `daemon/src/git.rs` |
 | `GitPush` / `GitFetch` daemon RPCs | ~100 | `daemon/src/service.rs` |
 | Proto definitions for new RPCs | ~30 | `proto/jj_interface.proto` |
-| CLI commands (`yak git push/fetch/remote`) | ~80 | `cli/src/main.rs` |
+| CLI commands (`kk git push/fetch/remote`) | ~80 | `cli/src/main.rs` |
 | **Total** | **~640** | |
 
 The distribution of complexity shifts toward the object graph translator
@@ -584,12 +584,12 @@ trees is straightforward but requires careful bottom-up ordering.
 2. **Multiple git remotes.** The shadow git repo can have multiple git remotes
    (origin, upstream, etc.). This works naturally with gix / git config.
 
-3. ~~**Conflict round-tripping.**~~ **Resolved.** YakBackend and GitBackend
+3. ~~**Conflict round-tripping.**~~ **Resolved.** KikiBackend and GitBackend
    use the same `Merge<TreeId>` type. The `jj:trees` commit header preserves
    exact conflict structure. Only ID substitution (BLAKE3→SHA-1) is needed.
    Round-trip test exists in jj's test suite.
 
-4. **Change-id stability.** When pushing a yak commit to git and fetching it
+4. **Change-id stability.** When pushing a kiki commit to git and fetching it
    back, the change-id must survive the round trip. jj stores it as a commit
    header, which `GitBackend` preserves. Should be fine, but needs testing.
 
@@ -604,9 +604,9 @@ trees is straightforward but requires careful bottom-up ordering.
    the user's SSH agent and git credential config apply naturally. No special
    handling needed.
 
-7. **Bookmarks.** Yak's bookmark model needs to be compatible with jj's for
+7. **Bookmarks.** Kiki's bookmark model needs to be compatible with jj's for
    `export_refs` to work. Need to verify how bookmarks are represented in
-   yak's catalog refs vs. jj's `View`. The push flow uses
+   kiki's catalog refs vs. jj's `View`. The push flow uses
    `mut_repo.set_local_bookmark_target()` to set bookmarks before pushing,
    and `push_refs` handles `export_refs_to_git` internally.
 

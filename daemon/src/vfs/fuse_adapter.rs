@@ -1,4 +1,4 @@
-//! `fuse3::raw::Filesystem` adapter over [`JjYakFs`].
+//! `fuse3::raw::Filesystem` adapter over [`JjKikiFs`].
 //!
 //! Linux primary path. The kernel mount is wired up at M4
 //! (`Session::mount_with_unprivileged` from the `fuse3` crate). M5 added
@@ -12,9 +12,9 @@
 //!   We ignore it for now — single-user mount, no permission checks.
 //! - `readdir` returns a `ReplyDirectory<DirEntryStream<'_>>` where the
 //!   stream is an associated type. The simplest concrete stream is
-//!   `futures::stream::Iter<vec::IntoIter<…>>` since `JjYakFs::readdir`
+//!   `futures::stream::Iter<vec::IntoIter<…>>` since `JjKikiFs::readdir`
 //!   already returns the full listing.
-//! - The `.` and `..` entries are added by the adapter, not by `JjYakFs`,
+//! - The `.` and `..` entries are added by the adapter, not by `JjKikiFs`,
 //!   because their inode numbers are protocol-specific.
 //! - `create` and `open` return a stateless `fh = 0`. The kernel echoes
 //!   it back on subsequent reads/writes; we don't track per-handle
@@ -36,16 +36,16 @@ use fuse3::raw::{Filesystem, Request};
 use fuse3::{Errno, FileType, Inode, Result as FuseResult, SetAttr, Timestamp};
 use futures::stream;
 
-use crate::vfs::yak_fs::{Attr, FileKind, FsError, JjYakFs};
+use crate::vfs::kiki_fs::{Attr, FileKind, FsError, JjKikiFs};
 use crate::vfs::ROOT_INODE;
 
 #[derive(Debug)]
 pub struct FuseAdapter {
-    inner: Arc<dyn JjYakFs>,
+    inner: Arc<dyn JjKikiFs>,
 }
 
 impl FuseAdapter {
-    pub fn new(inner: Arc<dyn JjYakFs>) -> Self {
+    pub fn new(inner: Arc<dyn JjKikiFs>) -> Self {
         Self { inner }
     }
 }
@@ -120,7 +120,7 @@ fn to_file_attr(a: Attr) -> FileAttr {
         perm,
         nlink: 1,
         // Owner is whoever runs the daemon. Real uid/gid mapping is on
-        // the table only for multi-user setups, which jj-yak isn't.
+        // the table only for multi-user setups, which kiki isn't.
         uid: 0,
         gid: 0,
         rdev: 0,
@@ -128,7 +128,7 @@ fn to_file_attr(a: Attr) -> FileAttr {
     }
 }
 
-/// Concrete stream type used for `readdir`. `JjYakFs::readdir` already
+/// Concrete stream type used for `readdir`. `JjKikiFs::readdir` already
 /// returns everything in one shot, so we wrap it in a `stream::iter`.
 type DirStream =
     stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntry>>>;
@@ -247,7 +247,7 @@ impl Filesystem for FuseAdapter {
         // The kernel expects `.` and `..` as the first two entries on a
         // fresh `readdir`. They're protocol-specific (FUSE includes them;
         // NFS3's `READDIR` does not), so we add them here rather than in
-        // `JjYakFs`. Parent inode for `..` falls back to the parent's id
+        // `JjKikiFs`. Parent inode for `..` falls back to the parent's id
         // if known; the root's `..` points at itself.
         let parent_inode = if parent == ROOT_INODE {
             ROOT_INODE
@@ -466,8 +466,8 @@ impl Filesystem for FuseAdapter {
 
     /// Rename. jj-lib relies on the standard atomic-write pattern
     /// (write to `.tmpXXXX`, then `rename` to the real name). Without
-    /// this, `jj yak init` fails the first time it tries to persist an
-    /// index segment / opheads file. POSIX semantics live on `JjYakFs`;
+    /// this, `jj kk init` fails the first time it tries to persist an
+    /// index segment / opheads file. POSIX semantics live on `JjKikiFs`;
     /// the adapter just translates names and dispatches.
     async fn rename(
         &self,
@@ -503,7 +503,7 @@ impl Filesystem for FuseAdapter {
     }
 
     /// `fsync` semantics are "make this durable". jj-lib `fsync`s its
-    /// index segment files after writing them. Yak's durability story
+    /// index segment files after writing them. Kiki's durability story
     /// lives at Layer B (a real backing store); until then the in-memory
     /// `Store` is "durable enough" within a daemon lifetime, so this is
     /// a no-op rather than `ENOSYS`. Same reasoning as `flush`.
@@ -589,7 +589,7 @@ impl Filesystem for FuseAdapter {
 
         // Same `..` approximation as `readdir`. The slab doesn't give
         // us a quick hop to the real grandparent; if a caller ever
-        // needs an accurate `..` here, plumb it through `JjYakFs`.
+        // needs an accurate `..` here, plumb it through `JjKikiFs`.
         let parent_inode = if parent == ROOT_INODE { ROOT_INODE } else { parent };
 
         let parent_attr = self
@@ -661,7 +661,7 @@ mod tests {
 
     use crate::store::{Store, StoreTestExt as _};
     use crate::ty::{File, Tree, TreeEntry, TreeEntryMapping};
-    use crate::vfs::yak_fs::YakFs;
+    use crate::vfs::kiki_fs::KikiFs;
 
     use super::*;
 
@@ -692,8 +692,8 @@ mod tests {
             }],
         };
         let root_id = store.put_tree(root);
-        let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id, None));
-        FuseAdapter::new(yak)
+        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None));
+        FuseAdapter::new(kiki)
     }
 
     #[tokio::test]
@@ -771,7 +771,7 @@ mod tests {
 
     /// `create` + `write` + `read` round-trips through the FUSE
     /// adapter's mode/flag plumbing. Smoke-tests that the M6 dispatch
-    /// reaches `JjYakFs` rather than short-circuiting at the adapter
+    /// reaches `JjKikiFs` rather than short-circuiting at the adapter
     /// surface.
     #[tokio::test]
     async fn create_then_write_then_read_round_trips() {

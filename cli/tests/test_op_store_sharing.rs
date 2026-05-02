@@ -3,8 +3,8 @@
 //! (views and operations) through the remote.
 //!
 //! M10.5 proved arbitration (no clobber on op-heads). M10.6 proves
-//! content sharing: CLI_A's `jj yak init` writes operation + view
-//! objects via `YakOpStore` → daemon → remote. CLI_B, pointed at
+//! content sharing: CLI_A's `jj kk init` writes operation + view
+//! objects via `KikiOpStore` → daemon → remote. CLI_B, pointed at
 //! the same remote, can `jj op log` and see CLI_A's operations —
 //! which requires reading the actual operation bytes from the remote,
 //! not just the op-heads ref.
@@ -14,24 +14,24 @@ use crate::common::TestEnvironment;
 /// CLI_A inits a repo, writing ops to the shared remote. CLI_B inits
 /// its own repo against the same remote. After both inits, CLI_B
 /// should be able to see its own op log (which exercises read of its
-/// own operations through the daemon). This confirms `YakOpStore` is
+/// own operations through the daemon). This confirms `KikiOpStore` is
 /// wired up end-to-end.
 #[test]
-fn cli_reads_own_ops_via_yak_op_store() {
+fn cli_reads_own_ops_via_kiki_op_store() {
     let env = TestEnvironment::default();
-    let remote_tmp = tempfile::TempDir::with_prefix("yak-op-store-test").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("kiki-op-store-test").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 
-    // Init a repo — writes root op + "add workspace" op via YakOpStore.
+    // Init a repo — writes root op + "add workspace" op via KikiOpStore.
     let (_stdout, stderr) =
-        env.jj_cmd_ok(env.env_root(), &["yak", "init", &remote_url, "repo"]);
+        env.jj_cmd_ok(env.env_root(), &["kk", "init", &remote_url, "repo"]);
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo""#);
 
     let repo_path = env.env_root().join("repo");
 
     // `jj op log` should work — it reads operation + view objects
-    // through the YakOpStore → daemon → local cache path.
+    // through the KikiOpStore → daemon → local cache path.
     let (stdout, _stderr) = env.jj_cmd_ok(&repo_path, &["op", "log"]);
     // Should show at least the "add workspace 'default'" operation.
     assert!(
@@ -49,13 +49,13 @@ fn two_clis_share_op_contents_via_remote() {
     let env_b = TestEnvironment::default();
     env_b.advance_test_rng_seed_to_multiple_of(1_000_000);
 
-    let remote_tmp = tempfile::TempDir::with_prefix("yak-op-store-sharing").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("kiki-op-store-sharing").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 
     // CLI A: init a repo. Its ops land on the remote.
     let (_stdout_a, stderr_a) =
-        env_a.jj_cmd_ok(env_a.env_root(), &["yak", "init", &remote_url, "repo_a"]);
+        env_a.jj_cmd_ok(env_a.env_root(), &["kk", "init", &remote_url, "repo_a"]);
     insta::assert_snapshot!(stderr_a, @r#"Initialized repo in "repo_a""#);
 
     // Confirm A's ops landed on the remote. Check for view/ and
@@ -89,7 +89,7 @@ fn two_clis_share_op_contents_via_remote() {
 
     // CLI B: init its own repo against the same remote.
     let (_stdout_b, stderr_b) =
-        env_b.jj_cmd_ok(env_b.env_root(), &["yak", "init", &remote_url, "repo_b"]);
+        env_b.jj_cmd_ok(env_b.env_root(), &["kk", "init", &remote_url, "repo_b"]);
     insta::assert_snapshot!(stderr_b, @r#"Initialized repo in "repo_b""#);
 
     // Both A and B should be able to do `jj op log` against their own repos.

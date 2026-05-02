@@ -56,7 +56,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Methods are sync (`Result`) rather than async: every body just opens
 /// a redb transaction (no `.await` points). Keeping them async would
 /// force every caller into an async context — most painfully, the
-/// recursive `JjYakFs::snapshot` walk in `vfs/yak_fs.rs`, which would
+/// recursive `JjKikiFs::snapshot` walk in `vfs/kiki_fs.rs`, which would
 /// otherwise need `async-recursion` or `Box::pin` to satisfy the
 /// borrow checker.
 #[derive(Clone, Debug)]
@@ -165,7 +165,7 @@ impl Store {
     /// The bytes are returned so callers that also need to push to a
     /// remote ([`crate::remote::RemoteStore`], M9) can reuse the same
     /// buffer instead of re-encoding. Callers that only want the id
-    /// (e.g. the recursive snapshot walk in `vfs/yak_fs.rs`) can
+    /// (e.g. the recursive snapshot walk in `vfs/kiki_fs.rs`) can
     /// destructure with `let (id, _) = ...`.
     #[tracing::instrument(skip(self))]
     pub fn write_tree(&self, tree: Tree) -> Result<(Id, Bytes)> {

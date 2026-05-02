@@ -1,4 +1,4 @@
-//! `nfsserve::vfs::NFSFileSystem` adapter over [`JjYakFs`].
+//! `nfsserve::vfs::NFSFileSystem` adapter over [`JjKikiFs`].
 //!
 //! Read ops dispatch into the trait; write ops dispatch into the M6
 //! mutating surface (`create` / `mkdir` / `symlink` / `write` / `setattr`
@@ -11,9 +11,9 @@
 //!   (`set_mode3`, `set_size3`, …). The helpers at the bottom of this
 //!   module collapse those to `Option<T>` so the trait surface stays
 //!   protocol-agnostic.
-//! - `rename` dispatches into `JjYakFs::rename`. jj-lib uses the standard
+//! - `rename` dispatches into `JjKikiFs::rename`. jj-lib uses the standard
 //!   atomic-write-via-temp-then-rename pattern for index segments,
-//!   opheads, and refs; without rename, `jj yak init` fails halfway.
+//!   opheads, and refs; without rename, `jj kk init` fails halfway.
 
 use std::sync::Arc;
 
@@ -26,15 +26,15 @@ use nfsserve::vfs::{
     DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities,
 };
 
-use crate::vfs::yak_fs::{Attr, FileKind, FsError, JjYakFs};
+use crate::vfs::kiki_fs::{Attr, FileKind, FsError, JjKikiFs};
 
 #[derive(Debug)]
 pub struct NfsAdapter {
-    inner: Arc<dyn JjYakFs>,
+    inner: Arc<dyn JjKikiFs>,
 }
 
 impl NfsAdapter {
-    pub fn new(inner: Arc<dyn JjYakFs>) -> Self {
+    pub fn new(inner: Arc<dyn JjKikiFs>) -> Self {
         Self { inner }
     }
 }
@@ -191,7 +191,7 @@ impl NFSFileSystem for NfsAdapter {
     }
 
     // ------------------------------------------------------------------
-    // Write side (M6) — dispatches into JjYakFs.
+    // Write side (M6) — dispatches into JjKikiFs.
     // ------------------------------------------------------------------
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
@@ -272,7 +272,7 @@ impl NFSFileSystem for NfsAdapter {
 
     /// Rename. Required for jj-lib's atomic-write-via-temp-then-rename
     /// pattern (index segments, opheads, refs). The adapter just
-    /// translates filenames to UTF-8 and dispatches to `JjYakFs::rename`,
+    /// translates filenames to UTF-8 and dispatches to `JjKikiFs::rename`,
     /// which holds the POSIX semantics. Returns `NFS3ERR_INVAL` for
     /// non-UTF-8 names — same convention as `lookup`.
     async fn rename(
@@ -361,11 +361,11 @@ mod tests {
 
     use crate::store::{Store, StoreTestExt as _};
     use crate::ty::{File, Tree, TreeEntry, TreeEntryMapping};
-    use crate::vfs::yak_fs::YakFs;
+    use crate::vfs::kiki_fs::KikiFs;
 
     use super::*;
 
-    /// Build the same tiny tree the YakFs tests use, scaled down. Verifies
+    /// Build the same tiny tree the KikiFs tests use, scaled down. Verifies
     /// the NFS adapter passes through to the trait without losing fidelity
     /// (kind, size, exec bit) and that attribute conversion is consistent.
     fn build_adapter() -> NfsAdapter {
@@ -384,8 +384,8 @@ mod tests {
             }],
         };
         let root_id = store.put_tree(root);
-        let yak: Arc<dyn JjYakFs> = Arc::new(YakFs::new(store, root_id, None));
-        NfsAdapter::new(yak)
+        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None));
+        NfsAdapter::new(kiki)
     }
 
     #[tokio::test]
@@ -422,7 +422,7 @@ mod tests {
 
     /// `write` against a directory inode surfaces NFS3ERR_ISDIR (mapped
     /// from `FsError::NotAFile`). Smoke-test that the M6 dispatch
-    /// reaches `JjYakFs::write` rather than short-circuiting at the
+    /// reaches `JjKikiFs::write` rather than short-circuiting at the
     /// adapter level.
     #[tokio::test]
     async fn write_on_directory_is_isdir() {

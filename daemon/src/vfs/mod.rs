@@ -2,7 +2,7 @@
 //!
 //! Layout (mirrors `docs/PLAN.md` §4.3):
 //!
-//! - [`yak_fs`] — `JjYakFs` trait + concrete `YakFs` impl. Owns the inode
+//! - [`kiki_fs`] — `JjKikiFs` trait + concrete `KikiFs` impl. Owns the inode
 //!   slab and walks the content store. The interesting code lives here.
 //! - [`inode`] — the slab itself. Stable, monotonic `u64` ids that fit
 //!   both `nfsserve::nfs::fileid3` and `fuse3::Inode`.
@@ -11,7 +11,7 @@
 //!   without a kernel mount.
 //!
 //! The FUSE adapter (Linux primary) lands later in M3 — it reuses
-//! `JjYakFs` unchanged.
+//! `JjKikiFs` unchanged.
 
 pub mod fuse_adapter;
 mod inode;
@@ -21,7 +21,7 @@ mod inode;
 // helper inside, since nothing uses them outside of tests.
 #[cfg(any(target_os = "macos", test))]
 pub mod nfs_adapter;
-mod yak_fs;
+mod kiki_fs;
 
 // Re-exports kept tight: only the symbols `vfs_mgr.rs` and `service.rs`
 // need at the crate root. The full per-module surface is reachable via
@@ -37,11 +37,11 @@ pub use fuse_adapter::FuseAdapter;
 pub use inode::ROOT_INODE;
 #[cfg(target_os = "macos")]
 pub use nfs_adapter::NfsAdapter;
-pub use yak_fs::{FsError, JjYakFs, YakFs};
+pub use kiki_fs::{FsError, JjKikiFs, KikiFs};
 // `FileKind` is consumed only by tests today (the M10 §10.6 service-
 // level read-through tests that walk a `readdir` result for a kind
 // assertion). Re-exported under `cfg(test)` so production builds
 // don't see an "unused import" warning while keeping the symbol
 // reachable from the existing `crate::vfs::FileKind` import path.
 #[cfg(test)]
-pub use yak_fs::FileKind;
+pub use kiki_fs::FileKind;

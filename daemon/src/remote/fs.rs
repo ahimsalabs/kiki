@@ -67,7 +67,7 @@ impl FsRemoteStore {
 /// The lock is **advisory** — well-behaved peers using the same flock
 /// see the contention; rogue processes that bypass it can still race.
 /// All M10 backends go through this code path, so the contract holds
-/// for the intended use case (multiple `jj-yak` daemons sharing a
+/// for the intended use case (multiple `kiki` daemons sharing a
 /// remote dir).
 struct RefsLock {
     file: fs::File,

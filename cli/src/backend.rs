@@ -24,7 +24,7 @@ const COMMIT_ID_LENGTH: usize = 32;
 const CHANGE_ID_LENGTH: usize = 16;
 
 #[derive(Debug)]
-pub struct YakBackend {
+pub struct KikiBackend {
     client: BlockingJujutsuInterfaceClient,
     /// Stamped on every store RPC so the daemon can route to the right
     /// per-mount Store. Derived from `store_path` per the jj convention
@@ -35,9 +35,9 @@ pub struct YakBackend {
     empty_tree_id: TreeId,
 }
 
-impl YakBackend {
+impl KikiBackend {
     pub const fn name() -> &'static str {
-        "yak"
+        "kiki"
     }
 
     pub fn new(settings: &UserSettings, store_path: &Path) -> Result<Self, BackendInitError> {
@@ -62,7 +62,7 @@ impl YakBackend {
                 .tree_id,
         );
 
-        Ok(YakBackend {
+        Ok(KikiBackend {
             client,
             working_copy_path,
             root_commit_id,
@@ -116,7 +116,7 @@ fn derive_working_copy_path(
 }
 
 #[async_trait]
-impl Backend for YakBackend {
+impl Backend for KikiBackend {
     fn name(&self) -> &str {
         Self::name()
     }
@@ -206,22 +206,22 @@ impl Backend for YakBackend {
         Ok(SymlinkId::new(id.symlink_id))
     }
 
-    // Copy tracking is not supported by yak yet.
+    // Copy tracking is not supported by kiki yet.
     async fn read_copy(&self, _id: &CopyId) -> BackendResult<CopyHistory> {
         Err(BackendError::Unsupported(
-            "yak backend does not support copy tracking".into(),
+            "kiki backend does not support copy tracking".into(),
         ))
     }
 
     async fn write_copy(&self, _contents: &CopyHistory) -> BackendResult<CopyId> {
         Err(BackendError::Unsupported(
-            "yak backend does not support copy tracking".into(),
+            "kiki backend does not support copy tracking".into(),
         ))
     }
 
     async fn get_related_copies(&self, _copy_id: &CopyId) -> BackendResult<Vec<RelatedCopy>> {
         Err(BackendError::Unsupported(
-            "yak backend does not support copy tracking".into(),
+            "kiki backend does not support copy tracking".into(),
         ))
     }
 
@@ -280,7 +280,7 @@ impl Backend for YakBackend {
         commit: Commit,
         sign_with: Option<&mut SigningFn>,
     ) -> BackendResult<(CommitId, Commit)> {
-        // Yak does not yet support signing commits. Both invariants below would
+        // Kiki does not yet support signing commits. Both invariants below would
         // be programmer errors at the call site rather than user-facing failures.
         assert!(commit.secure_sig.is_none(), "commit.secure_sig was set");
         assert!(sign_with.is_none(), "sign_with was set");
@@ -471,7 +471,7 @@ fn tree_to_proto(tree: &Tree) -> BackendResult<proto::jj_interface::Tree> {
 
 fn tree_value_to_proto(value: &TreeValue) -> BackendResult<proto::jj_interface::TreeValue> {
     let value = match value {
-        // Yak stores copy ids on tree entries, but the backend's copy-history
+        // Kiki stores copy ids on tree entries, but the backend's copy-history
         // APIs still report Unsupported until the daemon has real copy objects.
         TreeValue::File {
             id,
@@ -486,7 +486,7 @@ fn tree_value_to_proto(value: &TreeValue) -> BackendResult<proto::jj_interface::
         TreeValue::Tree(id) => proto::jj_interface::tree_value::Value::TreeId(id.to_bytes()),
         TreeValue::GitSubmodule(_) => {
             return Err(BackendError::Unsupported(
-                "yak backend does not support git submodules".into(),
+                "kiki backend does not support git submodules".into(),
             ));
         }
     };
@@ -534,13 +534,13 @@ fn tree_value_from_proto(proto: proto::jj_interface::TreeValue) -> BackendResult
             TreeValue::Symlink(SymlinkId::new(id))
         }
         // jj-lib 0.40 dropped TreeValue::Conflict from the trait surface; the
-        // wire type still carries it for legacy data, but yak should never
+        // wire type still carries it for legacy data, but kiki should never
         // round-trip it. Surface this as Unsupported instead of crashing so
         // existing daemon data containing legacy conflict objects fails the
         // single read rather than aborting the CLI.
         proto::jj_interface::tree_value::Value::ConflictId(_) => {
             return Err(BackendError::Unsupported(
-                "yak backend: stored conflict_id is no longer supported by jj-lib 0.40".into(),
+                "kiki backend: stored conflict_id is no longer supported by jj-lib 0.40".into(),
             ));
         }
     })

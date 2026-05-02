@@ -1,7 +1,7 @@
 //! VFS manager — owns transport-specific mount logistics.
 //!
 //! Production flow at M4: `JujutsuService::initialize` builds a per-mount
-//! `Arc<dyn JjYakFs>` and asks the manager to attach it to a kernel mount
+//! `Arc<dyn JjKikiFs>` and asks the manager to attach it to a kernel mount
 //! (Linux: `fuse3` via the `fusermount3` setuid helper; macOS: `nfsserve`
 //! over a localhost port that the CLI then `mount_nfs`es). Each `bind`
 //! returns both a [`TransportInfo`] for the wire and a [`MountAttachment`]
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::vfs::JjYakFs;
+use crate::vfs::JjKikiFs;
 #[cfg(target_os = "linux")]
 use crate::vfs::FuseAdapter;
 #[cfg(target_os = "macos")]
@@ -110,7 +110,7 @@ pub enum BindError {
 /// shutdown), surfacing as `BindError::ManagerGone` on the caller side.
 struct BindRequest {
     working_copy_path: String,
-    fs: Arc<dyn JjYakFs>,
+    fs: Arc<dyn JjKikiFs>,
     response: oneshot::Sender<Result<(TransportInfo, MountAttachment), BindError>>,
 }
 
@@ -138,7 +138,7 @@ impl VfsManagerHandle {
     pub async fn bind(
         &self,
         working_copy_path: String,
-        fs: Arc<dyn JjYakFs>,
+        fs: Arc<dyn JjKikiFs>,
     ) -> Result<(TransportInfo, MountAttachment), BindError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -186,7 +186,7 @@ impl VfsManager {
     async fn handle_bind(
         &self,
         working_copy_path: &str,
-        fs: Arc<dyn JjYakFs>,
+        fs: Arc<dyn JjKikiFs>,
     ) -> Result<(TransportInfo, MountAttachment), BindError> {
         #[cfg(target_os = "linux")]
         {
@@ -207,7 +207,7 @@ impl VfsManager {
     async fn bind_fuse(
         &self,
         working_copy_path: &str,
-        fs: Arc<dyn JjYakFs>,
+        fs: Arc<dyn JjKikiFs>,
     ) -> Result<(TransportInfo, MountAttachment), BindError> {
         use fuse3::raw::Session;
         use fuse3::MountOptions;
@@ -216,8 +216,8 @@ impl VfsManager {
         let mut opts = MountOptions::default();
         // `fs_name` shows up in /proc/self/mountinfo; pick something
         // identifiable so users (and us during debugging) can tell which
-        // mount belongs to yak.
-        opts.fs_name("yak").read_only(false);
+        // mount belongs to kiki.
+        opts.fs_name("kiki").read_only(false);
         let session = Session::new(opts);
         let path = Path::new(working_copy_path);
         let handle = session
@@ -232,7 +232,7 @@ impl VfsManager {
     async fn bind_nfs(
         &self,
         working_copy_path: &str,
-        fs: Arc<dyn JjYakFs>,
+        fs: Arc<dyn JjKikiFs>,
     ) -> Result<(TransportInfo, MountAttachment), BindError> {
         use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 

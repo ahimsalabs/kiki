@@ -2,12 +2,12 @@
 //! share a `dir://` remote and serialize op-heads advances through
 //! the catalog rather than silently clobbering.
 //!
-//! Each `jj yak init` issues two `update_op_heads` calls against the
+//! Each `jj kk init` issues two `update_op_heads` calls against the
 //! catalog: first to register the root_operation_id, then again
 //! during `init_working_copy` to advance from root_op → "add
 //! workspace 'default'" op. With a shared remote, the second CLI's
 //! create-only CAS conflicts with the first CLI's already-written
-//! ref; the `YakOpHeadsStore` retry loop reads the actual value and
+//! ref; the `KikiOpHeadsStore` retry loop reads the actual value and
 //! re-CASes against it, ending with a catalog that contains *both*
 //! workspace ops as divergent heads. Divergence is fine — that's
 //! what `resolve_op_heads` is for; the M10.5 property under test is
@@ -22,7 +22,7 @@ use std::path::Path;
 
 use crate::common::TestEnvironment;
 
-/// Decode the wire format `YakOpHeadsStore` writes:
+/// Decode the wire format `KikiOpHeadsStore` writes:
 /// `[u32 BE len][bytes]` repeated until end of buffer.
 /// Returns the decoded op-id byte vectors.
 fn decode_op_heads(buf: &[u8]) -> Vec<Vec<u8>> {
@@ -77,13 +77,13 @@ fn two_clis_serialize_op_heads_via_shared_dir_remote() {
     // Shared remote dir lives outside either env so neither's `Drop`
     // tears it down prematurely. Canonicalize so the daemon's
     // `working_copy_path` lookup matches across the two daemons.
-    let remote_tmp = tempfile::TempDir::with_prefix("yak-shared-remote").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("kiki-shared-remote").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 
     // CLI A goes first: empty catalog → catalog has {A's workspace op}.
     let (_stdout_a, stderr_a) =
-        env_a.jj_cmd_ok(env_a.env_root(), &["yak", "init", &remote_url, "repo_a"]);
+        env_a.jj_cmd_ok(env_a.env_root(), &["kk", "init", &remote_url, "repo_a"]);
     insta::assert_snapshot!(stderr_a, @r#"Initialized repo in "repo_a""#);
 
     // CLI B comes second: catalog already has A's op-head. Each
@@ -96,7 +96,7 @@ fn two_clis_serialize_op_heads_via_shared_dir_remote() {
     // either spin past MAX_RETRIES, clobber A's head silently, or
     // surface a daemon-side error.
     let (_stdout_b, stderr_b) =
-        env_b.jj_cmd_ok(env_b.env_root(), &["yak", "init", &remote_url, "repo_b"]);
+        env_b.jj_cmd_ok(env_b.env_root(), &["kk", "init", &remote_url, "repo_b"]);
     insta::assert_snapshot!(stderr_b, @r#"Initialized repo in "repo_b""#);
 
     // Inspect the shared remote directly. The format matches
@@ -115,7 +115,7 @@ fn two_clis_serialize_op_heads_via_shared_dir_remote() {
     // Each entry should be a valid jj-lib op-id (64 bytes for
     // blake2b). Anything other than 64 bytes here would mean we
     // serialized garbage, or the wire format drifted from the
-    // YakOpHeadsStore encoder.
+    // KikiOpHeadsStore encoder.
     for (i, id) in op_heads.iter().enumerate() {
         assert_eq!(
             id.len(),
@@ -141,12 +141,12 @@ fn two_clis_serialize_op_heads_via_shared_dir_remote() {
 #[test]
 fn one_cli_writes_op_heads_to_shared_dir_remote() {
     let env = TestEnvironment::default();
-    let remote_tmp = tempfile::TempDir::with_prefix("yak-shared-remote-single").unwrap();
+    let remote_tmp = tempfile::TempDir::with_prefix("kiki-shared-remote-single").unwrap();
     let remote_path = remote_tmp.path().canonicalize().unwrap();
     let remote_url = format!("dir://{}", remote_path.display());
 
     let (_stdout, stderr) =
-        env.jj_cmd_ok(env.env_root(), &["yak", "init", &remote_url, "repo"]);
+        env.jj_cmd_ok(env.env_root(), &["kk", "init", &remote_url, "repo"]);
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo""#);
 
     let op_heads = read_remote_op_heads(&remote_path);

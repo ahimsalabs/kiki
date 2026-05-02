@@ -20,7 +20,7 @@ use crate::remote::{self, BlobKind, RemoteStore};
 use crate::store::Store;
 use crate::ty;
 use crate::ty::TreeEntry;
-use crate::vfs::{FsError, JjYakFs, YakFs};
+use crate::vfs::{FsError, JjKikiFs, KikiFs};
 use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle};
 
 /// Where per-mount redb files live. Production runs are always
@@ -219,7 +219,7 @@ async fn validate_op_store_blob_id(
 /// the daemon needs to answer working-copy and store RPCs for one mount.
 ///
 /// `op_id` and `workspace_id` start empty after `Initialize`; the CLI fills
-/// them in via `SetCheckoutState` once `YakWorkingCopy::init` runs (M2).
+/// them in via `SetCheckoutState` once `KikiWorkingCopy::init` runs (M2).
 /// `root_tree_id` defaults to the store's empty tree until a real check-out
 /// lands (M5).
 ///
@@ -266,7 +266,7 @@ struct Mount {
     /// Per-mount filesystem. The same `Arc` is handed to the VFS bind so
     /// kernel I/O hits this object; we keep a clone here so RPCs that
     /// mutate the mount (today: `CheckOut`) can drive it directly.
-    fs: Arc<dyn JjYakFs>,
+    fs: Arc<dyn JjKikiFs>,
     /// Holds the kernel mount alive. `None` only in the test path where
     /// `JujutsuService::bare` constructed a service without a
     /// `VfsManagerHandle`. Production `Initialize` always populates it.
@@ -386,11 +386,11 @@ impl JujutsuService {
         // operator can prune the broken mount dir.
         let remote_store = remote::parse(&meta.remote)
             .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
-        // M10 §10.6: hand the remote into `YakFs` too, so FUSE-side
+        // M10 §10.6: hand the remote into `KikiFs` too, so FUSE-side
         // reads on a `StoreMiss` fall through to the remote the same
         // way M9's RPC-layer reads already do.
-        let fs: Arc<dyn JjYakFs> =
-            Arc::new(YakFs::new(store.clone(), root_tree_id, remote_store.clone()));
+        let fs: Arc<dyn JjKikiFs> =
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone()));
 
         // The previous daemon's FUSE/NFS mount went away when its
         // process exited (kernel drops the mount). On restart the path
@@ -446,12 +446,12 @@ impl JujutsuService {
         }
     }
 
-    /// Test-only access to a mount's per-mount `JjYakFs`. Used to drive
+    /// Test-only access to a mount's per-mount `JjKikiFs`. Used to drive
     /// VFS write ops directly from service-level tests without going
     /// through a real FUSE/NFS adapter — e.g. to seed a dirty file, then
     /// confirm the `Snapshot` RPC turns it into a real tree id.
     #[cfg(test)]
-    async fn fs_for_test(&self, path: &str) -> Option<Arc<dyn JjYakFs>> {
+    async fn fs_for_test(&self, path: &str) -> Option<Arc<dyn JjKikiFs>> {
         let mounts = self.mounts.lock().await;
         mounts.get(path).map(|m| m.fs.clone())
     }
@@ -503,7 +503,7 @@ fn validate_mountpoint(path: &str) -> Result<(), MountpointError> {
 /// already mounted.
 ///
 /// Edge case: if `path` is a filesystem root (no parent), treat it as
-/// already mounted. We don't expect anyone to `jj yak init /` but the
+/// already mounted. We don't expect anyone to `jj kk init /` but the
 /// conservative answer keeps the validator from accepting it.
 fn is_mountpoint(path: &Path) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
@@ -647,7 +647,7 @@ async fn catalog_for(
 // `not_found` — preserves pre-M9 behavior.
 //
 // M10 §10.6 factored the fetch+verify+persist dance out of this module
-// so `vfs/yak_fs.rs` can share the implementation. The wrapper here
+// so `vfs/kiki_fs.rs` can share the implementation. The wrapper here
 // translates the typed `FetchError` onto gRPC `Status` codes — keeping
 // `data_loss` distinct from generic `internal` is a real wire-side
 // signal (corrupt peer, not a transient I/O hiccup).
@@ -720,7 +720,7 @@ async fn fetch_commit_through_remote(
 
 // ---- Layer C / M9 post-snapshot push ---------------------------------
 //
-// After `JjYakFs::snapshot` produces the new root, walk every reachable
+// After `JjKikiFs::snapshot` produces the new root, walk every reachable
 // blob and push the ones the remote doesn't already have. Idempotent
 // across snapshots: `has_blob` short-circuits the second-and-later visit
 // for unchanged subtrees.
@@ -762,7 +762,7 @@ async fn push_reachable_blobs(
                     push_blob_if_missing(store, remote, BlobKind::Symlink, id).await?;
                 }
                 TreeEntry::ConflictId(_) => {
-                    // Not reachable from a `JjYakFs`-produced snapshot
+                    // Not reachable from a `JjKikiFs`-produced snapshot
                     // tree (the FS only emits TreeId/File/SymlinkId).
                     // Conflict objects, when they appear, ride on the
                     // commit-side write-through path instead. Skip.
@@ -852,11 +852,11 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // the disable_mount test path the `Mount` keeps an `fs` so
         // mutating RPCs work end-to-end without the kernel.
         //
-        // M10 §10.6: the remote is threaded into `YakFs` too — kernel
+        // M10 §10.6: the remote is threaded into `KikiFs` too — kernel
         // reads on local-store miss fall through the same way the M9
         // RPC layer already does at `service.rs`.
-        let fs: Arc<dyn JjYakFs> =
-            Arc::new(YakFs::new(store.clone(), root_tree_id, remote_store.clone()));
+        let fs: Arc<dyn JjKikiFs> =
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone()));
 
         // Production path validates and binds; test path skips both so
         // unit tests can use arbitrary string paths.
@@ -923,7 +923,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         _request: Request<DaemonStatusReq>,
     ) -> Result<Response<DaemonStatusReply>, Status> {
         let mounts = self.mounts.lock().await;
-        // Sort by path so output is deterministic — `yak status` is
+        // Sort by path so output is deterministic — `kk status` is
         // user-facing and `HashMap` iteration order is not.
         let mut data: Vec<_> = mounts
             .values()
@@ -1198,7 +1198,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
     // ---- M10.6: op-store RPCs ----------------------------------------
     //
     // The daemon stores and forwards opaque bytes; serialization and
-    // content-hashing happen on the CLI side (YakOpStore). Write-
+    // content-hashing happen on the CLI side (KikiOpStore). Write-
     // through pushes to the remote inline; read-through falls back to
     // the remote on local miss (same shape as the blob handlers above).
 
@@ -1404,7 +1404,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // `op_id`/`workspace_id` start empty after `Initialize`. Surfacing
         // that as `failed_precondition` keeps the contract crisp: the CLI
         // must call `SetCheckoutState` first (which it does inside
-        // `YakWorkingCopy::init`).
+        // `KikiWorkingCopy::init`).
         if mount.op_id.is_empty() && mount.workspace_id.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "checkout state not yet set for {}",
@@ -1477,7 +1477,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         })?;
         info!(path = %req.working_copy_path, tree_id = %hex(&new_root), "Snapshot");
 
-        // M9 §13.2: blobs written through `JjYakFs::snapshot_node`
+        // M9 §13.2: blobs written through `JjKikiFs::snapshot_node`
         // bypass the RPC handlers, so we walk the rolled-up tree and
         // push every reachable blob the remote doesn't already have.
         // Synchronous push: `Snapshot` blocks until durable. The walk
@@ -1536,7 +1536,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         info!(path = %req.working_copy_path, tree_id = %hex(&new_tree_id), "CheckOut");
 
         // Clone the per-mount fs handle out from under the lock so the
-        // (potentially I/O-heavy) `JjYakFs::check_out` call doesn't hold
+        // (potentially I/O-heavy) `JjKikiFs::check_out` call doesn't hold
         // it. Mirrors how `store_for` works.
         let fs = {
             let mounts = self.mounts.lock().await;
@@ -1782,8 +1782,8 @@ mod tests {
         assert_eq!(root_merge_commit, commit);
     }
 
-    /// Walk through the lifecycle exercised by `jj yak init` followed by
-    /// `YakWorkingCopy::init` (M2): Initialize → SetCheckoutState →
+    /// Walk through the lifecycle exercised by `jj kk init` followed by
+    /// `KikiWorkingCopy::init` (M2): Initialize → SetCheckoutState →
     /// GetCheckoutState → GetTreeState → Snapshot. Catches plumbing
     /// regressions in the per-mount state map.
     #[tokio::test]
@@ -1803,7 +1803,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
         // GetTreeState before any check-out returns the empty tree id —
-        // this is what lets `YakWorkingCopy::tree()` succeed on a fresh
+        // this is what lets `KikiWorkingCopy::tree()` succeed on a fresh
         // mount.
         let empty = svc
             .get_empty_tree_id(Request::new(GetEmptyTreeIdReq {
@@ -1846,7 +1846,7 @@ mod tests {
 
         // Snapshot of an unmodified mount returns the existing root
         // (empty here since nothing has been written through the VFS).
-        // M6 made Snapshot drive `JjYakFs::snapshot`, but that walk is a
+        // M6 made Snapshot drive `JjKikiFs::snapshot`, but that walk is a
         // no-op on a clean mount.
         let snap = svc
             .snapshot(Request::new(SnapshotReq {
@@ -1979,7 +1979,7 @@ mod tests {
     /// CheckOut updates `Mount.root_tree_id` and the per-mount FS so
     /// subsequent `GetTreeState` / `Snapshot` reads see the new root,
     /// and rejects unknown tree ids cleanly. This is the wire-side
-    /// contract `LockedYakWorkingCopy::check_out` depends on.
+    /// contract `LockedKikiWorkingCopy::check_out` depends on.
     #[tokio::test]
     async fn check_out_updates_root_tree_and_validates_input() {
         let svc = JujutsuService::bare();
@@ -2095,7 +2095,7 @@ mod tests {
     }
 
     /// End-to-end M6 Snapshot RPC: drive a write through the per-mount
-    /// `JjYakFs`, then call `Snapshot` and confirm the daemon both
+    /// `JjKikiFs`, then call `Snapshot` and confirm the daemon both
     /// returns the new root tree id and stamps it on `Mount.root_tree_id`
     /// (so subsequent `GetTreeState` agrees).
     #[tokio::test]
@@ -2168,7 +2168,7 @@ mod tests {
         #[test]
         fn rejects_missing() {
             let err =
-                validate_mountpoint("/definitely/does/not/exist/jjyak").expect_err("missing");
+                validate_mountpoint("/definitely/does/not/exist/jjkiki").expect_err("missing");
             assert_matches::assert_matches!(err, MountpointError::Missing(_));
         }
 
@@ -2206,7 +2206,7 @@ mod tests {
     async fn persisted_mount_rehydrates_after_restart() {
         let storage_dir = tempfile::tempdir().expect("storage tempdir");
         let remote_dir = tempfile::tempdir().expect("remote tempdir");
-        let mount_path = "/tmp/yak-rehydrate-test";
+        let mount_path = "/tmp/kiki-rehydrate-test";
         let remote_url = format!("dir://{}", remote_dir.path().display());
 
         // Phase 1: initialize and stamp some checkout state into the
@@ -2461,7 +2461,7 @@ mod tests {
 
     /// Snapshot pushes every reachable blob from the new root tree to
     /// the remote (M9 §13.2 post-snapshot walk). Drives a write through
-    /// the per-mount `JjYakFs`, calls `Snapshot`, and verifies the file
+    /// the per-mount `JjKikiFs`, calls `Snapshot`, and verifies the file
     /// blob *and* the rolled-up tree blob both land on the remote.
     #[tokio::test]
     async fn snapshot_pushes_reachable_blobs_to_remote() {
@@ -2626,14 +2626,14 @@ mod tests {
     /// End-to-end FUSE-side read-through: service A populates a remote
     /// (write-through + post-snapshot push); service B initialised
     /// with the same remote but an empty local store can `lookup` /
-    /// `read` through B's `JjYakFs` and get the right content via
-    /// the lazy remote fetch in `vfs/yak_fs.rs`.
+    /// `read` through B's `JjKikiFs` and get the right content via
+    /// the lazy remote fetch in `vfs/kiki_fs.rs`.
     ///
     /// This is the M10 analog of M9's
     /// `read_file_falls_back_to_remote_on_local_miss`, but exercising
     /// the FS layer rather than the RPC layer. Pre-M10 this test
     /// would fail at `lookup` / `getattr` / `read` with EIO because
-    /// `vfs/yak_fs.rs::read_*` mapped `StoreMiss` straight to that;
+    /// `vfs/kiki_fs.rs::read_*` mapped `StoreMiss` straight to that;
     /// now those helpers fall through to `RemoteStore::get_blob`.
     #[tokio::test]
     async fn fuse_layer_reads_through_remote_on_local_miss() {
@@ -2668,7 +2668,7 @@ mod tests {
 
         // Service B: separate storage_dir (so the tree+file blobs
         // genuinely aren't local), shares the same remote. Tell it
-        // to check out A's tree id; B's `JjYakFs::check_out` calls
+        // to check out A's tree id; B's `JjKikiFs::check_out` calls
         // `read_tree` which must fall through to the remote.
         let svc_b = JujutsuService::bare();
         init_mount_with_remote(&svc_b, "/tmp/b", &remote_url).await;
@@ -2703,7 +2703,7 @@ mod tests {
     }
 
     /// Negative case: with no remote configured, a `StoreMiss`
-    /// against `JjYakFs::check_out` still surfaces as the expected
+    /// against `JjKikiFs::check_out` still surfaces as the expected
     /// failed_precondition (tree not in store), preserving pre-M10
     /// behavior for mounts without a Layer-C remote.
     #[tokio::test]

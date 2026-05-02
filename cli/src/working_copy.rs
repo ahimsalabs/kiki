@@ -44,9 +44,9 @@ fn path_to_str(path: &Path) -> Result<&str, WorkingCopyStateError> {
     })
 }
 
-pub struct YakWorkingCopyFactory {}
+pub struct KikiWorkingCopyFactory {}
 
-impl WorkingCopyFactory for YakWorkingCopyFactory {
+impl WorkingCopyFactory for KikiWorkingCopyFactory {
     fn init_working_copy(
         &self,
         store: Arc<Store>,
@@ -56,7 +56,7 @@ impl WorkingCopyFactory for YakWorkingCopyFactory {
         workspace_name: WorkspaceNameBuf,
         settings: &UserSettings,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
-        Ok(Box::new(YakWorkingCopy::init(
+        Ok(Box::new(KikiWorkingCopy::init(
             store,
             working_copy_path,
             operation_id,
@@ -72,7 +72,7 @@ impl WorkingCopyFactory for YakWorkingCopyFactory {
         _state_path: PathBuf,
         settings: &UserSettings,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
-        Ok(Box::new(YakWorkingCopy::load(
+        Ok(Box::new(KikiWorkingCopy::load(
             store,
             working_copy_path,
             settings,
@@ -80,13 +80,13 @@ impl WorkingCopyFactory for YakWorkingCopyFactory {
     }
 }
 
-/// The "all files" sparse pattern. Yak doesn't support sparse
+/// The "all files" sparse pattern. Kiki doesn't support sparse
 /// checkouts — the daemon always materializes the full tree — so
 /// this is the only pattern we ever return.
 static FULL_SPARSE: std::sync::LazyLock<Vec<RepoPathBuf>> =
     std::sync::LazyLock::new(|| vec![RepoPathBuf::root()]);
 
-pub struct YakWorkingCopy {
+pub struct KikiWorkingCopy {
     store: Arc<Store>,
     working_copy_path: PathBuf,
     client: BlockingJujutsuInterfaceClient,
@@ -95,22 +95,22 @@ pub struct YakWorkingCopy {
     tree_state: OnceCell<MergedTree>,
 }
 
-impl YakWorkingCopy {
+impl KikiWorkingCopy {
     pub fn name() -> &'static str {
-        "yak"
+        "kiki"
     }
 
     fn connect_client(
         settings: &UserSettings,
     ) -> Result<BlockingJujutsuInterfaceClient, WorkingCopyStateError> {
-        // Pull the daemon port from user settings (matches YakBackend); the
+        // Pull the daemon port from user settings (matches KikiBackend); the
         // integration test harness assigns a random port per env, so this
         // must not be hardcoded.
         let grpc_port = settings
             .get::<usize>("grpc_port")
             .map_err(|e| wc_state_err("grpc_port not configured", e))?;
         BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
-            .map_err(|e| wc_state_err("failed to connect to yak daemon", e))
+            .map_err(|e| wc_state_err("failed to connect to kiki daemon", e))
     }
 
     fn init(
@@ -131,7 +131,7 @@ impl YakWorkingCopy {
                 }),
             })
             .map_err(|e| wc_state_err("daemon SetCheckoutState failed", e))?;
-        Ok(YakWorkingCopy {
+        Ok(KikiWorkingCopy {
             store,
             working_copy_path,
             client,
@@ -149,7 +149,7 @@ impl YakWorkingCopy {
         // need to handle them.
         let _ = path_to_str(&working_copy_path)?;
         let client = Self::connect_client(settings)?;
-        Ok(YakWorkingCopy {
+        Ok(KikiWorkingCopy {
             store,
             working_copy_path,
             client,
@@ -166,7 +166,7 @@ struct CheckoutState {
     workspace_name: WorkspaceNameBuf,
 }
 
-impl YakWorkingCopy {
+impl KikiWorkingCopy {
     fn get_tree(&self) -> Result<&MergedTree, WorkingCopyStateError> {
         if self.tree_state.get().is_none() {
             let path_str = path_to_str(&self.working_copy_path)?.to_string();
@@ -249,7 +249,7 @@ struct DaemonLock {
 }
 impl DaemonLock {
     fn lock_path(working_copy_path: &Path) -> PathBuf {
-        working_copy_path.join(".jj").join("working_copy").join("yak.lock")
+        working_copy_path.join(".jj").join("working_copy").join("kiki.lock")
     }
 
     pub fn new(working_copy_path: &Path) -> Result<Self, WorkingCopyStateError> {
@@ -282,7 +282,7 @@ impl DaemonLock {
     }
 }
 
-impl WorkingCopy for YakWorkingCopy {
+impl WorkingCopy for KikiWorkingCopy {
     fn name(&self) -> &str {
         Self::name()
     }
@@ -316,7 +316,7 @@ impl WorkingCopy for YakWorkingCopy {
     fn start_mutation(&self) -> Result<Box<dyn LockedWorkingCopy>, WorkingCopyStateError> {
         info!("Starting mutation");
         let lock = self.get_working_copy_lock()?;
-        let wc = YakWorkingCopy {
+        let wc = KikiWorkingCopy {
             client: self.client.clone(),
             store: self.store.clone(),
             working_copy_path: self.working_copy_path.clone(),
@@ -328,7 +328,7 @@ impl WorkingCopy for YakWorkingCopy {
         // surprise panics.
         let old_operation_id = wc.get_checkout_state()?.operation_id.clone();
         let _ = wc.get_tree()?;
-        Ok(Box::new(LockedYakWorkingCopy {
+        Ok(Box::new(LockedKikiWorkingCopy {
             wc,
             lock,
             old_operation_id,
@@ -336,15 +336,15 @@ impl WorkingCopy for YakWorkingCopy {
     }
 }
 
-struct LockedYakWorkingCopy {
-    wc: YakWorkingCopy,
+struct LockedKikiWorkingCopy {
+    wc: KikiWorkingCopy,
     #[allow(dead_code)]
     lock: DaemonLock,
     old_operation_id: OperationId,
 }
 
 #[async_trait]
-impl LockedWorkingCopy for LockedYakWorkingCopy {
+impl LockedWorkingCopy for LockedKikiWorkingCopy {
     fn old_operation_id(&self) -> &OperationId {
         &self.old_operation_id
     }
@@ -373,7 +373,7 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
     }
 
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError> {
-        // Yak only supports unconflicted checkouts today: the daemon's
+        // Kiki only supports unconflicted checkouts today: the daemon's
         // VFS roots at a single tree id, so a Merge<TreeId> with
         // multiple terms has no obvious materialization. Conflict
         // rendering pairs with the conflict UI work — punt for now and
@@ -381,7 +381,7 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
         let new_tree = commit.tree();
         let resolved_tree_id = new_tree.tree_ids().as_resolved().ok_or_else(|| {
             CheckoutError::Other {
-                message: "yak: checking out a conflicted tree is not yet supported".into(),
+                message: "kiki: checking out a conflicted tree is not yet supported".into(),
                 err: std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "conflicted MergedTree",
@@ -423,13 +423,13 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
 
     async fn reset(&mut self, commit: &Commit) -> Result<(), ResetError> {
         // `reset` re-roots the working copy at the given commit's tree,
-        // discarding any pending mutations. For yak this is the same
+        // discarding any pending mutations. For kiki this is the same
         // operation as `check_out`: tell the daemon to swap the VFS
         // root tree.
         let new_tree = commit.tree();
         let resolved_tree_id = new_tree.tree_ids().as_resolved().ok_or_else(|| {
             ResetError::Other {
-                message: "yak: resetting to a conflicted tree is not yet supported".into(),
+                message: "kiki: resetting to a conflicted tree is not yet supported".into(),
                 err: std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "conflicted MergedTree",
@@ -461,7 +461,7 @@ impl LockedWorkingCopy for LockedYakWorkingCopy {
         _new_sparse_patterns: Vec<RepoPathBuf>,
     ) -> Result<CheckoutStats, CheckoutError> {
         Err(CheckoutError::Other {
-            message: "yak: sparse checkouts are not supported".into(),
+            message: "kiki: sparse checkouts are not supported".into(),
             err: std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "sparse patterns",
@@ -521,6 +521,6 @@ mod tests {
     #[test]
     fn daemon_lock_path_stays_in_jj_working_copy_dir() {
         let path = DaemonLock::lock_path(Path::new("/tmp/repo"));
-        assert_eq!(path, Path::new("/tmp/repo/.jj/working_copy/yak.lock"));
+        assert_eq!(path, Path::new("/tmp/repo/.jj/working_copy/kiki.lock"));
     }
 }

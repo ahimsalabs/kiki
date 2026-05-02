@@ -7,7 +7,7 @@
 //! (op heads, branch tips). When a mount has a remote configured the
 //! catalog naturally lives on the remote — that's the whole point.
 //! When a mount has no remote (single-daemon case), refs need to live
-//! *somewhere* so the CLI's [`YakOpHeadsStore`] (jj-lib's `OpHeadsStore`
+//! *somewhere* so the CLI's [`KikiOpHeadsStore`] (jj-lib's `OpHeadsStore`
 //! impl that drives the catalog) sees a working API regardless.
 //!
 //! `LocalRefs` is that "somewhere": a single redb table inside the

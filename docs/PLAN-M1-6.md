@@ -1,4 +1,4 @@
-# jj-yak: Archive — M1 through M6
+# kiki: Archive — M1 through M6
 
 This document is the archived implementation log for milestones M1–M6.
 The main roadmap lives in [`PLAN.md`](./PLAN.md); this file preserves the
@@ -39,7 +39,7 @@ Plumbing now in place:
   remote backends in Layer C.
 - `DaemonStatus` now sorts entries by path so output is deterministic.
 
-`transport: TransportHandle` and `fs: Arc<JjYakFs>` from the original sketch
+`transport: TransportHandle` and `fs: Arc<JjKikiFs>` from the original sketch
 were dropped from the M1 struct — they belong to M3/M4 and have no
 consumer yet. Field types match the proto wire format directly (`Vec<u8>`
 for `bytes`, `String` for `string`) so RPC handlers copy in/out without
@@ -55,25 +55,25 @@ still pass. WC-RPC coverage is in `service.rs` unit tests
 `duplicate_initialize_rejected`, `set_checkout_state_requires_initialize`)
 because the CLI doesn't yet call those RPCs — that path turns on at M2.
 
-The end-to-end `jj yak init` → `jj log` → `jj op log` op_id round-trip
+The end-to-end `jj kk init` → `jj log` → `jj op log` op_id round-trip
 test moves to M2's scope: it's the natural smoke test once the factory
-flip routes `YakWorkingCopy::init` through `SetCheckoutState`.
+flip routes `KikiWorkingCopy::init` through `SetCheckoutState`.
 
-## M2 — Wire YakWorkingCopyFactory at init
+## M2 — Wire KikiWorkingCopyFactory at init
 
-Landed as `cli: M2 — route YakWorkingCopyFactory at workspace init` and
+Landed as `cli: M2 — route KikiWorkingCopyFactory at workspace init` and
 `cli/tests: add op_id round-trip smoke test`.
 
 `Workspace::init_with_factories` in `cli/src/main.rs` now passes
-`&YakWorkingCopyFactory {}` instead of a `LocalWorkingCopyFactory`
+`&KikiWorkingCopyFactory {}` instead of a `LocalWorkingCopyFactory`
 fallback. The `default_working_copy_factory()` helper and its
 `LocalWorkingCopyFactory` import are gone — the factory map registered in
 `main()` already covers the load path.
 
 End-to-end behaviour:
 
-- `jj yak init` → `Initialize` RPC → `Workspace::init_with_factories` →
-  `YakWorkingCopyFactory::init_working_copy` → `YakWorkingCopy::init` →
+- `jj kk init` → `Initialize` RPC → `Workspace::init_with_factories` →
+  `KikiWorkingCopyFactory::init_working_copy` → `KikiWorkingCopy::init` →
   `SetCheckoutState` RPC. The op id and workspace id flow into the
   daemon's per-mount `Mount`.
 - Subsequent commands (`jj log`, `jj op log`) call
@@ -87,12 +87,12 @@ wrote.
 **Tests that needed reslotting:** `test_repos_are_independent`,
 `test_nested_tree_round_trips`, `test_symlink_tree_round_trips` were green
 pre-flip only because `LocalWorkingCopyFactory` was masking the gap — they
-all call `jj new`, which routes through `LockedYakWorkingCopy::check_out`
+all call `jj new`, which routes through `LockedKikiWorkingCopy::check_out`
 (M5 `todo!`) or the VFS write path (M6). They are now `#[ignore =
 "needs M5/M6: …"]` with a milestone marker. §6 still owns moving them
 into `test_workingcopy.rs` once those milestones land. The plan
 originally implied `test_multiple_init` exercised `jj new`; it does not —
-only `yak status`. Corrected.
+only `kk status`. Corrected.
 
 **Other corrections folded in:** the original plan paragraph claimed
 "if anything breaks, that tells you something M1 missed." Nothing M1
@@ -101,23 +101,23 @@ are scoped to fill. Fix is documentary, not code.
 
 ## M3 — VFS read path
 
-Landed as `daemon: M3 — split vfs.rs into JjYakFs trait + NFS adapter`
+Landed as `daemon: M3 — split vfs.rs into JjKikiFs trait + NFS adapter`
 and `daemon: M3 — add fuse3 dep and FuseAdapter (Linux primary path)`.
 
 `daemon/src/vfs.rs` is now a directory:
 
 ```
 daemon/src/vfs/
-├── mod.rs            tight re-exports (NfsAdapter, FuseAdapter, JjYakFs, YakFs)
+├── mod.rs            tight re-exports (NfsAdapter, FuseAdapter, JjKikiFs, KikiFs)
 ├── inode.rs          monotonic u64 slab (188 LoC; 3 unit tests)
-├── yak_fs.rs         JjYakFs trait + concrete YakFs impl (483 LoC; 11 unit tests)
+├── kiki_fs.rs         JjKikiFs trait + concrete KikiFs impl (483 LoC; 11 unit tests)
 ├── nfs_adapter.rs    impl nfsserve::NFSFileSystem (313 LoC; 4 unit tests)
 └── fuse_adapter.rs   impl fuse3::raw::Filesystem (421 LoC; 5 unit tests)
 ```
 
-`JjYakFs` is read-only for M3 (`lookup`, `getattr`, `read`, `readdir`,
+`JjKikiFs` is read-only for M3 (`lookup`, `getattr`, `read`, `readdir`,
 `readlink`); mutations live on the adapters as ROFS / ENOSYS until
-M5/M6. Adapters wrap `Arc<dyn JjYakFs>`, dispatch to the trait, and
+M5/M6. Adapters wrap `Arc<dyn JjKikiFs>`, dispatch to the trait, and
 own only the wire-type conversions and protocol-specific quirks (NFS
 pagination cookies, FUSE `.`/`..` synthesis, errno-vs-nfsstat
 mapping).
@@ -132,12 +132,12 @@ or eviction yet; that has to coordinate with FUSE `forget` first.
 the FUSE adapter is built everywhere; only Linux will actually use
 it for a real mount (per §4.3). macOS keeps `nfsserve`.
 
-**Behaviour after M3:** in-memory only. The trait-level `YakFs` walks
+**Behaviour after M3:** in-memory only. The trait-level `KikiFs` walks
 the in-memory `Store`, but no real mount is wired up yet — `Bind`
 still isn't sent from the gRPC service. Trait + adapters are ready
 to feed `fuse3::Session::mount_with_unprivileged` (Linux) or
 `NFSTcpListener::bind` (macOS) the moment M4 plumbs them. The
-`vfs_mgr` stub now constructs a `YakFs` over an empty store rather
+`vfs_mgr` stub now constructs a `KikiFs` over an empty store rather
 than the old `VirtualFileSystem::default()` placeholder.
 
 **Decisions deferred:** the inode slab grows unbounded — eviction
@@ -157,7 +157,7 @@ daemon (29 → 34 daemon tests in total — a sizable chunk because
 the new modules pull in their own tests). The 3 M5/M6-ignored
 CLI integration tests remain ignored — M5 turns them on.
 
-## M4 — `jj yak init` actually mounts
+## M4 — `jj kk init` actually mounts
 
 Landed across `proto: M4 — wrap store RPCs in working_copy_path
 envelopes + transport oneof`, `daemon: M4 — per-mount Store +
@@ -178,14 +178,14 @@ Final scope (one delta from the original plan, called out below):
    owns `Arc<Store>`; the global `JujutsuService.store` is gone. Every
    store RPC (`Read*Req` / `Write*Req` / `GetEmptyTreeIdReq`) carries
    `working_copy_path` so the daemon can route to the right keyspace.
-   `YakBackend::working_copy_path` derives from `store_path` via the jj
+   `KikiBackend::working_copy_path` derives from `store_path` via the jj
    convention `<wc>/.jj/repo/store` (`cli/src/backend.rs:78-95`), and
    stamps it on every call. New unit test
    `mounts_are_isolated_by_path` writes a blob to `/tmp/a` and asserts
    it cannot be read back from `/tmp/b` — the per-mount Store's whole
    raison d'être.
 3. **`VfsManager` wiring** (`daemon/src/vfs_mgr.rs`). `Bind` payload now
-   carries `(working_copy_path, Arc<dyn JjYakFs>, oneshot::Sender)`;
+   carries `(working_copy_path, Arc<dyn JjKikiFs>, oneshot::Sender)`;
    the response is `Result<(TransportInfo, MountAttachment), BindError>`.
    Replaces the old `expect("NFS listener bind failed…")`. `MountAttachment`
    is platform-gated (`Fuse(MountHandle)` on Linux, `Nfs(NfsAttachment)` on
@@ -232,14 +232,14 @@ M6 will turn the flag off (and remove it once writes are reliable).
 integration tests pass; 3 stay `#[ignore]` waiting on M5/M6.
 
 **M4 done signal (verified manually):** with `disable_mount = false` on
-Linux, `jj yak init /tmp/r localhost` mounts a FUSE filesystem at
-`/tmp/r` (visible in `/proc/self/mountinfo` with `fs_name=yak`); `ls
+Linux, `jj kk init /tmp/r localhost` mounts a FUSE filesystem at
+`/tmp/r` (visible in `/proc/self/mountinfo` with `fs_name=kiki`); `ls
 /tmp/r` returns empty without erroring; `stat /tmp/r` reports a
-directory; re-running `jj yak init /tmp/r localhost` returns
-`FailedPrecondition` ("already a mountpoint"). End-to-end `jj yak init`
+directory; re-running `jj kk init /tmp/r localhost` returns
+`FailedPrecondition` ("already a mountpoint"). End-to-end `jj kk init`
 with `.jj/` scaffolding intact is M6's signal — the `disable_mount`
 flag exists exactly because M4 alone doesn't carry the writes that
-make `jj yak init` succeed end-to-end on a real mount.
+make `jj kk init` succeed end-to-end on a real mount.
 
 **Scope (actual):** ~1100 LoC net across `proto/jj_interface.proto`
 (rewritten: introduced `Read*Req` / `Write*Req` envelopes, oneof
@@ -254,22 +254,22 @@ oneof, `mount_nfs` shellout on macOS), `cli/tests/common/mod.rs`
 
 ## M5 — `check_out` writes files
 
-Landed as `daemon: M5 — CheckOut RPC + JjYakFs::check_out` and `cli: M5
-— call CheckOut from LockedYakWorkingCopy::check_out`.
+Landed as `daemon: M5 — CheckOut RPC + JjKikiFs::check_out` and `cli: M5
+— call CheckOut from LockedKikiWorkingCopy::check_out`.
 
 End-to-end shape:
 
-1. CLI: `LockedYakWorkingCopy::check_out` (`cli/src/working_copy.rs:339`)
+1. CLI: `LockedKikiWorkingCopy::check_out` (`cli/src/working_copy.rs:339`)
    pulls the resolved root `TreeId` out of `commit.tree()` and sends a
    `CheckOut` RPC.
 2. Proto: new `CheckOut(CheckOutReq) returns (CheckOutReply)`. Req carries
    `working_copy_path` + `new_tree_id`; reply is empty (reserved for
    added/updated/removed counts once M6 gives us a real tree-diff).
 3. Daemon: `JujutsuService::check_out` clones the per-mount
-   `Arc<dyn JjYakFs>` out from under the lock, then calls
-   `JjYakFs::check_out(new_tree_id)`. `Mount.root_tree_id` is updated
+   `Arc<dyn JjKikiFs>` out from under the lock, then calls
+   `JjKikiFs::check_out(new_tree_id)`. `Mount.root_tree_id` is updated
    only on success so the field never lies about what the kernel sees.
-4. `JjYakFs::check_out` (on `YakFs`): validates the tree exists in the
+4. `JjKikiFs::check_out` (on `KikiFs`): validates the tree exists in the
    per-mount `Store` (miss → `failed_precondition` "call WriteTree
    first") and re-roots the inode slab via `InodeSlab::swap_root`.
 5. `InodeSlab::swap_root` rewrites `ROOT_INODE`'s `NodeRef::Tree` and
@@ -279,8 +279,8 @@ End-to-end shape:
    per checkout; the slab is small per workspace, so we eat the cost.
 
 **Conflicted trees rejected.** `Commit::tree().tree_ids()` returns
-`Merge<TreeId>`. Yak only handles the resolved single-id case today;
-multi-term merges return `CheckoutError::Other` ("yak: checking out a
+`Merge<TreeId>`. Kiki only handles the resolved single-id case today;
+multi-term merges return `CheckoutError::Other` ("kiki: checking out a
 conflicted tree is not yet supported"). Conflict materialization
 pairs with the conflict UI work — punted, not a blocker for the next
 milestones.
@@ -305,8 +305,8 @@ of stale `getattr`/`lookup` after a `check_out`. Decide before turning
 decision 9.]
 
 **Tests:** +5 daemon unit tests (39 → 44):
-`vfs::yak_fs::check_out_swaps_visible_tree`,
-`vfs::yak_fs::check_out_unknown_tree_is_store_miss`,
+`vfs::kiki_fs::check_out_swaps_visible_tree`,
+`vfs::kiki_fs::check_out_unknown_tree_is_store_miss`,
 `vfs::inode::swap_root_updates_root_and_clears_reverse_cache`,
 `service::check_out_updates_root_tree_and_validates_input`,
 `service::check_out_without_mount_is_not_found`. CLI integration
@@ -319,21 +319,21 @@ into a tree).
 
 **Scope (actual):** ~430 LoC net across `proto/jj_interface.proto`
 (new `CheckOut` rpc + `CheckOutReq`/`Reply`),
-`daemon/src/vfs/{inode,yak_fs,mod}.rs` (trait method, `swap_root`,
+`daemon/src/vfs/{inode,kiki_fs,mod}.rs` (trait method, `swap_root`,
 `FsError` re-export), `daemon/src/service.rs` (per-mount `fs:
-Arc<dyn JjYakFs>`, `check_out` handler, +2 unit tests),
+Arc<dyn JjKikiFs>`, `check_out` handler, +2 unit tests),
 `cli/src/{blocking_client,working_copy}.rs` (RPC shim + the actual
 implementation), `cli/tests/test_init.rs` (un-ignore one test).
 
 ## M6 — VFS write path + snapshot
 
-Landed across `daemon: M6 — VFS write path on JjYakFs`, `daemon: M6 —
-wire adapters (FUSE + NFS) to JjYakFs write ops`, and `daemon: M6 —
-Snapshot RPC delegates to JjYakFs::snapshot`.
+Landed across `daemon: M6 — VFS write path on JjKikiFs`, `daemon: M6 —
+wire adapters (FUSE + NFS) to JjKikiFs write ops`, and `daemon: M6 —
+Snapshot RPC delegates to JjKikiFs::snapshot`.
 
 End-to-end shape:
 
-1. **Trait surface** (`daemon/src/vfs/yak_fs.rs`). `JjYakFs` grew
+1. **Trait surface** (`daemon/src/vfs/kiki_fs.rs`). `JjKikiFs` grew
    `create_file` / `mkdir` / `symlink` / `write` / `setattr` / `remove`
    / `snapshot`. Errors gained `AlreadyExists` and `NotEmpty` variants
    for the create-collision and rmdir-non-empty paths. `setattr` only
@@ -352,12 +352,12 @@ End-to-end shape:
    leaner `alloc` that no longer pre-registers `by_parent` (split from
    `attach_child` so the caller can back out without leaving stale
    entries).
-3. **Lazy promotion in `YakFs`.** First write touching a path promotes
+3. **Lazy promotion in `KikiFs`.** First write touching a path promotes
    that inode from clean to dirty by loading content from the per-mount
    `Store`; subsequent writes mutate the in-memory buffer in place. The
    `child_exists` pre-check on create/mkdir/symlink walks the
    still-clean parent tree without forcing a materialize.
-4. **Snapshot is recursive sync** (`YakFs::snapshot_node`). Walks the
+4. **Snapshot is recursive sync** (`KikiFs::snapshot_node`). Walks the
    slab from `root`, persists every dirty blob into the per-mount
    `Store`, and replaces dirty refs with their content-addressed
    counterparts. **Inode ids are preserved across snapshot** so the
@@ -373,8 +373,8 @@ End-to-end shape:
    the `set_*` enums on `sattr3` via small `mode_value`/`size_value`
    helpers and applies any `O_TRUNC`-style size on the create path.
 6. **`Snapshot` RPC** (`daemon/src/service.rs`). No longer returns the
-   cached `Mount.root_tree_id`; clones the per-mount `Arc<dyn JjYakFs>`
-   out from under the lock, calls `JjYakFs::snapshot`, and stamps the
+   cached `Mount.root_tree_id`; clones the per-mount `Arc<dyn JjKikiFs>`
+   out from under the lock, calls `JjKikiFs::snapshot`, and stamps the
    returned id back on `Mount.root_tree_id`. Mirrors the lock pattern
    `CheckOut` set up at M5.
 
@@ -384,7 +384,7 @@ the same id regardless of write-insertion order. A unit test
 (`snapshot_is_deterministic_under_insertion_order`) pins this.
 
 **Tests:** 67 daemon unit tests pass (44 → 67 — added 6 inode-slab
-cases, 12 yak_fs write-path cases, 4 NFS adapter cases, 4 FUSE adapter
+cases, 12 kiki_fs write-path cases, 4 NFS adapter cases, 4 FUSE adapter
 cases, 2 service-level Snapshot RPC cases, plus a `fs_for_test` helper
 on `JujutsuService`). 8 cli unit tests pass. CLI integration tests
 unchanged: 2 still passed + 2 still ignored.
@@ -403,8 +403,8 @@ shape is exercised end-to-end via the `fs_for_test` helper in
 
 **Scope (actual):** ~1700 LoC net across `daemon/src/store.rs`
 (spurious-async removal), `daemon/src/vfs/inode.rs` (dirty NodeRef
-variants + materialize/attach/detach), `daemon/src/vfs/yak_fs.rs`
-(trait surface + YakFs impl + recursive snapshot + write-path tests),
+variants + materialize/attach/detach), `daemon/src/vfs/kiki_fs.rs`
+(trait surface + KikiFs impl + recursive snapshot + write-path tests),
 `daemon/src/vfs/{fuse,nfs}_adapter.rs` (write-method dispatch),
 `daemon/src/service.rs` (`Snapshot` RPC body + fs_for_test test
 helper).
@@ -432,12 +432,12 @@ historical record.
   round-trip with proto-decode errors instead of panics.
 - **M2 smoke test.** Original plan said `test_init.rs` is read-only —
   only the first of three tests is. `test_multiple_init` and
-  `test_repos_are_independent` already exercise `jj new` and `yak
+  `test_repos_are_independent` already exercise `jj new` and `kk
   status`, so they're a better post-M1 signal.
 - **Spurious `async` on `Store` (folded in M6).** `Store::write_*` were
   marked `async` but never awaited anything (their bodies are pure
   `parking_lot::Mutex` locks). Kept misleading the trait-impl
-  recursion story in `JjYakFs::snapshot`; converted to plain sync at
+  recursion story in `JjKikiFs::snapshot`; converted to plain sync at
   M6 so the recursive `snapshot_node` walk doesn't need `Box::pin` /
   `async-recursion`. Layer B (durable storage) may add real I/O to
   these methods — switch back to async if/when that lands.
@@ -445,6 +445,6 @@ historical record.
   mutates an in-memory tree under the `Mount`." The actual
   representation layered the dirty side onto `NodeRef` itself (clean ⊎
   dirty in the same enum) rather than introducing a separate
-  working-tree object. Lazy promotion in `YakFs` (clean → dirty on
+  working-tree object. Lazy promotion in `KikiFs` (clean → dirty on
   first write touching a path) means we only pay the buffer cost for
   paths the user is actually editing.

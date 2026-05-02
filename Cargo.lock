@@ -537,31 +537,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cli"
-version = "0.0.1"
-dependencies = [
- "assert_cmd",
- "assert_matches",
- "async-trait",
- "chrono",
- "clap",
- "futures 0.3.32",
- "insta",
- "itertools 0.14.0",
- "jj-cli",
- "jj-lib",
- "pollster",
- "prost 0.12.6",
- "proto",
- "rand 0.9.4",
- "regex",
- "tempfile",
- "tokio",
- "tonic",
- "tracing",
-]
-
-[[package]]
 name = "clru"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2670,6 +2645,31 @@ dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "kiki"
+version = "0.0.1"
+dependencies = [
+ "assert_cmd",
+ "assert_matches",
+ "async-trait",
+ "chrono",
+ "clap",
+ "futures 0.3.32",
+ "insta",
+ "itertools 0.14.0",
+ "jj-cli",
+ "jj-lib",
+ "pollster",
+ "prost 0.12.6",
+ "proto",
+ "rand 0.9.4",
+ "regex",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

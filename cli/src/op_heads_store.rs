@@ -8,7 +8,7 @@
 //! CLI processes against a shared remote (`dir://`, future S3/grpc)
 //! would silently clobber each other's "advance op-heads" updates.
 //!
-//! `YakOpHeadsStore` replaces the file-per-head shape with a single
+//! `KikiOpHeadsStore` replaces the file-per-head shape with a single
 //! `op_heads` ref in the catalog. `update_op_heads` is one
 //! compare-and-swap against the daemon's `CasCatalogRef` RPC; the
 //! daemon dispatches to either the configured remote (multi-daemon)
@@ -123,14 +123,14 @@ fn decode(buf: &[u8]) -> Result<BTreeSet<OperationId>, OpHeadsStoreError> {
 /// (in `Workspace::init_with_factories`) and on every load via the
 /// registered store factory.
 #[derive(Debug)]
-pub struct YakOpHeadsStore {
+pub struct KikiOpHeadsStore {
     client: BlockingJujutsuInterfaceClient,
     working_copy_path: String,
 }
 
-impl YakOpHeadsStore {
+impl KikiOpHeadsStore {
     pub fn name() -> &'static str {
-        "yak_op_heads"
+        "kiki_op_heads"
     }
 
     pub fn new(
@@ -164,7 +164,7 @@ impl YakOpHeadsStore {
 }
 
 #[async_trait]
-impl OpHeadsStore for YakOpHeadsStore {
+impl OpHeadsStore for KikiOpHeadsStore {
     fn name(&self) -> &str {
         Self::name()
     }
@@ -271,7 +271,7 @@ enum ExpectedShape {
     Present(Vec<u8>),
 }
 
-impl YakOpHeadsStore {
+impl KikiOpHeadsStore {
     fn expected_for_empty(&self) -> Result<ExpectedShape, OpHeadsStoreError> {
         let resp = self
             .client

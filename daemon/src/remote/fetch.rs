@@ -1,12 +1,12 @@
 //! Read-through helpers shared between [`crate::service`] and
-//! [`crate::vfs::yak_fs`].
+//! [`crate::vfs::kiki_fs`].
 //!
 //! Both consumers face the same shape: "local store missed; if a
 //! remote is configured, fetch the blob, verify it round-trips to
 //! the requested id (defending against a corrupt peer), persist it
 //! locally so the next access hits the cache, and return the typed
 //! value." The two consumers differ only in error mapping —
-//! `service.rs` surfaces gRPC `Status` codes; `yak_fs.rs` surfaces
+//! `service.rs` surfaces gRPC `Status` codes; `kiki_fs.rs` surfaces
 //! `FsError`. Splitting the typed [`FetchError`] out lets each
 //! consumer pattern-match on the variant they care about (typically
 //! `NotFound` and `DataLoss`) and collapse the rest to "internal".

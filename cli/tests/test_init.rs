@@ -4,7 +4,7 @@ use crate::common::TestEnvironment;
 fn test_init() {
     let test_env = TestEnvironment::default();
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo""#);
     let repo_path = test_env.env_root().join("repo");
@@ -17,19 +17,19 @@ fn test_init() {
     ");
 }
 
-/// Round-trip the operation id through the daemon: `jj yak init` makes
-/// `YakWorkingCopy::init` push the workspace op id via `SetCheckoutState`,
+/// Round-trip the operation id through the daemon: `jj kk init` makes
+/// `KikiWorkingCopy::init` push the workspace op id via `SetCheckoutState`,
 /// and subsequent commands fetch it back via `GetCheckoutState` whenever
 /// they need the workspace's current operation. `jj op log` exercises that
 /// fetch — the `current_operation` keyword resolves to whichever op id the
-/// workspace reports, which for `YakWorkingCopy` is the daemon's cached
+/// workspace reports, which for `KikiWorkingCopy` is the daemon's cached
 /// value. If the round-trip drops bytes (e.g. workspace_id<->op_id swapped
 /// in the proto, hex/decode mismatch) the `@` marker either attaches to
 /// the wrong op or no op at all, and this assertion fails.
 #[test]
 fn test_op_id_round_trip() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     let stdout = test_env.jj_cmd_success(
@@ -52,13 +52,13 @@ fn test_op_id_round_trip() {
 fn test_multiple_init() {
     let test_env = TestEnvironment::default();
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo1"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo1"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo1""#);
     let repo1_path = test_env.env_root().join("repo1");
 
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo2"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo2"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo2""#);
     let repo2_path = test_env.env_root().join("repo2");
@@ -77,14 +77,14 @@ fn test_multiple_init() {
     ◆  zzzzzzzz root() 00000000
     ");
 
-    let stdout = test_env.jj_cmd_success(&repo2_path, &["yak", "status"]);
+    let stdout = test_env.jj_cmd_success(&repo2_path, &["kk", "status"]);
     insta::assert_snapshot!(stdout, @r"
     $TEST_ENV/repo1
     $TEST_ENV/repo2
     ");
 }
 
-// End-to-end smoke test for M5's `LockedYakWorkingCopy::check_out`:
+// End-to-end smoke test for M5's `LockedKikiWorkingCopy::check_out`:
 // `jj new` triggers a CheckOut RPC against each repo's daemon-side
 // Mount, and the per-mount Stores (M4) keep the trees from bleeding
 // between repos. §6 of docs/PLAN.md will move this kind of coverage
@@ -94,13 +94,13 @@ fn test_multiple_init() {
 fn test_repos_are_independent() {
     let test_env = TestEnvironment::default();
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo1"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo1"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo1""#);
     let repo1_path = test_env.env_root().join("repo1");
 
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo2"]);
+        test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo2"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"Initialized repo in "repo2""#);
     let repo2_path = test_env.env_root().join("repo2");
@@ -129,7 +129,7 @@ fn test_repos_are_independent() {
     ◆  zzzzzzzz root() 00000000
     ");
 
-    let stdout = test_env.jj_cmd_success(&repo2_path, &["yak", "status"]);
+    let stdout = test_env.jj_cmd_success(&repo2_path, &["kk", "status"]);
     insta::assert_snapshot!(stdout, @r"
     $TEST_ENV/repo1
     $TEST_ENV/repo2
@@ -144,7 +144,7 @@ fn test_repos_are_independent() {
 #[test]
 fn test_nested_tree_round_trips() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
     let dir_path = repo_path.join("dir");
     std::fs::create_dir(&dir_path).unwrap();
@@ -162,7 +162,7 @@ fn test_nested_tree_round_trips() {
 #[test]
 fn test_symlink_tree_round_trips() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["yak", "init", "", "repo"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     let repo_path = test_env.env_root().join("repo");
     std::os::unix::fs::symlink("target", repo_path.join("link")).unwrap();
 

@@ -1,6 +1,6 @@
 # Workspaces and Managed Namespace
 
-Design notes for a CitC/EdenFS-style user experience on top of jj-yak:
+Design notes for a CitC/EdenFS-style user experience on top of kiki:
 many repos and many workspaces, presented under one managed namespace,
 with lazy hydration and shared content storage.
 
@@ -12,11 +12,11 @@ git convergence, M10.7, and M11.
 
 ## Goal
 
-Make jj-yak feel like a managed workspace system rather than a
+Make kiki feel like a managed workspace system rather than a
 collection of one-off mounts:
 
 ```text
-~/.yak/
+~/.kiki/
   git@github.com/
     repo1/
       default/
@@ -51,7 +51,7 @@ The managed-namespace model adds a second layer of complexity:
 - Global inode identity.
 - Repo discovery in the filesystem namespace.
 - Lazy repo hydration on first access.
-- Workspace lifecycle commands above the current `jj yak init` flow.
+- Workspace lifecycle commands above the current `jj kk init` flow.
 
 That deserves its own design doc instead of being buried in milestone
 notes.
@@ -60,7 +60,7 @@ notes.
 
 At the UX level, users should think in terms of:
 
-- A managed root such as `~/.yak/` or `~/.kiki/mnt/`.
+- A managed root such as `~/.kiki/` or `~/.kiki/mnt/`.
 - Repos addressed by remote + repo name.
 - Multiple named workspaces per repo.
 - Workspace operations that are cheaper than cloning.
@@ -69,10 +69,10 @@ Illustrative commands:
 
 ```bash
 kk clone s3://company/repos/api
-# -> mounts or materializes ~/.yak/company/api/default/
+# -> mounts or materializes ~/.kiki/company/api/default/
 
 kk workspace new fix-auth
-# -> creates ~/.yak/company/api/fix-auth/
+# -> creates ~/.kiki/company/api/fix-auth/
 
 kk workspace list
 kk workspace delete fix-auth
@@ -83,7 +83,7 @@ kk sync --prefetch --depth 50
 
 The exact CLI name is not important here. The important part is that
 workspace management becomes a top-level concept rather than an
-incidental consequence of `jj yak init`.
+incidental consequence of `jj kk init`.
 
 ## Architecture options
 
@@ -91,7 +91,7 @@ There are two plausible presentation models.
 
 ### Option A: many mounts, managed by CLI
 
-Each workspace remains its own `YakFs` mount, but the CLI presents them
+Each workspace remains its own `KikiFs` mount, but the CLI presents them
 under a standardized namespace and manages creation/deletion.
 
 Pros:
@@ -108,7 +108,7 @@ Cons:
 
 ### Option B: one top-level mount with a `RootFs`
 
-Introduce a new filesystem layer above `YakFs`:
+Introduce a new filesystem layer above `KikiFs`:
 
 ```rust
 struct RootFs {
@@ -117,7 +117,7 @@ struct RootFs {
 ```
 
 `RootFs` owns the visible namespace and delegates operations into
-workspace-specific `YakFs` instances.
+workspace-specific `KikiFs` instances.
 
 Pros:
 
@@ -128,7 +128,7 @@ Pros:
 Cons:
 
 - Requires global inode strategy.
-- Requires path routing and lifecycle logic above `YakFs`.
+- Requires path routing and lifecycle logic above `KikiFs`.
 - More moving parts around mount recovery and cache invalidation.
 
 ## Recommended sequencing
@@ -148,14 +148,14 @@ Reasoning:
 
 ## `RootFs` model
 
-If jj-yak graduates to the single-mount model, `RootFs` would be the
+If kiki graduates to the single-mount model, `RootFs` would be the
 top-level router.
 
 Responsibilities:
 
 - Present remote/org/repo/workspace directories.
 - Resolve a path prefix to the correct repo/workspace instance.
-- Lazily instantiate or rehydrate the underlying `YakFs`.
+- Lazily instantiate or rehydrate the underlying `KikiFs`.
 - Maintain global inode identity for the mount.
 - Surface repo discovery without requiring an explicit init step.
 
@@ -169,7 +169,7 @@ Those stay in the existing store/remote layers.
 
 ## Global inode strategy
 
-One mount means one inode namespace. Per-repo `YakFs` instances cannot
+One mount means one inode namespace. Per-repo `KikiFs` instances cannot
 all expose `ROOT_INODE = 1` directly to the kernel.
 
 Two broad approaches:
@@ -185,7 +185,7 @@ Assign each repo or workspace a reserved inode range:
 Pros:
 
 - Simple mental model.
-- Per-workspace `YakFs` can remain mostly unchanged if the range is
+- Per-workspace `KikiFs` can remain mostly unchanged if the range is
   threaded in at construction time.
 
 Cons:
@@ -195,12 +195,12 @@ Cons:
 
 ### 2. Boundary remapping
 
-Keep local inode identities inside `YakFs`, and let `RootFs` remap them
+Keep local inode identities inside `KikiFs`, and let `RootFs` remap them
 to globally unique inode ids at the boundary.
 
 Pros:
 
-- Less invasive to `YakFs` internals.
+- Less invasive to `KikiFs` internals.
 - Global policy lives in one place.
 
 Cons:
@@ -209,7 +209,7 @@ Cons:
 - More bookkeeping for file handles, lookups, and invalidations.
 
 Either approach is viable. Boundary remapping is cleaner if the goal is
-to avoid reopening `YakFs` internals; range partitioning is cleaner if
+to avoid reopening `KikiFs` internals; range partitioning is cleaner if
 we want the per-workspace FS to be directly mountable for debugging.
 
 ## Lazy repo hydration
@@ -229,7 +229,7 @@ Hydration can mean:
 - Or fetch enough remote metadata to present the initial tree.
 
 The important constraint is that "open the namespace" must stay cheap.
-Listing `~/.yak/` cannot require mounting hundreds of repos eagerly.
+Listing `~/.kiki/` cannot require mounting hundreds of repos eagerly.
 
 ## Workspace economics
 

@@ -1,6 +1,6 @@
-# Git-convergent storage for jj-yak
+# Git-convergent storage for kiki
 
-Design for replacing jj-yak's custom content store (BLAKE3/prost/redb)
+Design for replacing kiki's custom content store (BLAKE3/prost/redb)
 with jj-lib's `GitBackend`, making every remote — git forges, cloud
 object stores, peer daemons — speak the same content format with zero
 translation.
@@ -10,11 +10,11 @@ translation approach).
 
 ## Problem statement
 
-jj-yak needs to work with multiple remote types: git forges (GitHub,
+kiki needs to work with multiple remote types: git forges (GitHub,
 GitLab) for public collaboration, cloud object stores (S3, GCS, R2)
 for private/team storage, and peer daemons (gRPC) for real-time sync.
 
-The current `YakBackend` uses a custom object format (prost-encoded,
+The current `KikiBackend` uses a custom object format (prost-encoded,
 BLAKE3-addressed, stored in redb) that has no connection to git's
 object model. The original design proposed a shadow git repo with full
 object graph translation (blobs, trees, commits) between the two
@@ -29,7 +29,7 @@ prost-encoded BLAKE3 blobs while GitHub holds git objects, with
 translation needed between them.
 
 This document proposes eliminating the translation layer entirely by
-converging yak's content store to git's object format, making it the
+converging kiki's content store to git's object format, making it the
 **universal content-addressed format** across all remote types.
 
 ## Architecture
@@ -37,7 +37,7 @@ converging yak's content store to git's object format, making it the
 ### Current (BLAKE3/prost/redb)
 
 ```
-CLI (YakBackend)
+CLI (KikiBackend)
   │  gRPC proxy — every Backend method is an RPC
   ▼
 Daemon
@@ -60,7 +60,7 @@ structs. Every object is stored as prost-encoded bytes in redb.
 ### Proposed (GitBackend)
 
 ```
-CLI (YakBackend)
+CLI (KikiBackend)
   │  gRPC proxy — same RPC surface
   ▼
 Daemon
@@ -87,7 +87,7 @@ extras table — the daemon never touches git objects directly.
 
 ### What stays the same
 
-- **CLI-side `YakBackend`**: still a gRPC proxy. Every `Backend` trait
+- **CLI-side `KikiBackend`**: still a gRPC proxy. Every `Backend` trait
   method is an RPC to the daemon. The only change is ID sizes (20 bytes
   instead of 32).
 
@@ -105,7 +105,7 @@ extras table — the daemon never touches git objects directly.
   The blob bytes change from prost-encoded to git object bytes, but the
   trait doesn't care.
 
-- **VFS architecture**: FUSE/NFS adapters dispatch to `JjYakFs` trait.
+- **VFS architecture**: FUSE/NFS adapters dispatch to `JjKikiFs` trait.
   The trait methods read content by ID — the backing store changes but
   the interface doesn't.
 
@@ -158,7 +158,7 @@ There is no format boundary anywhere in the system.
 
 This means:
 - A colleague can clone from S3 or from GitHub — same objects.
-- An S3-backed repo can `jj yak git push` to GitHub with zero
+- An S3-backed repo can `jj kk git push` to GitHub with zero
   translation — the git objects already exist locally.
 - A GitHub-backed repo can add an S3 remote for fast internal sync
   — same bytes, different transport.
@@ -243,7 +243,7 @@ correctly and is simpler to implement first.
 ### Deployment topologies unlocked by git convergence
 
 Git-convergent storage does more than simplify encoding. It also keeps
-jj-yak open to several deployment shapes without introducing a format
+kiki open to several deployment shapes without introducing a format
 boundary between them.
 
 #### Local-only daemon
@@ -263,7 +263,7 @@ toward.
 
 A more interesting model becomes possible after convergence:
 
-- A central yak daemon or small yak service acts as the team's
+- A central kiki daemon or small kiki service acts as the team's
   low-latency workspace/cache layer.
 - Developers and agents create live workspaces against that central
   service rather than talking to GitHub directly for every operation.
@@ -272,7 +272,7 @@ A more interesting model becomes possible after convergence:
 
 In that model:
 
-- **Yak is the live workspace backend.**
+- **Kiki is the live workspace backend.**
 - **GitHub is the publication/exchange remote.**
 - **Both store the same git objects.**
 
@@ -288,9 +288,9 @@ filesystem backend." GitHub speaks git's fetch/push protocols and is a
 good upstream/downstream synchronization point, but it is not a
 low-latency object-by-object workspace server.
 
-What git convergence guarantees is that the central yak service and
+What git convergence guarantees is that the central kiki service and
 GitHub can exchange content with zero translation. What it does **not**
-solve by itself is the operational side of running yak as a shared
+solve by itself is the operational side of running kiki as a shared
 service:
 
 - multi-user auth and permissions
@@ -404,7 +404,7 @@ assumption. The `views_v1` and `operations_v1` tables use `&[u8]` keys
 
 The VFS currently reads from redb via `store.get_tree(id)` etc. With
 GitBackend, reads go through `git_backend.read_tree(path, id)` (which
-calls gix to read git objects). The `JjYakFs` trait methods are already
+calls gix to read git objects). The `JjKikiFs` trait methods are already
 async and return typed values — only the backing implementation changes.
 
 **Concurrency**: GitBackend's internal `Mutex<gix::Repository>` and
@@ -412,7 +412,7 @@ async and return typed values — only the backing implementation changes.
 is a micro-optimization for single-threaded use, not a safety
 requirement. gix's underlying `Store` uses `ArcSwap` + atomics and
 is explicitly designed for "lock-free reading for perfect scaling
-across all cores." The YakBackend wrapper overrides all read methods
+across all cores." The KikiBackend wrapper overrides all read methods
 to use `self.inner.git_repo()` (which returns a fresh thread-local
 `gix::Repository` from the `ThreadSafeRepository` base — cost is a
 few `Arc` clones, microseconds, no disk I/O) and returns
@@ -518,8 +518,8 @@ jj-lib's transaction model.
 let mut tx = repo.start_transaction();
 let mut_repo = tx.repo_mut();
 
-// Set bookmark targets from yak's catalog refs
-for (name, commit_id) in yak_bookmarks {
+// Set bookmark targets from kiki's catalog refs
+for (name, commit_id) in kiki_bookmarks {
     mut_repo.set_local_bookmark_target(&name, RefTarget::normal(commit_id));
 }
 
@@ -539,9 +539,9 @@ let mut gf = GitFetch::new(mut_repo, subprocess_opts, &import_opts)?;
 gf.fetch(&remote_name, refspecs, &mut cb, None, None)?;
 gf.import_refs().await?;
 
-// Sync imported bookmarks back to yak's catalog refs
+// Sync imported bookmarks back to kiki's catalog refs
 for (name, target) in tx.repo().view().local_bookmarks() {
-    yak_catalog.cas_ref(&name, expected, new).await?;
+    kiki_catalog.cas_ref(&name, expected, new).await?;
 }
 
 tx.commit("fetch from origin").await?;
@@ -557,21 +557,21 @@ apply naturally. No special handling needed.
 ### CLI commands
 
 ```bash
-# Add a git remote to an existing yak repo
-jj yak git remote add origin https://github.com/user/repo.git
+# Add a git remote to an existing kiki repo
+jj kk git remote add origin https://github.com/user/repo.git
 
 # Push bookmarks to GitHub
-jj yak git push --remote origin
-jj yak git push --remote origin --bookmark main
+jj kk git push --remote origin
+jj kk git push --remote origin --bookmark main
 
 # Fetch from GitHub
-jj yak git fetch --remote origin
+jj kk git fetch --remote origin
 
 # List git remotes
-jj yak git remote list
+jj kk git remote list
 ```
 
-The `jj yak git` subcommand tree mirrors `jj git` as closely as
+The `jj kk git` subcommand tree mirrors `jj git` as closely as
 possible.
 
 ### Multi-remote workflow
@@ -581,18 +581,18 @@ and a git forge for public collaboration:
 
 ```bash
 # Init with S3 as the primary remote (real-time sync, private)
-jj yak init --remote s3://company-bucket/repos/my-project
+jj kk init --remote s3://company-bucket/repos/my-project
 
 # Work normally — writes flow through to S3 via RemoteStore
 jj new -m "add feature"
 # ... edit files ...
 
 # A teammate syncs from the same S3 bucket
-jj yak init --remote s3://company-bucket/repos/my-project ~/teammate-copy
+jj kk init --remote s3://company-bucket/repos/my-project ~/teammate-copy
 
 # When ready, push to GitHub for a PR (batch, public)
-jj yak git remote add origin git@github.com:company/my-project.git
-jj yak git push --remote origin --bookmark main
+jj kk git remote add origin git@github.com:company/my-project.git
+jj kk git push --remote origin --bookmark main
 
 # External contributor clones from GitHub
 jj git clone git@github.com:company/my-project.git
@@ -613,9 +613,9 @@ that plain `git` clients can clone from and push to:
 
 ```
                     ┌──────────────────────────┐
-                    │       yak daemon         │
+                    │       kiki daemon         │
                     │                          │
- jj/yak clients ──►│  gRPC  (yak protocol)    │
+ jj/kiki clients ──►│  gRPC  (kiki protocol)    │
                     │    ├─ VFS / FUSE         │
                     │    ├─ real-time sync      │
                     │    ├─ op-log              │
@@ -693,19 +693,19 @@ waiting to be exposed.
 ### Stock tool read-only interop
 
 The daemon controls the VFS — it already synthesizes `.jj/` at the
-workspace root (`YakFs::jj_subtree`, M7). After convergence, the
+workspace root (`KikiFs::jj_subtree`, M7). After convergence, the
 backing store is a real bare git repo. The daemon could additionally
 synthesize a `.git` gitdir file pointing at it:
 
 ```
 # synthesized by the VFS at the workspace root
 .git        →  gitdir: <storage_dir>/mounts/<hash>/git/
-.jj/        →  (already pinned, yak CLI metadata)
+.jj/        →  (already pinned, kiki CLI metadata)
 src/
 README.md
 ```
 
-This makes **read-only stock tooling** work against any yak mount
+This makes **read-only stock tooling** work against any kiki mount
 without special setup:
 
 - `git log`, `git diff`, `git blame` — read the real git ODB
@@ -728,7 +728,7 @@ writing to the same bare repo concurrently would corrupt state.
 
 Specific conflicts:
 
-- **Op store ownership.** Yak's `YakOpStore` and `YakOpHeadsStore`
+- **Op store ownership.** Kiki's `KikiOpStore` and `KikiOpHeadsStore`
   route through gRPC with remote sync and CAS arbitration. Stock
   `jj` would try to read/write op store files directly on disk.
   Two code paths managing the same op state is a conflict.
@@ -751,7 +751,7 @@ require either:
   tools, then re-acquires), or
 - A proxy `Backend` that stock `jj` uses to talk to the daemon via
   gRPC instead of touching the git repo directly (which is what the
-  yak CLI already does via `YakBackend`).
+  kiki CLI already does via `KikiBackend`).
 
 Neither is planned for the convergence milestone. The read-only
 interop is a natural consequence of the content store being real git
@@ -761,13 +761,13 @@ compatibility is a separate design problem (see
 
 ## Migration
 
-### Existing yak repos
+### Existing kiki repos
 
-This is a breaking change to the on-disk format. Existing yak repos
-(with 32-byte BLAKE3 IDs in redb) are incompatible. Since jj-yak is
+This is a breaking change to the on-disk format. Existing kiki repos
+(with 32-byte BLAKE3 IDs in redb) are incompatible. Since kiki is
 pre-release, this is acceptable.
 
-Migration path: `jj yak init` creates a new repo with git-backed
+Migration path: `jj kk init` creates a new repo with git-backed
 storage. Existing repos can be abandoned or migrated with a one-time
 export/import tool (low priority).
 
@@ -813,11 +813,11 @@ concurrent access:
 ### The wrapper pattern
 
 ```rust
-struct YakGitStore {
+struct KikiGitStore {
     inner: GitBackend,  // owns the ThreadSafeRepository + mutex
 }
 
-impl YakGitStore {
+impl KikiGitStore {
     /// Thread-safe concurrent read — bypasses inner's mutex
     fn read_file(&self, path: &RepoPath, id: &FileId) -> BackendResult<Vec<u8>> {
         let repo = self.inner.git_repo();  // fresh thread-local, no mutex
@@ -875,7 +875,7 @@ SHA-1's effectively broken 160-bit. In practice:
   writes, gix's SHA-1 is fast enough.
 - **Collision resistance**: git is migrating to SHA-256. jj already has
   infrastructure for this (`git.write-change-id-header`). When git
-  completes the transition, yak benefits automatically.
+  completes the transition, kiki benefits automatically.
 
 ### redb as content store
 
@@ -891,7 +891,7 @@ pack files. For VFS random-read workloads:
 - **Writes**: git loose object writes are atomic (tmp + rename), same
   as redb. Pack file repacking is a background operation.
 
-Net: no meaningful performance regression for yak's workload.
+Net: no meaningful performance regression for kiki's workload.
 
 ### Custom serialization
 
@@ -907,7 +907,7 @@ for the content path).
 Git's ODB handles this. It's literally what git was built for. The
 Linux kernel has ~1M commits and ~80K files; Chromium has ~100K files.
 gix reads pack files via mmap'd indexes with O(log n) lookup.
-Performance is comparable to redb for yak's VFS workload, where
+Performance is comparable to redb for kiki's VFS workload, where
 FUSE/NFS kernel overhead dominates object store access time.
 
 ### Huge monorepos (Google, Meta scale)
@@ -924,7 +924,7 @@ This is what Google does internally with jj (cloud backend + caching
 daemon), what Microsoft does with VFS for Git, and what Meta does with
 Sapling/EdenFS.
 
-**Yak already has this pattern.** The daemon's `RemoteStore`
+**Kiki already has this pattern.** The daemon's `RemoteStore`
 read-through fetches objects on local cache miss:
 
 ```
@@ -955,14 +955,14 @@ another. That's a separate project from the current work.
 **The convergence decision should be made on the translation-tax and
 remote-universality arguments, not the scaling argument.** Scaling is
 orthogonal — both stores need the same lazy-fetch architecture for
-true monorepo support, and yak already has the foundation for it.
+true monorepo support, and kiki already has the foundation for it.
 
 ## Alternatives considered
 
 ### A. Shadow git repo with full object graph translation
 
 The original design in `GIT_REMOTE_RESEARCH.md`. Maintain a separate
-bare git repo alongside the yak redb store. On push, walk the full
+bare git repo alongside the kiki redb store. On push, walk the full
 object graph (blobs, trees, commits) bottom-up, translating IDs from
 BLAKE3 (32-byte) to SHA-1 (20-byte) and writing to the shadow repo.
 On fetch, reverse the process.
@@ -985,7 +985,7 @@ On fetch, reverse the process.
 
 ### B. `git fast-import` for batch translation
 
-Generate a `git fast-import` stream from yak commits and pipe to
+Generate a `git fast-import` stream from kiki commits and pipe to
 `git fast-import` in a shadow repo. Avoids per-object gix writes.
 
 **Why rejected:**
@@ -1002,7 +1002,7 @@ Generate a `git fast-import` stream from yak commits and pipe to
 ### C. Dual-write (write to both stores simultaneously)
 
 On every `write_commit` / `write_tree` / `write_file`, write to both
-the yak redb store and a git repo. The git repo is always up-to-date,
+the kiki redb store and a git repo. The git repo is always up-to-date,
 so push is cheap.
 
 **Why rejected:**
@@ -1025,15 +1025,15 @@ for GitHub, raw prost bytes for S3, etc.
   layer. GitHub needs BLAKE3→SHA-1 object graph translation (~640
   lines). A future format-aware remote would need its own translator.
 - S3 and gRPC remotes would store prost bytes that no other tool can
-  read. The content is opaque to everything outside yak.
+  read. The content is opaque to everything outside kiki.
 - The format boundary multiplies: N remote types × M content types =
   N×M translation paths. With git objects as the universal format,
   all remote types store the same bytes — the only special case is
   GitHub (which speaks git protocol instead of per-object CAS).
-- Yak becomes a walled garden. Git objects are the universal
+- Kiki becomes a walled garden. Git objects are the universal
   interchange format — every tool, service, and hosting provider
-  understands them. A custom format means yak content only lives
-  in yak.
+  understands them. A custom format means kiki content only lives
+  in kiki.
 
 ## Scope estimate
 
@@ -1073,7 +1073,7 @@ simpler final architecture.
    is required. See "Extras table replication" above.
 
 3. ~~**Peer daemon interop.**~~ Breaking change, acceptable for
-   pre-release. No existing yak users.
+   pre-release. No existing kiki users.
 
 4. ~~**gRPC content sync format.**~~ Send decompressed git object
    content via the existing `put_blob` / `get_blob` API. The receiver
@@ -1100,19 +1100,19 @@ simpler final architecture.
    - Hook into jj's `gc()` Backend method (GitBackend runs `git gc`)
    Not urgent — loose objects work fine for small-to-medium repos.
 
-7. **Bookmark model bridging.** Yak's catalog refs are flat strings
+7. **Bookmark model bridging.** Kiki's catalog refs are flat strings
    (`op_heads`, custom refs). jj's bookmarks are structured
    (`local_bookmarks`, `remote_bookmarks` with tracking state). The
    push/fetch RPCs need to bridge this:
-   - On push: read yak catalog refs → set `local_bookmark_target` in
+   - On push: read kiki catalog refs → set `local_bookmark_target` in
      `MutableRepo` → `push_refs` handles export + push
    - On fetch: `import_refs` updates jj's View → read View's
-     `local_bookmarks()` → write back to yak catalog refs via `cas_ref`
+     `local_bookmarks()` → write back to kiki catalog refs via `cas_ref`
    The bridging is straightforward but the exact ref naming convention
    needs design.
 
-8. **StoreFactories registration.** The CLI-side `YakBackend` needs
-   to register with `StoreFactories` under a custom name (e.g. `"yak"`)
+8. **StoreFactories registration.** The CLI-side `KikiBackend` needs
+   to register with `StoreFactories` under a custom name (e.g. `"kiki"`)
    so `Workspace::load` can find it. The `store/type` file contains
    this name. The daemon-side `GitBackend` uses the standard `"git"`
    type — the daemon doesn't go through `StoreFactories` at all.

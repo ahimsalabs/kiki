@@ -19,10 +19,10 @@ mod op_heads_store;
 mod op_store;
 mod working_copy;
 
-use backend::YakBackend;
+use backend::KikiBackend;
 use blocking_client::BlockingJujutsuInterfaceClient;
-use op_heads_store::YakOpHeadsStore;
-use working_copy::{YakWorkingCopy, YakWorkingCopyFactory};
+use op_heads_store::KikiOpHeadsStore;
+use working_copy::{KikiWorkingCopy, KikiWorkingCopyFactory};
 
 /// Create a new repo in the given directory
 /// If the given directory does not exist, it will be created. If no directory
@@ -39,7 +39,7 @@ pub(crate) struct InitArgs {
 }
 
 #[derive(Debug, Clone, clap::Subcommand)]
-enum YakCommands {
+enum KikiCommands {
     Init(InitArgs),
     Status,
 }
@@ -47,66 +47,66 @@ enum YakCommands {
 #[derive(Debug, Clone, clap::Args)]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(flatten_help = true)]
-struct YakArgs {
+struct KikiArgs {
     #[command(subcommand)]
-    command: YakCommands,
+    command: KikiCommands,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
-enum YakSubcommand {
-    /// Commands for working with the yak daemon
-    Yak(YakArgs),
+enum KikiSubcommand {
+    /// Commands for working with the kiki daemon
+    Kk(KikiArgs),
 }
 
 fn create_store_factories() -> StoreFactories {
     // Start empty: `CliRunner::add_store_factories` merges these on top
     // of jj-cli's own defaults, and `merge_factories_map` panics on
-    // collisions. We only register the yak-specific factories here.
+    // collisions. We only register the kiki-specific factories here.
     let mut store_factories = StoreFactories::empty();
     // Register the backend so it can be loaded when the repo is loaded. The name
     // must match `Backend::name()`.
     store_factories.add_backend(
-        "yak",
+        "kiki",
         // The factory closure returns BackendLoadError; map BackendInitError
-        // (which is what YakBackend::new produces) into it preserving the
+        // (which is what KikiBackend::new produces) into it preserving the
         // underlying error.
         Box::new(|settings, store_path| {
-            let backend = YakBackend::new(settings, store_path)
+            let backend = KikiBackend::new(settings, store_path)
                 .map_err(|jj_lib::backend::BackendInitError(e)| {
                     jj_lib::backend::BackendLoadError(e)
                 })?;
             Ok(Box::new(backend))
         }),
     );
-    // M10.5: register the YakOpHeadsStore factory so subsequent loads
+    // M10.5: register the KikiOpHeadsStore factory so subsequent loads
     // pick up the catalog-driven impl. The corresponding initializer
     // wired into `Workspace::init_with_factories` writes the
-    // `yak_op_heads` type tag to disk; this loader honors it.
+    // `kiki_op_heads` type tag to disk; this loader honors it.
     //
     // The `repo_dir` we receive is `<jj_root>/op_heads/`. We need the
     // workspace path for the daemon RPCs — climb two levels up
     // (`<wc>/.jj/repo/op_heads/`) to recover it.
     store_factories.add_op_heads_store(
-        op_heads_store::YakOpHeadsStore::name(),
+        op_heads_store::KikiOpHeadsStore::name(),
         Box::new(|settings, store_path| {
             let working_copy_path = climb_to_workspace(store_path)
                 .map_err(|e| jj_lib::backend::BackendLoadError(e.into()))?;
             let client = connect_daemon(settings)
                 .map_err(jj_lib::backend::BackendLoadError)?;
-            Ok(Box::new(YakOpHeadsStore::new(client, working_copy_path)))
+            Ok(Box::new(KikiOpHeadsStore::new(client, working_copy_path)))
         }),
     );
-    // M10.6: register the YakOpStore factory so subsequent loads
+    // M10.6: register the KikiOpStore factory so subsequent loads
     // pick up the daemon-routed impl. The `store_path` is
     // `<wc>/.jj/repo/op_store/`; climb 3 levels to recover `<wc>`.
     store_factories.add_op_store(
-        op_store::YakOpStore::name(),
+        op_store::KikiOpStore::name(),
         Box::new(|settings, store_path, root_data| {
             let working_copy_path = climb_to_workspace(store_path)
                 .map_err(|e| jj_lib::backend::BackendLoadError(e.into()))?;
             let client = connect_daemon(settings)
                 .map_err(jj_lib::backend::BackendLoadError)?;
-            Ok(Box::new(op_store::YakOpStore::load(
+            Ok(Box::new(op_store::KikiOpStore::load(
                 store_path,
                 root_data,
                 client,
@@ -144,7 +144,7 @@ fn climb_to_workspace(op_heads_path: &std::path::Path) -> std::io::Result<String
 }
 
 /// Connect to the daemon described by user settings. Same shape as
-/// `YakWorkingCopy::connect_client` (cli/src/working_copy.rs:96) — we
+/// `KikiWorkingCopy::connect_client` (cli/src/working_copy.rs:96) — we
 /// duplicate the few lines rather than expose a public helper because
 /// the error types differ (`BackendLoadError` here, `WorkingCopyStateError`
 /// there).
@@ -158,12 +158,12 @@ fn connect_daemon(
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 
-async fn run_yak_command(
+async fn run_kk_command(
     ui: &mut Ui,
     command_helper: &CommandHelper,
-    command: YakSubcommand,
+    command: KikiSubcommand,
 ) -> Result<(), CommandError> {
-    let YakSubcommand::Yak(YakArgs { command }) = command;
+    let KikiSubcommand::Kk(KikiArgs { command }) = command;
 
     let grpc_port = command_helper
         .settings()
@@ -173,10 +173,10 @@ async fn run_yak_command(
         "http://[::1]:{grpc_port}"
     ))
     .map_err(|e| {
-        user_error_with_message(format!("Failed to connect to yak daemon on port {grpc_port}"), e)
+        user_error_with_message(format!("Failed to connect to kiki daemon on port {grpc_port}"), e)
     })?;
     match command {
-        YakCommands::Status => {
+        KikiCommands::Status => {
             let resp = client
                 .daemon_status(proto::jj_interface::DaemonStatusReq {})
                 .map_err(|e| internal_error_with_message("daemon DaemonStatus RPC failed", e))?;
@@ -195,7 +195,7 @@ async fn run_yak_command(
             }
             Ok(())
         }
-        YakCommands::Init(args) => {
+        KikiCommands::Init(args) => {
             if command_helper.global_args().ignore_working_copy {
                 return Err(cli_error("--ignore-working-copy is not respected"));
             }
@@ -233,12 +233,12 @@ async fn run_yak_command(
             attach_transport(init_reply.transport, &wc_path)?;
 
             // M10.5: replace the default `OpHeadsStore` initializer
-            // with one that constructs a `YakOpHeadsStore` driving
+            // with one that constructs a `KikiOpHeadsStore` driving
             // the daemon's catalog. The store dir argument is
             // `<wc>/.jj/repo/op_heads/`; the daemon already routes
             // by `working_copy_path`, which we have here.
             let wc_path_for_op_heads = wc_path_str.to_string();
-            let yak_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
+            let kiki_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
                                                  _store_path: &std::path::Path|
                   -> Result<
                 Box<dyn jj_lib::op_heads_store::OpHeadsStore>,
@@ -247,17 +247,17 @@ async fn run_yak_command(
                 let client = connect_daemon(settings).map_err(|e| {
                     jj_lib::backend::BackendInitError(e.to_string().into())
                 })?;
-                Ok(Box::new(YakOpHeadsStore::new(
+                Ok(Box::new(KikiOpHeadsStore::new(
                     client,
                     wc_path_for_op_heads.clone(),
                 )))
             };
 
             // M10.6: replace the default `OpStore` initializer with
-            // one that constructs a `YakOpStore` routing through the
+            // one that constructs a `KikiOpStore` routing through the
             // daemon (write-through to remote, read-through on miss).
             let wc_path_for_op_store = wc_path_str.to_string();
-            let yak_op_store_initializer = move |settings: &jj_lib::settings::UserSettings,
+            let kiki_op_store_initializer = move |settings: &jj_lib::settings::UserSettings,
                                                  store_path: &std::path::Path,
                                                  root_data: jj_lib::op_store::RootOperationData|
                   -> Result<
@@ -267,7 +267,7 @@ async fn run_yak_command(
                 let client = connect_daemon(settings).map_err(|e| {
                     jj_lib::backend::BackendInitError(e.to_string().into())
                 })?;
-                let store = op_store::YakOpStore::init(
+                let store = op_store::KikiOpStore::init(
                     store_path,
                     root_data,
                     client,
@@ -281,22 +281,22 @@ async fn run_yak_command(
                 command_helper.settings(),
                 &wc_path,
                 &|settings, store_path| {
-                    let backend = YakBackend::new(settings, store_path)?;
+                    let backend = KikiBackend::new(settings, store_path)?;
                     Ok(Box::new(backend))
                 },
                 Signer::from_settings(command_helper.settings())
                     .map_err(WorkspaceInitError::SignInit)?,
-                &yak_op_store_initializer,
-                &yak_op_heads_initializer,
+                &kiki_op_store_initializer,
+                &kiki_op_heads_initializer,
                 ReadonlyRepo::default_index_store_initializer(),
                 ReadonlyRepo::default_submodule_store_initializer(),
                 // M2: route Workspace::init_with_factories through
-                // YakWorkingCopyFactory so the freshly-initialised workspace
+                // KikiWorkingCopyFactory so the freshly-initialised workspace
                 // talks to the daemon (SetCheckoutState) rather than spinning
                 // up a local on-disk working copy. The daemon mount is
                 // guaranteed to exist here because the Initialize RPC above
                 // ran first.
-                &YakWorkingCopyFactory {},
+                &KikiWorkingCopyFactory {},
                 WorkspaceName::DEFAULT.to_owned(),
             )
             .await?;
@@ -372,15 +372,17 @@ fn mount_nfs_localhost(_wc_path: &std::path::Path, _port: u32) -> Result<(), Com
 fn main() -> std::process::ExitCode {
     let mut working_copy_factories = WorkingCopyFactories::new();
     working_copy_factories.insert(
-        YakWorkingCopy::name().to_owned(),
-        Box::new(YakWorkingCopyFactory {}),
+        KikiWorkingCopy::name().to_owned(),
+        Box::new(KikiWorkingCopyFactory {}),
     );
     // NOTE: logging before this point will not work since it is
     // initialized by CliRunner.
     CliRunner::init()
+        .name("kiki")
+        .about("Experimental jj remote backend")
         .add_store_factories(create_store_factories())
         .add_working_copy_factories(working_copy_factories)
-        .add_subcommand(run_yak_command)
+        .add_subcommand(run_kk_command)
         .run()
         .into()
 }

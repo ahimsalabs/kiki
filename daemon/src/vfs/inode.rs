@@ -24,13 +24,13 @@
 //! per-mount [`Store`](crate::store::Store) and are immutable; dirty
 //! nodes hold the in-memory representation that VFS writes mutate. A
 //! dirty node is "promoted" back to a clean reference on
-//! [`crate::vfs::JjYakFs::snapshot`], which writes the in-memory blob
+//! [`crate::vfs::JjKikiFs::snapshot`], which writes the in-memory blob
 //! into the store and updates the slab to point at the resulting id.
 //!
 //! Promotion in the other direction — clean → dirty — happens lazily on
 //! the first write touching a path. `materialize_dir_for_mutation` and
 //! `materialize_file_for_mutation` on [`InodeSlab`] do that work; the
-//! `YakFs` impl in `yak_fs.rs` orchestrates which to call when.
+//! `KikiFs` impl in `kiki_fs.rs` orchestrates which to call when.
 //!
 //! Concurrency: a single mutex guards both maps. The slab is on the hot
 //! path for `lookup`/`getattr`, but contention is bounded by the number
@@ -274,7 +274,7 @@ impl InodeSlab {
     ///
     /// `child_for_entry` builds the `NodeRef` for each tree entry. The
     /// closure form keeps the [`crate::ty::TreeEntry`] → [`NodeRef`]
-    /// mapping in `yak_fs.rs` (where it belongs) rather than dragging
+    /// mapping in `kiki_fs.rs` (where it belongs) rather than dragging
     /// every `TreeEntry` variant into this module.
     pub fn materialize_dir_for_mutation<F, I>(
         &self,

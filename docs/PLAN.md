@@ -1,4 +1,4 @@
-# jj-yak: Implementation Plan
+# kiki: Implementation Plan
 
 Status: active. Transport architecture decided (§4.3 Path C). M1–M10
 done — see [`PLAN-M1-6.md`](./PLAN-M1-6.md) for M1–M6 detail,
@@ -12,17 +12,17 @@ rehydrates across daemon restart; the per-mount `RemoteStore`
 read-through + post-snapshot push against `dir://` and `grpc://`
 backends; M10 added a CAS-arbitrated mutable refs catalog
 (`get_ref` / `cas_ref` / `list_refs` on the same `RemoteStore`
-service) and threaded the remote into `YakFs` so FUSE-side reads
+service) and threaded the remote into `KikiFs` so FUSE-side reads
 fall through to the remote on local-store miss. 137/115 daemon
 tests + 14/14 cli tests pass; `cargo clippy --workspace
 --all-targets -- -D warnings` is clean. Inode handle stability (§7
 decision 6) is still deferred; the in-memory slab is fine until
 kernel handles need to survive a daemon restart in production.
-M10.5 (§10.5) is done — `YakOpHeadsStore` drives the daemon's
+M10.5 (§10.5) is done — `KikiOpHeadsStore` drives the daemon's
 catalog (with a per-mount `LocalRefs` redb-backed fallback for
 the no-remote case) so two CLIs against a shared `dir://` remote
 serialize op-log advances rather than silently clobbering. M10.6
-(§10.6) is done — `YakOpStore` routes op-store contents
+(§10.6) is done — `KikiOpStore` routes op-store contents
 (operations + views) through the daemon with write-through to
 remote and read-through on local miss, so a peer CLI can read
 the bytes of ops another CLI wrote. `RemoteStore` blob ids
@@ -30,7 +30,7 @@ generalized from `&Id` (32-byte) to `&[u8]` so 64-byte
 BLAKE2b-512 op-store ids ride on the same blob CAS.
 192/167-daemon tests pass. Last updated: 2026-04-30
 
-This document captures the roadmap for getting jj-yak from "scaffold with
+This document captures the roadmap for getting kiki from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
 against the current code and external feasibility risks.
 
@@ -44,7 +44,7 @@ that eventually goes to a remote. Three orthogonal layers:
 ┌─────────────────────────────────────────────────────────────────┐
 │  Layer A: WC-over-VFS         <── core architectural bet        │
 │  Layer B: Backend persistence <── scaling / durability          │
-│  Layer C: Remote storage      <── the "yak" in jj-yak           │
+│  Layer C: Remote storage      <── the "kiki" in kiki           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,28 +62,28 @@ One-line summaries:
   `JujutsuService { sessions, store }` with a path-keyed `Mount` map
   exercising the WC RPCs (`Initialize`, `Set/GetCheckoutState`,
   `GetTreeState`, `Snapshot`).
-- **M2.** Wired `YakWorkingCopyFactory` into `Workspace::init_with_factories`
-  so `jj yak init` flows: factory → `YakWorkingCopy::init` →
+- **M2.** Wired `KikiWorkingCopyFactory` into `Workspace::init_with_factories`
+  so `jj kk init` flows: factory → `KikiWorkingCopy::init` →
   `SetCheckoutState` RPC. Op-id round-trips end-to-end through `jj op log`.
-- **M3.** Split `daemon/src/vfs.rs` into a `JjYakFs` trait + concrete
-  `YakFs` + `NfsAdapter` (macOS) and `FuseAdapter` (Linux). Read-only
+- **M3.** Split `daemon/src/vfs.rs` into a `JjKikiFs` trait + concrete
+  `KikiFs` + `NfsAdapter` (macOS) and `FuseAdapter` (Linux). Read-only
   surface: `lookup` / `getattr` / `read` / `readdir` / `readlink`.
-- **M4.** `jj yak init` actually mounts. Mountpoint validation,
+- **M4.** `jj kk init` actually mounts. Mountpoint validation,
   per-mount `Store` (every store RPC carries `working_copy_path`),
   `VfsManager` bind protocol, platform-specific attach
   (`fuse3::Session::mount_with_unprivileged` on Linux,
   `nfsserve::tcp::NFSTcpListener` + `mount_nfs` shellout on macOS),
   and the `InitializeReply.transport` oneof. Added the `disable_mount`
   test-mode flag.
-- **M5.** `CheckOut` RPC + `JjYakFs::check_out` re-roots the inode
-  slab via `swap_root`. CLI's `LockedYakWorkingCopy::check_out` calls
+- **M5.** `CheckOut` RPC + `JjKikiFs::check_out` re-roots the inode
+  slab via `swap_root`. CLI's `LockedKikiWorkingCopy::check_out` calls
   it. Conflicted trees rejected (single-id only).
 - **M6.** VFS write path + snapshot. Trait grew `create_file` /
   `mkdir` / `symlink` / `write` / `setattr` / `remove` / `snapshot`.
   Lazy clean→dirty promotion on the inode slab; recursive sync
   snapshot persists into the per-mount `Store` and preserves inode ids
   across snapshot. Adapters dispatch to the trait. `Snapshot` RPC
-  delegates to `JjYakFs::snapshot`.
+  delegates to `JjKikiFs::snapshot`.
 
 After M6 the daemon-side VCS surface is feature-complete.
 
@@ -95,14 +95,14 @@ missing FUSE methods between M6 and M7). One-line summaries:
 
 - **M7.** Two changes that together let `disable_mount = false` flip:
   - **M7.1** — `.jj/` lives outside the content-addressed user tree.
-    `YakFs::jj_subtree: Mutex<Option<InodeId>>` pins the metadata
+    `KikiFs::jj_subtree: Mutex<Option<InodeId>>` pins the metadata
     directory across `check_out` and excludes it from `snapshot`.
     `mkdir(root, ".jj")` populates the pin; `lookup`/`readdir`/
     `remove`/`rename` short-circuit at the root.
   - **M7.2** — two coupled bugs that broke `jj new` end-to-end on a
     real mount: (a) `swap_root` cleared the entire `by_parent`
     cache, severing the chain through pinned `.jj/`; fixed by
-    clearing only `(ROOT_INODE, *)` entries. (b) `LockedYakWorkingCopy::
+    clearing only `(ROOT_INODE, *)` entries. (b) `LockedKikiWorkingCopy::
     finish` didn't propagate the new `operation_id` back to the
     daemon; fixed by sending `SetCheckoutState` in `finish`.
   - Capstone: `cli/tests/common/mod.rs` flipped to `disable_mount =
@@ -143,15 +143,15 @@ missing FUSE methods between M6 and M7). One-line summaries:
   `list_refs` over the same gRPC service any daemon already
   serves (M10); `JujutsuInterface` gained
   `Get/Cas/ListCatalogRefs` for CLI access (M10.5). The CLI's
-  `YakOpHeadsStore` writes a single `op_heads` ref via CAS
+  `KikiOpHeadsStore` writes a single `op_heads` ref via CAS
   retry, with a per-mount `LocalRefs` redb-backed fallback when
   no remote is configured. **Op contents** (the actual operation
-  bytes) done at M10.6 (§10.6) — `YakOpStore` routes
+  bytes) done at M10.6 (§10.6) — `KikiOpStore` routes
   `read/write_view` and `read/write_operation` through the
   daemon with write-through to remote and read-through on local
   miss, so a peer CLI can read the bytes of ops another CLI wrote.
 - **FUSE-side read-through on `StoreMiss`** — done at M10 §10.6.
-  `YakFs` now holds an `Option<Arc<dyn RemoteStore>>`;
+  `KikiFs` now holds an `Option<Arc<dyn RemoteStore>>`;
   `read_tree`/`read_file`/`read_symlink` are async and fall
   through to the remote on local-store miss, sharing the
   verify-round-trip + persist helpers in `remote/fetch.rs` with
@@ -171,7 +171,7 @@ missing FUSE methods between M6 and M7). One-line summaries:
 - **Gitignore-aware VFS.** Active — M10.7 (§10.7). Prerequisite
   for real-world use with package managers and agent workflows.
 - **Sparse patterns:** `set_sparse_patterns` can stay `todo!` until there's
-  a real reason. Most yak users probably don't want sparse if the FS is
+  a real reason. Most kiki users probably don't want sparse if the FS is
   already lazy.
 
 ## 4. Areas of concern
@@ -187,7 +187,7 @@ For the record, since the original sketch worried about these:
 **Mounting NFS on Linux would have required root.** `mount(2)` on Linux
 is gated on `CAP_SYS_ADMIN`; nfsserve's server runs unprivileged but the
 kernel NFS *client* doesn't. **Closed by §4.3:** Linux uses FUSE
-(`fusermount3` is setuid; `jj yak init` runs as the user with no `sudo`).
+(`fusermount3` is setuid; `jj kk init` runs as the user with no `sudo`).
 
 **inotify/Watchman wouldn't see server-side mutations over NFS.** True,
 and `snapshot` without fsmonitor walks the entire WC. **Closed by §4.3
@@ -197,7 +197,7 @@ without scanning. macOS still has the original problem; see §4.2.
 
 **fsmonitor strategy still TBD for snapshot.** Resolved as a non-blocker
 by M6's actual shape (see §7 #7): the daemon's VFS owns every write, so
-`JjYakFs::snapshot` walks the slab and produces the rolled-up tree id
+`JjKikiFs::snapshot` walks the slab and produces the rolled-up tree id
 directly without jj-lib ever scanning.
 
 ### 4.2 Live risks (mostly macOS NFS)
@@ -254,9 +254,9 @@ shared trait shaped like the existing `NFSFileSystem` impl in
 `daemon/src/vfs.rs` covers both. Concretely:
 
 ```
-trait JjYakFs (≈15 async methods, our own type names)
-   ├── NfsAdapter:  impl nfsserve::NFSFileSystem for &dyn JjYakFs
-   └── FuseAdapter: impl fuse3::Filesystem      for &dyn JjYakFs
+trait JjKikiFs (≈15 async methods, our own type names)
+   ├── NfsAdapter:  impl nfsserve::NFSFileSystem for &dyn JjKikiFs
+   └── FuseAdapter: impl fuse3::Filesystem      for &dyn JjKikiFs
 ```
 
 **Adopted:**
@@ -303,7 +303,7 @@ specific corrections are archived in `PLAN-M1-6.md`.)
   when M3 reveals what's clunky." Promoted, decided, and adopted as the
   Linux primary path. macOS keeps NFS.
 - **Other ambient findings worth noting.**
-  - `LockedYakWorkingCopy` has 6 `todo!`s, not just `check_out`: `recover`
+  - `LockedKikiWorkingCopy` has 6 `todo!`s, not just `check_out`: `recover`
     (251), `rename_workspace` (268), `reset` (272), `sparse_patterns` (276),
     `set_sparse_patterns` (280).
   - jj-lib pinned to 0.40 (`Cargo.toml:22`). Predecessors-deletion TODO is
@@ -343,9 +343,9 @@ Worth doing in passing, not blocking:
 
 ### Decided
 
-1. **Transport architecture (§4.3).** Thin internal `JjYakFs` trait,
+1. **Transport architecture (§4.3).** Thin internal `JjKikiFs` trait,
    `fuse3` adapter on Linux, `nfsserve` adapter on macOS. Done in M3:
-   trait + concrete `YakFs` + both adapters live in
+   trait + concrete `KikiFs` + both adapters live in
    `daemon/src/vfs/`.
 2. **Linux mount privilege.** Falls out of (1): `fusermount3` setuid
    helper handles rootless mount; no `sudo` flow needed.
@@ -383,11 +383,11 @@ Worth doing in passing, not blocking:
 
 7. **fsmonitor strategy.** Resolved as a non-blocker by M6's actual
    shape. The daemon's VFS owns every write, so snapshot doesn't need
-   fsmonitor at all — `JjYakFs::snapshot` walks the slab and produces
+   fsmonitor at all — `JjKikiFs::snapshot` walks the slab and produces
    the rolled-up tree id directly. (Option (b) from §4.1 in spirit:
    daemon already knows what's dirty; jj-lib never has to scan.) Real
    integration with `WorkingCopy::snapshot` happens via the existing
-   `LockedYakWorkingCopy::snapshot` → `snapshot_via_daemon` path; no
+   `LockedKikiWorkingCopy::snapshot` → `snapshot_via_daemon` path; no
    jj-lib hook override required.
 8. **Concurrency model.** Multiple `Mount`s, each now with its own
    `Store` (decision 4). If two mounts point at the same remote
@@ -424,7 +424,7 @@ Worth doing in passing, not blocking:
 ## 8. Recommended starting point
 
 **M1–M10.5 are done.** Integration tests run with `disable_mount =
-false`: `jj yak init`, `jj new`, `jj log`, `jj op log`, and the
+false`: `jj kk init`, `jj new`, `jj log`, `jj op log`, and the
 `test_nested_tree_round_trips` / `test_symlink_tree_round_trips`
 end-to-end paths succeed on a real Linux FUSE mount; the per-mount
 Store is durable across daemon restarts (M8 in
@@ -432,16 +432,16 @@ Store is durable across daemon restarts (M8 in
 rides on every write/read RPC + post-snapshot walk (M9 in
 [`PLAN-M7-9.md`](./PLAN-M7-9.md) §13); M10 added the catalog
 protocol (CAS-arbitrated mutable refs alongside the blob CAS,
-§10.1–10.5) and FUSE-side lazy read-through inside `YakFs`
+§10.1–10.5) and FUSE-side lazy read-through inside `KikiFs`
 (§10.6). M10.5 wires jj-lib's `OpHeadsStore` to the catalog so
 two CLIs against a shared `dir://` remote serialize op-log
-advances rather than silently clobbering — `YakOpHeadsStore`
+advances rather than silently clobbering — `KikiOpHeadsStore`
 on the CLI side, `LocalRefs` redb-backed fallback on the daemon
 side for the no-remote case (§10.5). M7 detail in
 [`PLAN-M7-9.md`](./PLAN-M7-9.md) §10; M10 detail in §10 above;
 M10.5 detail in §10.5 above.
 
-**M10.6 (§10.6) is done.** `YakOpStore` routes op-store contents
+**M10.6 (§10.6) is done.** `KikiOpStore` routes op-store contents
 through the daemon with write-through to remote and read-through
 on local miss. Blob ids generalized from `&Id` (32-byte) to
 `&[u8]` so 64-byte BLAKE2b-512 op-store ids ride on the same
@@ -495,7 +495,7 @@ Cost (reconfirmed against actual sources):
   `JujutsuService::check_out` so we push `inval_inode(ROOT_INODE,
   0, 0)` + per-child `inval_entry` after the swap).
 
-Pre-requisite reading: our `JjYakFs` async methods are "async in
+Pre-requisite reading: our `JjKikiFs` async methods are "async in
 name only" — every body is sync (parking_lot mutex + Store calls
 are sync as of M6). So the sync→async bridge in the new fuser
 adapter is light: the bodies don't await anything we'd lose by
@@ -503,7 +503,7 @@ switching to a sync trait.
 
 **M10 update (2026-04-30):** that "async in name only" claim is no
 longer true at the read paths. M10 §10.6's lazy remote read-through
-makes `YakFs::read_tree`/`read_file`/`read_symlink` actually `await`
+makes `KikiFs::read_tree`/`read_file`/`read_symlink` actually `await`
 the `RemoteStore` on local miss. The fuser migration cost goes up
 slightly: the sync fuser callback bodies need a runtime handle for
 the post-M10 read paths the same way their write paths already
@@ -522,7 +522,7 @@ M10 owns two pieces that the M9 outcome left as explicit non-goals
    daemons over a shared remote can serialize "what's the latest
    op_id" without each silently overwriting the other.
 2. **FUSE-side remote read-through on `StoreMiss`.** Today
-   `vfs/yak_fs.rs::read_tree`/`read_file`/`read_symlink` map a
+   `vfs/kiki_fs.rs::read_tree`/`read_file`/`read_symlink` map a
    local-store miss straight onto `EIO`. M9 wired the remote into
    `service.rs` for the RPC layer; M10 threads it into the FS
    layer too, so clone-style flows (where the kernel asks the
@@ -706,7 +706,7 @@ to exercise refs do so against `Mount.remote_store` directly
 
 ### 10.6 FUSE-side remote read-through on `StoreMiss`
 
-Lazy fetch on miss inside `vfs/yak_fs.rs`. Current shape:
+Lazy fetch on miss inside `vfs/kiki_fs.rs`. Current shape:
 
 ```rust
 fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
@@ -737,21 +737,21 @@ async fn read_tree(&self, id: Id) -> Result<Tree, FsError> {
 Same shape for `read_file` and `read_symlink`. The
 `fetch_*_through` helpers (verify-round-trip + persist locally)
 already exist in `service.rs` — M10 factors them into
-`remote/fetch.rs` so both `service.rs` and `yak_fs.rs` share one
+`remote/fetch.rs` so both `service.rs` and `kiki_fs.rs` share one
 implementation. No new round-trip semantics — just a relocation.
 
 Mechanical fallout:
 
-- `YakFs` gains `remote: Option<Arc<dyn RemoteStore>>` (set at
+- `KikiFs` gains `remote: Option<Arc<dyn RemoteStore>>` (set at
   construction, same as `store`).
-- `YakFs::new` becomes `YakFs::new(store, root_tree, remote)`;
+- `KikiFs::new` becomes `KikiFs::new(store, root_tree, remote)`;
   `service.rs::Initialize` and `rehydrate` both pass the parsed
   remote in.
 - `read_tree`/`read_file`/`read_symlink` go from `&self -> Result`
   to `async &self -> Result`. Their call sites inside the trait's
   `async` methods already `.await`, so the change propagates.
-- Tests that constructed `YakFs::new(store, root_tree)` switch
-  to `YakFs::new(store, root_tree, None)`.
+- Tests that constructed `KikiFs::new(store, root_tree)` switch
+  to `KikiFs::new(store, root_tree, None)`.
 
 **Why lazy, not warm-on-CheckOut.** A clone-style workflow
 typically opens a handful of files in a multi-thousand-file tree;
@@ -802,7 +802,7 @@ One commit per task:
    client impl + the gRPC end-to-end test.
 5. FUSE-side remote read-through: extract shared
    `fetch_*_through` helpers into `remote/fetch.rs`; thread
-   `Option<Arc<dyn RemoteStore>>` into `YakFs`; flip
+   `Option<Arc<dyn RemoteStore>>` into `KikiFs`; flip
    `read_tree`/`read_file`/`read_symlink` to async; update call
    sites; add a service-level read-through-via-FS test.
 6. PLAN.md §10.9 — M10 outcome.
@@ -821,7 +821,7 @@ One commit per task:
   S3.
 - **Stable inode ids across restarts (PLAN §7 decision 6).**
   Still deferred; the M10 read-through change touches the same
-  `YakFs` struct, but the slab-id source is unchanged.
+  `KikiFs` struct, but the slab-id source is unchanged.
 - **Async background push queue.** Still M10/M11 follow-up;
   current `Snapshot` blocks on remote.
 
@@ -895,7 +895,7 @@ Decisions made on the way:
   said factor; we did. The helpers return a typed `FetchError`
   (NotFound / DataLoss / Decode / DecodeValue / LocalWrite /
   Remote), so `service.rs` maps onto gRPC `Status` codes and
-  `vfs/yak_fs.rs` maps onto `FsError`. Both consumers reach for
+  `vfs/kiki_fs.rs` maps onto `FsError`. Both consumers reach for
   the variant they care about (typically NotFound and DataLoss)
   and collapse the rest. No more `verify_round_trip` duplicated
   across modules.
@@ -909,7 +909,7 @@ Decisions made on the way:
   separate cleanup pass could collapse the two; out of M10
   scope.
 
-- **`YakFs::read_*` go async; six private helpers follow.**
+- **`KikiFs::read_*` go async; six private helpers follow.**
   Mechanical propagation: `read_tree`, `read_file`,
   `read_symlink` await `RemoteStore::get_blob` on miss; their
   callers (`dir_tree`, `ensure_dirty_tree`, `ensure_dirty_file`,
@@ -931,19 +931,19 @@ Decisions made on the way:
 - **`mkdir`'s pinned-`.jj/` arm releases the
   `parking_lot::Mutex` before awaiting `attr_for`.**
   `parking_lot::MutexGuard` is `!Send`; held across an
-  `.await` it would break the `JjYakFs: Send + Sync` bound.
+  `.await` it would break the `JjKikiFs: Send + Sync` bound.
   Wrapped the lock in a block so the guard drops before the
   await.
 
 - **Service-level FUSE read-through tests live in
-  `service.rs`, not `vfs/yak_fs.rs::tests`.** Drives a real
+  `service.rs`, not `vfs/kiki_fs.rs::tests`.** Drives a real
   `JujutsuService` with a configured `dir://` remote so the
   test exercises the same `Initialize` → `Mount.remote_store`
-  → `YakFs::new(..., remote)` plumbing that production hits.
-  `vfs/yak_fs.rs::tests` could mock a `RemoteStore` directly,
+  → `KikiFs::new(..., remote)` plumbing that production hits.
+  `vfs/kiki_fs.rs::tests` could mock a `RemoteStore` directly,
   but the integration version catches a wiring regression
   (e.g. forgetting to pass `remote_store.clone()` to
-  `YakFs::new` in either `Initialize` or `rehydrate`) that a
+  `KikiFs::new` in either `Initialize` or `rehydrate`) that a
   unit test wouldn't.
 
 - **Re-export `FileKind` under `cfg(test)`.** Production code
@@ -966,7 +966,7 @@ What this milestone explicitly does **not** do (preserved from
   M11 alongside S3.
 - Stable inode ids across restarts (§7 decision 6). With the
   `fuser` migration (§9). M10 did slightly raise the cost of
-  that migration: `JjYakFs::read_*` are no longer "async in
+  that migration: `JjKikiFs::read_*` are no longer "async in
   name only" — they genuinely await on miss, so the fuser
   adapter's sync→async bridge has more to do at the read paths
   than the §9 estimate accounted for.
@@ -1024,7 +1024,7 @@ instead of the local filesystem.
 
 In:
 
-- Custom `YakOpHeadsStore` impl in `cli/src/op_heads_store.rs`,
+- Custom `KikiOpHeadsStore` impl in `cli/src/op_heads_store.rs`,
   driven by the daemon's catalog RPCs.
 - `JujutsuInterface` gains the three catalog RPCs (CLI never
   dials a remote directly — every CLI traffic still goes to the
@@ -1039,7 +1039,7 @@ In:
 
 Out (deferred):
 
-- **Custom `YakOpStore` (op contents).** The op contents (operations,
+- **Custom `KikiOpStore` (op contents).** The op contents (operations,
   views) still live in `.jj/op_store/` over FUSE → per-mount Store,
   not pushed anywhere. So a two-CLI shared op log won't work
   end-to-end yet — CLI_B can't read the bytes of operations CLI_A
@@ -1069,8 +1069,8 @@ Out (deferred):
 
 2. **Local fallback when no remote configured.** Without a
    fallback, every existing test (which passes `remote = ""`)
-   would break the moment we swap in `YakOpHeadsStore`. With a
-   fallback, `YakOpHeadsStore` is unconditional and the catalog
+   would break the moment we swap in `KikiOpHeadsStore`. With a
+   fallback, `KikiOpHeadsStore` is unconditional and the catalog
    API is uniform. §10.2 said "we'd add an in-memory or
    redb-backed `RemoteStore` impl and point `mount.remote_store`
    at it" — that's exactly what M10.5 does, except we keep
@@ -1162,7 +1162,7 @@ transaction.
   with `remote = ""` (so `Mount.remote_store = None`) and
   confirm catalog RPCs hit `LocalRefs`; drive a service with
   `remote = dir:///…` and confirm they hit the FsRemoteStore.
-- **`YakOpHeadsStore` unit tests** — drive against a fake
+- **`KikiOpHeadsStore` unit tests** — drive against a fake
   `BlockingJujutsuInterfaceClient` (or a real daemon in
   test env), exercise update_op_heads/get_op_heads/serialize/
   deserialize.
@@ -1183,7 +1183,7 @@ One commit per logical step:
 3. Proto + daemon: catalog RPCs on `JujutsuInterface` + dispatch
    to remote-or-local + service tests.
 4. CLI: `BlockingJujutsuInterfaceClient` gains the three catalog
-   methods + `YakOpHeadsStore` impl + register factory in
+   methods + `KikiOpHeadsStore` impl + register factory in
    `Workspace::init_with_factories`.
 5. Two-CLI acceptance test.
 6. PLAN.md §10.5 outcome.
@@ -1203,7 +1203,7 @@ already gives us:
 
 What jj-lib expects from a custom `OpHeadsStore`:
 
-- `name() -> &str` — pick `"yak_op_heads"`.
+- `name() -> &str` — pick `"kiki_op_heads"`.
 - `update_op_heads(old_ids: &[OperationId], new_id: &OperationId)
    -> Result<(), OpHeadsStoreError>`. CAS read+swap.
 - `get_op_heads() -> Result<Vec<OperationId>, OpHeadsStoreError>`.
@@ -1211,10 +1211,10 @@ What jj-lib expects from a custom `OpHeadsStore`:
 - `lock() -> Result<Box<dyn OpHeadsStoreLock + '_>,
    OpHeadsStoreError>`. No-op token.
 
-The factory side: `StoreFactories::add_op_heads_store("yak_op_heads", ...)`
+The factory side: `StoreFactories::add_op_heads_store("kiki_op_heads", ...)`
 in `create_store_factories`, and replace `default_op_heads_store_initializer()`
 in `Workspace::init_with_factories` with a closure that constructs
-`YakOpHeadsStore`.
+`KikiOpHeadsStore`.
 
 ### 10.5.8 M10.5 outcome
 
@@ -1238,14 +1238,14 @@ Six commits across the M10.5 sequence (numbered to match
    dispatch matrix (no-remote → LocalRefs; remote configured
    → FsRemoteStore; per-mount isolation; bad-name reject;
    unknown-mount NotFound).
-4. `cli: M10.5 — YakOpHeadsStore drives the daemon catalog`. ✅
+4. `cli: M10.5 — KikiOpHeadsStore drives the daemon catalog`. ✅
    Custom `OpHeadsStore` impl writes a single `op_heads` ref
    in length-prefixed concat format. CAS retry loop bounded
    at 64 iterations; `expected_for_empty` helper distinguishes
    absent-vs-empty on the wire so the create-only first call
    doesn't silently overwrite a concurrent writer's ref.
    Wire-up via both `Workspace::init_with_factories` (writing
-   the `yak_op_heads` type tag) and a registered
+   the `kiki_op_heads` type tag) and a registered
    `add_op_heads_store` factory (subsequent loads honor the
    tag). 7 unit tests on the encode/decode round-trip.
 5. `cli: M10.5 — two-CLI catalog arbitration acceptance test`. ✅
@@ -1325,11 +1325,11 @@ Decisions made on the way:
 - **`CliRunner::add_store_factories` merges with collision
   panic, so `StoreFactories::empty()` stays.** Briefly tried
   `StoreFactories::default()` to register the SimpleBackend
-  alongside the Yak backend; the resulting double-registration
-  panic surfaced at `jj yak init` time with
+  alongside the Kiki backend; the resulting double-registration
+  panic surfaced at `jj kk init` time with
   `Conflicting factory definitions for 'Simple' factory`.
   Reverted to `empty()` and added an explanatory comment —
-  CliRunner adds the defaults, we add only the yak-specific
+  CliRunner adds the defaults, we add only the kiki-specific
   factories on top.
 
 - **Test-time deterministic-ID gotcha.** Two `TestEnvironment`s
@@ -1345,7 +1345,7 @@ Decisions made on the way:
 What this milestone explicitly does **not** do (preserved from
 §10.5.1, repeated here so it's findable in the outcome):
 
-- **Custom `YakOpStore` (op contents).** The op contents
+- **Custom `KikiOpStore` (op contents).** The op contents
   (operations, views) still live in `<wc>/.jj/op_store/` over
   FUSE → per-mount Store, not pushed anywhere. So a two-CLI
   shared op log won't work end-to-end yet — CLI_B can see A's
@@ -1399,16 +1399,16 @@ Test coverage added in M10.5 (24 new tests, total
 
 ## 10.6. M10.6 — wire jj-lib's op-store contents through the remote
 
-M10.5 closed the **arbitration** story: `YakOpHeadsStore` drives the
+M10.5 closed the **arbitration** story: `KikiOpHeadsStore` drives the
 catalog so two CLIs against a shared remote serialize op-log
 advances rather than clobbering. But op contents — the actual
 `Operation` and `View` objects — still live in
 `<wc>/.jj/repo/op_store/` via `SimpleOpStore`. CLI_B can see
 CLI_A's op-head id in the catalog, but can't read CLI_A's op bytes.
 
-M10.6 closes the **content** story. A custom `YakOpStore` routes
+M10.6 closes the **content** story. A custom `KikiOpStore` routes
 `read_view`/`write_view`/`read_operation`/`write_operation` through
-the daemon (same pattern as `YakBackend` for commits/trees/files),
+the daemon (same pattern as `KikiBackend` for commits/trees/files),
 with write-through to the remote and read-through on local miss.
 After M10.6, two CLIs sharing a `dir://` remote can each read the
 other's full operation history.
@@ -1435,7 +1435,7 @@ In:
   `ResolveOperationIdPrefix` — all carry `working_copy_path`.
   Handlers follow the same write-through + read-through pattern
   as the existing blob RPCs.
-- **CLI `YakOpStore`.** Custom `OpStore` impl in
+- **CLI `KikiOpStore`.** Custom `OpStore` impl in
   `cli/src/op_store.rs`, routes through
   `BlockingJujutsuInterfaceClient`. Handles root operation/view
   synthetically (same as `SimpleOpStore`). `gc` is a no-op.
@@ -1480,7 +1480,7 @@ Out (deferred):
    blobs use a post-`Snapshot` reachability walk because the VFS
    produces them in bulk and the walk ensures nothing is missed.
    Op-store data is written one object at a time by jj-lib, and
-   each write goes through `YakOpStore::write_*` → daemon →
+   each write goes through `KikiOpStore::write_*` → daemon →
    remote. There's no "orphan op-store object" risk, so no walk
    is needed. Each `WriteView`/`WriteOperation` RPC pushes to the
    remote inline (same as `WriteCommit` today).
@@ -1488,7 +1488,7 @@ Out (deferred):
 4. **Root operation and root view are synthetic.** `SimpleOpStore`
    constructs the root operation (id = `[0; 64]`) and root view
    in-memory from `RootOperationData { root_commit_id }`. The
-   daemon never stores them. `YakOpStore` does the same: short-
+   daemon never stores them. `KikiOpStore` does the same: short-
    circuit on root ids, return the synthetic objects, never hit
    the daemon.
 
@@ -1510,12 +1510,12 @@ Out (deferred):
    bump. Length validation happens at the RPC boundary, not the
    storage layer.
 
-7. **`YakOpStore` factory receives `RootOperationData`.** Unlike
+7. **`KikiOpStore` factory receives `RootOperationData`.** Unlike
    the `OpHeadsStore` factory (which takes `settings` + `path`),
    the `OpStore` factory signature is
    `fn(settings, store_path, RootOperationData) -> OpStore`.
    The `root_commit_id` inside `RootOperationData` is needed to
-   construct the synthetic root view. `YakOpStore` stores it as
+   construct the synthetic root view. `KikiOpStore` stores it as
    a field.
 
 ### 10.6.3 Wire protocol
@@ -1601,7 +1601,7 @@ One commit per logical step:
    raw-bytes methods + prefix-scan + unit tests.
 4. Daemon `service.rs`: op-store RPC handlers with write-through +
    read-through + service-level tests.
-5. CLI: `YakOpStore` impl + `BlockingJujutsuInterfaceClient`
+5. CLI: `KikiOpStore` impl + `BlockingJujutsuInterfaceClient`
    methods + factory registration in `main.rs`.
 6. Two-CLI acceptance test.
 7. PLAN.md §10.6 outcome.
@@ -1627,7 +1627,7 @@ What's already in place from M10/M10.5:
 
 What jj-lib expects from a custom `OpStore`:
 
-- `name() -> &str` — `"yak_op_store"`.
+- `name() -> &str` — `"kiki_op_store"`.
 - `root_operation_id() -> &OperationId` — `[0; 64]`.
 - `read_view(id) -> View` — daemon RPC, short-circuit root.
 - `write_view(view) -> ViewId` — serialize, hash, daemon RPC.
@@ -1639,15 +1639,15 @@ What jj-lib expects from a custom `OpStore`:
   daemon RPC.
 - `gc(head_ids, keep_newer) -> ()` — no-op.
 
-Serialization: `YakOpStore` wraps a `SimpleOpStore` as a local
+Serialization: `KikiOpStore` wraps a `SimpleOpStore` as a local
 serialization delegate and cache. jj-lib's `view_to_proto` /
 `operation_to_proto` / `view_from_proto` / `operation_from_proto`
 are private (~300 lines tightly coupled to jj-lib internals);
 wrapping `SimpleOpStore` avoids reimplementing them. On write,
 the delegate serializes + content-hashes and writes to disk; the
-`YakOpStore` reads back the bytes and pushes them to the daemon.
+`KikiOpStore` reads back the bytes and pushes them to the daemon.
 On read, the delegate tries its local disk first; on miss the
-`YakOpStore` fetches from the daemon, writes the bytes to the
+`KikiOpStore` fetches from the daemon, writes the bytes to the
 delegate's disk path, and re-reads through the delegate to
 deserialize. The daemon is format-agnostic — it just stores bytes.
 
@@ -1674,12 +1674,12 @@ Six commits across the M10.6 sequence (numbered to match
    `WriteOperation`/`ReadOperation`/`ResolveOperationIdPrefix`
    — same write-through + read-through shape as the blob handlers.
    12 new tests (7 store-level + 5 service-level).
-4. `cli: M10.6 — YakOpStore impl + BlockingJujutsuInterfaceClient
-   methods + factory registration`. ✅ `YakOpStore` wraps
+4. `cli: M10.6 — KikiOpStore impl + BlockingJujutsuInterfaceClient
+   methods + factory registration`. ✅ `KikiOpStore` wraps
    `SimpleOpStore` as serialization delegate + local cache;
    pushes to daemon on write, fetches from daemon on read miss.
    `resolve_operation_id_prefix` merges daemon scan with root-id
-   check. Factory registered via `add_op_store("yak_op_store", …)`;
+   check. Factory registered via `add_op_store("kiki_op_store", …)`;
    init path replaces `default_op_store_initializer()`.
 5. `cli: M10.6 — two-CLI op-store content sharing acceptance
    test`. ✅ Two tests: single-CLI `jj op log` works end-to-end;
@@ -1708,7 +1708,7 @@ Decisions made on the way:
   computes content hashes). The existing "server rejects short
   id" gRPC test became "server rejects empty id".
 
-- **`YakOpStore` wraps `SimpleOpStore`, not a from-scratch
+- **`KikiOpStore` wraps `SimpleOpStore`, not a from-scratch
   reimplementation.** jj-lib's proto conversion functions
   (`view_to_proto`, `operation_from_proto`, etc.) are private.
   Reimplementing ~300 lines of tightly-coupled conversion code
@@ -1741,7 +1741,7 @@ Decisions made on the way:
 
 - **`resolve_operation_id_prefix` merges root-id with daemon
   scan.** The root operation (id `[0; 64]`) is synthetic — never
-  stored in the daemon's table. `YakOpStore` checks the root
+  stored in the daemon's table. `KikiOpStore` checks the root
   locally and merges with the daemon's redb scan result. A root
   match + daemon single-match of a different id → ambiguous.
 
@@ -1775,7 +1775,7 @@ Test coverage added in M10.6 (15 new tests, total 192):
   `write_operation_pushes_and_read_through_works`,
   `resolve_operation_id_prefix_works`.
 - `cli::tests::test_op_store_sharing` (integration, 2 new):
-  `cli_reads_own_ops_via_yak_op_store`,
+  `cli_reads_own_ops_via_kiki_op_store`,
   `two_clis_share_op_contents_via_remote`.
 
 ## 10.7. M10.7 — gitignore-aware VFS
@@ -1810,7 +1810,7 @@ In:
   so the snapshot walk skips them. Alternatively, ignored content
   could spill to a per-mount scratch directory on disk to avoid
   holding large dependency trees in RAM. Decision in §10.7.2.
-- **`SnapshotOptions` bridge.** `YakWorkingCopy::snapshot` stops
+- **`SnapshotOptions` bridge.** `KikiWorkingCopy::snapshot` stops
   ignoring `_options: &SnapshotOptions`. The `base_ignores` from
   jj-lib are forwarded to the daemon via a new `SnapshotReq` field
   (serialized gitignore patterns), or the daemon loads them
@@ -1904,7 +1904,7 @@ struct IgnoreRules {
     nested: HashMap<InodeId, GitIgnoreFile>,
 }
 
-impl YakFs {
+impl KikiFs {
     /// Called at check_out time and on .gitignore write.
     fn load_ignore_rules(&self) -> IgnoreRules {
         // Read /.gitignore from the slab (or content tree).
@@ -1933,7 +1933,7 @@ isn't jj-specific).
 
 ### 10.7.4 Snapshot changes
 
-Before (current, yak_fs.rs line 736):
+Before (current, kiki_fs.rs line 736):
 
 ```rust
 // Only exclusion: skip .jj/ at root
@@ -2048,12 +2048,12 @@ In:
   complete, reachable object graph.
 - **Health surface** — `DaemonStatus` gains per-mount queue depth
   and last-successful-push timestamp so the CLI can surface sync
-  state to the user (`jj yak status` shows "3 blobs pending,
+  state to the user (`jj kk status` shows "3 blobs pending,
   last sync 2m ago" or "offline, 47 blobs queued").
 - **Retry with backoff** — transport errors trigger exponential
   backoff (1s → 2s → 4s → ... → 60s cap). A successful push
   resets the backoff. The daemon doesn't spam a dead remote.
-- **CLI tolerance** — `YakOpHeadsStore::update_op_heads` (lines
+- **CLI tolerance** — `KikiOpHeadsStore::update_op_heads` (lines
   172–243 in `cli/src/op_heads_store.rs`) currently fails
   immediately on transport error. M11 adds a fallback: on
   transport error, write the op-heads update to the local catalog
@@ -2163,7 +2163,7 @@ Out (deferred):
    hasn't happened yet.
 
 9. **CLI op-heads fallback to LocalRefs.** Currently,
-   `YakOpHeadsStore::update_op_heads` calls
+   `KikiOpHeadsStore::update_op_heads` calls
    `cas_catalog_ref(...)` which routes through the daemon to
    the remote. If the remote is down, the daemon returns
    `Status::internal` and the CLI fails. M11 adds a two-tier
@@ -2408,7 +2408,7 @@ message MountInfo {
 }
 ```
 
-The CLI's `jj yak status` output changes from:
+The CLI's `jj kk status` output changes from:
 
 ```
   /home/user/repo  grpc://server:9090

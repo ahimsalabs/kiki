@@ -101,7 +101,7 @@ impl BlockingJujutsuInterfaceClient {
     }
 
     // Store RPCs all carry `working_copy_path` on the request side now (see
-    // proto/jj_interface.proto). YakBackend stamps it from its own
+    // proto/jj_interface.proto). KikiBackend stamps it from its own
     // `working_copy_path` field on every call.
 
     pub fn write_commit(
@@ -194,7 +194,7 @@ impl BlockingJujutsuInterfaceClient {
     // The CLI talks to the local daemon's `JujutsuInterface` for every
     // RPC; the daemon dispatches per-mount to either the configured
     // remote's catalog or the local-fallback `LocalRefs` (PLAN.md
-    // §10.5.2 decision 1). `YakOpHeadsStore` (cli/src/op_heads_store.rs)
+    // §10.5.2 decision 1). `KikiOpHeadsStore` (cli/src/op_heads_store.rs)
     // is the sole consumer today.
 
     pub fn get_catalog_ref(
@@ -215,7 +215,7 @@ impl BlockingJujutsuInterfaceClient {
         rt.block_on(client.cas_catalog_ref(request))
     }
 
-    // Unused by the only M10.5 consumer (`YakOpHeadsStore`) since the
+    // Unused by the only M10.5 consumer (`KikiOpHeadsStore`) since the
     // single-`op_heads`-ref keying doesn't need enumeration. Kept on
     // the client surface so a future branch-tip / multi-ref consumer
     // doesn't bounce back through the proto crate to add it.
@@ -232,7 +232,7 @@ impl BlockingJujutsuInterfaceClient {
     // ---- M10.6: op-store RPCs -----------------------------------------
     //
     // The daemon stores/forwards opaque bytes; serialization and content
-    // hashing happen on the CLI side (YakOpStore in op_store.rs).
+    // hashing happen on the CLI side (KikiOpStore in op_store.rs).
 
     pub fn write_view(
         &self,

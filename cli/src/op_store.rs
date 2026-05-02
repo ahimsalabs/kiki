@@ -1,4 +1,4 @@
-//! M10.6: `YakOpStore` — jj-lib's `OpStore` routed through the daemon.
+//! M10.6: `KikiOpStore` — jj-lib's `OpStore` routed through the daemon.
 //!
 //! Wraps a [`SimpleOpStore`] as a local serialization delegate and cache.
 //! On write, the delegate serializes + content-hashes the domain object
@@ -32,7 +32,7 @@ const OPERATION_ID_LENGTH: usize = 64;
 const VIEW_ID_LENGTH: usize = 64;
 
 #[derive(Debug)]
-pub struct YakOpStore {
+pub struct KikiOpStore {
     /// Local serialization delegate + cache. Handles proto encoding/
     /// decoding and content hashing. The store_path is the standard
     /// `<wc>/.jj/repo/op_store/`.
@@ -46,9 +46,9 @@ pub struct YakOpStore {
     root_view_id: ViewId,
 }
 
-impl YakOpStore {
+impl KikiOpStore {
     pub fn name() -> &'static str {
-        "yak_op_store"
+        "kiki_op_store"
     }
 
     /// Create a new op store (init path). Creates the base directories.
@@ -115,7 +115,7 @@ impl YakOpStore {
 }
 
 #[async_trait]
-impl OpStore for YakOpStore {
+impl OpStore for KikiOpStore {
     fn name(&self) -> &str {
         Self::name()
     }

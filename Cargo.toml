@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 authors = ["Benjamin Brittain <ben@brittain.org>"]
-description = "a remote backend for JJ"
+description = "kiki — a remote backend for jj"
 version = "0.0.1"
 
 [workspace.dependencies]
