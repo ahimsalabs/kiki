@@ -10,8 +10,10 @@ files tagged `ignored` at creation, `snapshot_node` skips ignored
 inodes. `.kiki-redirections` file redirects configured dirs
 (`node_modules/`, `target/`, etc.) to local scratch storage via
 symlinks — all I/O bypasses FUSE entirely. Hot-reload on `.gitignore`
-and `.kiki-redirections` writes. Next up: M11 (async push queue),
-daemon lifecycle polish, workspaces. Last updated: 2026-05-02
+and `.kiki-redirections` writes. **M12 (managed workspaces) active:**
+single `RootFs` FUSE mount at `/mnt/kiki/`, per-repo shared git
+store, cheap workspace creation, lazy hydration. Next up: M12
+implementation, M11 (async push queue). Last updated: 2026-05-02
 
 This document captures the roadmap for getting kiki from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -46,7 +48,7 @@ wasted effort. If it does, B and C are routine engineering.
 | **M11** — async push queue + offline resilience | active | [`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md) |
 | **Git convergence** — replace custom content store with jj-lib `GitBackend` | active | [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md) |
 | **Daemon lifecycle** — auto-start, launchd/systemd integration | active | [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md) |
-| **Workspaces** — managed namespace, multi-workspace orchestration | future | [`WORKSPACES.md`](./WORKSPACES.md) |
+| **M12 — Workspaces** — single RootFs mount, managed namespace, multi-workspace orchestration | active | [`M12-WORKSPACES.md`](./M12-WORKSPACES.md), [`WORKSPACES.md`](./WORKSPACES.md) |
 | **Linear history & segment index** — `linear` ref protection, O(1) ancestor queries | future | [`LINEAR_HISTORY.md`](./LINEAR_HISTORY.md) |
 | **Inode GC** — evict unused inodes from memory (critical for macOS NFS) | future | §10 |
 | **Graceful restart / takeover** — fd-passing so daemon upgrades don't unmount | future | §10 |
