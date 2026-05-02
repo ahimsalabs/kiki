@@ -136,7 +136,7 @@ parentless) on write, and injects `root_commit_id` on read.
 The mapping is rebuildable: walk all git objects, re-hash content as
 BLAKE3 via the kiki store, and reconstruct.
 
-### Push flow (`cli kk git push`)
+### Push flow (`kiki git push`)
 
 ```
 1. CLI sends GitPush RPC to daemon (with remote name, bookmark patterns)
@@ -178,7 +178,7 @@ BLAKE3 via the kiki store, and reconstruct.
 6. Commit transaction: tx.commit("push to <remote>")
 ```
 
-### Fetch flow (`cli kk git fetch`)
+### Fetch flow (`kiki git fetch`)
 
 ```
 1. CLI sends GitFetch RPC to daemon
@@ -525,38 +525,43 @@ protobuf, never in git commit headers. Handled transparently by
 
 ## CLI command design
 
-### `jj kk git push` / `jj kk git fetch`
+### `kiki git push` / `kiki git fetch`
 
 ```bash
 # Add a git remote to an existing kiki repo
-jj kk git remote add origin https://github.com/user/repo.git
+kiki git remote add origin https://github.com/user/repo.git
 
 # Push bookmarks to GitHub
-jj kk git push --remote origin
-jj kk git push --remote origin --bookmark main
+kiki git push --remote origin
+kiki git push --remote origin --bookmark main
 
 # Fetch from GitHub
-jj kk git fetch --remote origin
+kiki git fetch --remote origin
 
 # List git remotes
-jj kk git remote list
+kiki git remote list
 ```
 
-The `jj kk git` subcommand tree mirrors `jj git` as closely as possible.
+These are the same commands as `jj git push/fetch/remote`. A dispatch
+hook on `CliRunner` detects kiki-backend repos (by reading
+`.jj/repo/store/type`) and routes through the daemon. On non-kiki
+repos, the hook falls through to jj's built-in git commands.
 
-### Why not `jj git push` directly
+### How the dispatch hook works
 
-`jj git push` calls `git::get_git_backend(store)` which downcasts to
-`GitBackend`. Since kiki repos use `KikiBackend`, the downcast fails with
-`UnexpectedGitBackendError`. There is no extension point in jj-cli to
-intercept this.
+jj's `jj git push` calls `git::get_git_backend(store)` which
+downcasts to `GitBackend`. Since kiki repos use `KikiBackend`, the
+downcast fails with `UnexpectedGitBackendError`. The
+`add_dispatch_hook` API lets kiki intercept the `git` subcommand
+before jj's dispatch runs, re-parse the args, and route to the
+daemon-backed implementation.
 
 ### Future: upstream `jj git push` support
 
-The right long-term fix is an upstream contribution to jj: a trait like
-`GitSyncable` that any backend can implement, replacing the hard downcast
-to `GitBackend`. A working kiki implementation would strengthen that
-proposal with a concrete use case.
+The right long-term fix is an upstream contribution to jj: a trait
+like `GitSyncable` that any backend can implement, replacing the hard
+downcast to `GitBackend`. A working kiki implementation would
+strengthen that proposal with a concrete use case.
 
 ## Scope estimate
 
@@ -571,7 +576,7 @@ proposal with a concrete use case.
 | Graph walker (fetch direction) | ~50 | `daemon/src/git.rs` |
 | `GitPush` / `GitFetch` daemon RPCs | ~100 | `daemon/src/service.rs` |
 | Proto definitions for new RPCs | ~30 | `proto/jj_interface.proto` |
-| CLI commands (`kk git push/fetch/remote`) | ~80 | `cli/src/main.rs` |
+| CLI commands (`git push/fetch/remote` dispatch hook) | ~80 | `cli/src/main.rs` |
 | **Total** | **~640** | |
 
 The distribution of complexity shifts toward the object graph translator

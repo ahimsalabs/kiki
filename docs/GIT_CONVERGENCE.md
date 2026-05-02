@@ -158,7 +158,7 @@ There is no format boundary anywhere in the system.
 
 This means:
 - A colleague can clone from S3 or from GitHub — same objects.
-- An S3-backed repo can `jj kk git push` to GitHub with zero
+- An S3-backed repo can `kiki git push` to GitHub with zero
   translation — the git objects already exist locally.
 - A GitHub-backed repo can add an S3 remote for fast internal sync
   — same bytes, different transport.
@@ -561,21 +561,22 @@ apply naturally. No special handling needed.
 
 ```bash
 # Add a git remote to an existing kiki repo
-jj kk git remote add origin https://github.com/user/repo.git
+kiki git remote add origin https://github.com/user/repo.git
 
 # Push bookmarks to GitHub
-jj kk git push --remote origin
-jj kk git push --remote origin --bookmark main
+kiki git push --remote origin
+kiki git push --remote origin --bookmark main
 
 # Fetch from GitHub
-jj kk git fetch --remote origin
+kiki git fetch --remote origin
 
 # List git remotes
-jj kk git remote list
+kiki git remote list
 ```
 
-The `jj kk git` subcommand tree mirrors `jj git` as closely as
-possible.
+These are the same commands as `jj git`. A dispatch hook on
+`CliRunner` detects kiki-backend repos and routes through the daemon.
+On non-kiki repos, falls through to jj's built-in git commands.
 
 ### Multi-remote workflow
 
@@ -594,8 +595,8 @@ jj new -m "add feature"
 jj kk init --remote s3://company-bucket/repos/my-project ~/teammate-copy
 
 # When ready, push to GitHub for a PR (batch, public)
-jj kk git remote add origin git@github.com:company/my-project.git
-jj kk git push --remote origin --bookmark main
+kiki git remote add origin git@github.com:company/my-project.git
+kiki git push --remote origin --bookmark main
 
 # External contributor clones from GitHub
 jj git clone git@github.com:company/my-project.git
@@ -770,7 +771,7 @@ This is a breaking change to the on-disk format. Existing kiki repos
 (with 32-byte BLAKE3 IDs in redb) are incompatible. Since kiki is
 pre-release, this is acceptable.
 
-Migration path: `jj kk init` creates a new repo with git-backed
+Migration path: `kiki kk init` creates a new repo with git-backed
 storage. Existing repos can be abandoned or migrated with a one-time
 export/import tool (low priority).
 

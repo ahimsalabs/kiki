@@ -1,8 +1,10 @@
 #![deny(warnings)]
 
 use jj_cli::{
-    cli_util::{CliRunner, CommandHelper},
-    command_error::{cli_error, internal_error_with_message, user_error_with_message, CommandError},
+    cli_util::{BoxedAsyncCliDispatch, CliRunner, CommandHelper},
+    command_error::{
+        cli_error, internal_error_with_message, user_error, user_error_with_message, CommandError,
+    },
     ui::Ui,
 };
 use jj_lib::{
@@ -86,11 +88,11 @@ struct GitRemoteAddArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 struct GitPushArgs {
-    /// Remote to push to
-    #[arg(long, default_value = "origin")]
-    remote: String,
-    /// Bookmark(s) to push (can be repeated)
+    /// Remote to push to (defaults to "origin")
     #[arg(long)]
+    remote: Option<String>,
+    /// Bookmark(s) to push (can be repeated)
+    #[arg(long, short, alias = "branch")]
     bookmark: Vec<String>,
     /// Push all bookmarks
     #[arg(long, conflicts_with = "bookmark")]
@@ -99,9 +101,17 @@ struct GitPushArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 struct GitFetchArgs {
-    /// Remote to fetch from
-    #[arg(long, default_value = "origin")]
-    remote: String,
+    /// Remote to fetch from (defaults to "origin")
+    #[arg(long)]
+    remote: Option<String>,
+}
+
+/// Wrapper for re-parsing `kiki git ...` args in the dispatch hook.
+#[derive(clap::Parser, Debug)]
+#[command(name = "git")]
+struct KikiGitCli {
+    #[command(subcommand)]
+    command: GitCommands,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -216,6 +226,94 @@ fn connect_daemon(
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+/// Check if the current workspace uses the kiki backend.
+fn is_kiki_backend(command_helper: &CommandHelper) -> bool {
+    let Ok(loader) = command_helper.workspace_loader() else {
+        return false;
+    };
+    let type_path = loader.repo_path().join("store").join("type");
+    std::fs::read_to_string(type_path)
+        .map(|s| s.trim() == "kiki")
+        .unwrap_or(false)
+}
+
+/// Dispatch hook: intercepts `kiki git push/fetch/remote` on kiki-backend repos,
+/// routing them through the daemon instead of jj's built-in git commands (which
+/// fail with `UnexpectedGitBackendError` on non-GitBackend repos).
+async fn kiki_git_dispatch_hook(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    old_dispatch: BoxedAsyncCliDispatch<'_>,
+) -> Result<(), CommandError> {
+    if let Some(("git", git_matches)) = command_helper.matches().subcommand() {
+        if is_kiki_backend(command_helper) {
+            match git_matches.subcommand_name() {
+                Some("push") | Some("fetch") | Some("remote") => {
+                    return dispatch_kiki_git(ui, command_helper).await;
+                }
+                Some(other) => {
+                    return Err(user_error(format!(
+                        "'git {other}' is not supported on kiki-backend repositories\n\
+                         Supported: git push, git fetch, git remote"
+                    )));
+                }
+                None => {
+                    // `kiki git` with no subcommand — fall through to jj's help.
+                }
+            }
+        }
+    }
+    old_dispatch.call(ui, command_helper).await
+}
+
+/// Re-parse git args and dispatch to kiki's daemon-backed implementation.
+async fn dispatch_kiki_git(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+) -> Result<(), CommandError> {
+    use clap::Parser as _;
+
+    let string_args = command_helper.string_args();
+    let git_pos = string_args
+        .iter()
+        .position(|s| s == "git")
+        .ok_or_else(|| cli_error("internal: 'git' not found in command args"))?;
+    let git_args = &string_args[git_pos..];
+
+    let parsed = KikiGitCli::try_parse_from(git_args).map_err(|e| {
+        user_error(format!(
+            "on kiki-backend repos, only a subset of 'jj git' flags are supported:\n\n  \
+             git push [--remote <REMOTE>] [--bookmark <NAME>]... [--all]\n  \
+             git fetch [--remote <REMOTE>]\n  \
+             git remote add <NAME> <URL>\n  \
+             git remote list\n\n\
+             {e}"
+        ))
+    })?;
+
+    let grpc_port = command_helper
+        .settings()
+        .get::<usize>("grpc_port")
+        .map_err(|e| user_error_with_message("grpc_port not configured in jj config", e))?;
+    let client = BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
+        .map_err(|e| {
+            user_error_with_message(
+                format!("Failed to connect to kiki daemon on port {grpc_port}"),
+                e,
+            )
+        })?;
+
+    run_git_command(
+        ui,
+        command_helper,
+        &client,
+        GitArgs {
+            command: parsed.command,
+        },
+    )
+    .await
 }
 
 async fn run_kk_command(
@@ -414,6 +512,9 @@ async fn run_git_command(
             }
         },
         GitCommands::Push(push_args) => {
+            let remote = push_args
+                .remote
+                .unwrap_or_else(|| "origin".to_string());
             let wc_path = workspace_path(command_helper)?;
             let workspace_helper = command_helper.workspace_helper(ui)?;
             let repo = workspace_helper.repo();
@@ -465,14 +566,14 @@ async fn run_git_command(
                 ui.status(),
                 "Pushing {} bookmark(s) to {}: {}",
                 count,
-                push_args.remote,
+                remote,
                 names.join(", ")
             )?;
 
             client
                 .git_push(proto::jj_interface::GitPushReq {
                     working_copy_path: wc_path,
-                    remote: push_args.remote,
+                    remote,
                     bookmarks,
                 })
                 .map_err(|e| internal_error_with_message("daemon GitPush RPC failed", e))?;
@@ -481,13 +582,16 @@ async fn run_git_command(
             Ok(())
         }
         GitCommands::Fetch(fetch_args) => {
+            let remote = fetch_args
+                .remote
+                .unwrap_or_else(|| "origin".to_string());
             let wc_path = workspace_path(command_helper)?;
-            writeln!(ui.status(), "Fetching from {}...", fetch_args.remote)?;
+            writeln!(ui.status(), "Fetching from {}...", remote)?;
 
             let resp = client
                 .git_fetch(proto::jj_interface::GitFetchReq {
                     working_copy_path: wc_path,
-                    remote: fetch_args.remote.clone(),
+                    remote: remote.clone(),
                 })
                 .map_err(|e| internal_error_with_message("daemon GitFetch RPC failed", e))?;
 
@@ -504,7 +608,7 @@ async fn run_git_command(
                     let hex: String =
                         b.commit_id.iter().map(|byte| format!("{byte:02x}")).collect();
                     let short = &hex[..12.min(hex.len())];
-                    writeln!(formatter, "  {}/{}: {short}", fetch_args.remote, b.name)?;
+                    writeln!(formatter, "  {}/{}: {short}", remote, b.name)?;
                 }
             }
 
@@ -539,7 +643,7 @@ async fn run_git_command(
             }
 
             // Set remote-tracking bookmarks.
-            let remote_name = RemoteName::new(fetch_args.remote.as_str());
+            let remote_name = RemoteName::new(remote.as_str());
             for b in &fetched {
                 let bookmark_name = RefName::new(b.name.as_str());
                 let commit_id = CommitId::new(b.commit_id.clone());
@@ -582,7 +686,7 @@ async fn run_git_command(
 
             tx.finish(
                 ui,
-                format!("fetch from git remote(s) {}", fetch_args.remote),
+                format!("fetch from git remote(s) {}", remote),
             )
             .await?;
 
@@ -685,6 +789,7 @@ fn main() -> std::process::ExitCode {
         .add_store_factories(create_store_factories())
         .add_working_copy_factories(working_copy_factories)
         .add_subcommand(run_kk_command)
+        .add_dispatch_hook(kiki_git_dispatch_hook)
         .run()
         .into()
 }

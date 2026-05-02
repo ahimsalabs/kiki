@@ -77,8 +77,10 @@ for the sync + VFS experience; everyone else uses plain git.
 ## How it works
 
 kiki is a [jj](https://jj-vcs.github.io/jj/latest/) superset —
-all jj commands work unchanged. The `kk` subcommand adds the
-daemon and sync layer.
+all jj commands work unchanged. `kiki git push/fetch/remote`
+routes through the daemon automatically on kiki repos. The `kk`
+subcommand is only needed for operations that collide with jj
+builtins (`kk init`, `kk status`).
 
 ```mermaid
 graph LR

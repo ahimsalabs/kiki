@@ -1,4 +1,4 @@
-//! Integration tests for `jj kk git` operations (push, fetch, remote).
+//! Integration tests for `kiki git` operations (push, fetch, remote).
 //!
 //! `test_git_*` tests use `file://` bare repos and run in normal CI — no
 //! external deps.
@@ -472,6 +472,108 @@ fn test_git_remote_add_duplicate() {
         stderr.contains("already exists") || stderr.contains("remote add"),
         "expected duplicate error, got: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tests: `kiki git` dispatch hook (no `kk` prefix)
+// ---------------------------------------------------------------------------
+
+/// Full round-trip via `kiki git` (not `kiki kk git`): verifies the dispatch
+/// hook intercepts on kiki-backend repos and routes through the daemon.
+#[test]
+fn test_git_dispatch_hook_round_trip() {
+    let test_env = TestEnvironment::default();
+    let url = create_bare_repo(test_env.env_root(), "upstream", seed_single_branch);
+
+    // Init via `kk` (required — init is not on the git path).
+    let (_, stderr) =
+        test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
+    assert!(stderr.contains("Initialized repo"), "init: {stderr}");
+    let repo = test_env.env_root().join("repo");
+
+    // `git remote add` (dispatch hook path).
+    test_env.jj_cmd_ok(&repo, &["git", "remote", "add", "origin", &url]);
+
+    // `git remote list` (dispatch hook path).
+    let (stdout, _) = test_env.jj_cmd_ok(&repo, &["git", "remote", "list"]);
+    assert!(stdout.contains("origin"), "remote list: {stdout}");
+
+    // `git fetch` (dispatch hook path).
+    let (stdout, _) =
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
+    assert!(stdout.contains("origin/main"), "fetch: {stdout}");
+
+    // Verify bookmarks.
+    let (stdout, _) = test_env.jj_cmd_ok(&repo, &["bookmark", "list", "--all"]);
+    assert!(stdout.contains("main"), "bookmarks: {stdout}");
+    assert!(stdout.contains("@origin"), "bookmarks: {stdout}");
+
+    // Commit on top of fetched main, push back via `git push`.
+    test_env.jj_cmd_ok(&repo, &["new", "main"]);
+    test_env.jj_cmd_ok(&repo, &["describe", "-m", "dispatch hook commit"]);
+    test_env.jj_cmd_ok(&repo, &["new"]);
+    test_env.jj_cmd_ok(&repo, &["bookmark", "set", "main", "-r", "@-"]);
+    let (_, stderr) = test_env.jj_cmd_ok(
+        &repo,
+        &["git", "push", "--remote", "origin", "--bookmark", "main"],
+    );
+    assert!(stderr.contains("Done"), "push: {stderr}");
+}
+
+/// `kiki git fetch` with no --remote should default to "origin".
+#[test]
+fn test_git_dispatch_hook_fetch_default_remote() {
+    let test_env = TestEnvironment::default();
+    let url = create_bare_repo(test_env.env_root(), "upstream", seed_single_branch);
+    let repo = init_with_remote(&test_env, "repo", "origin", &url);
+
+    // Fetch with no --remote flag — should default to "origin".
+    let (stdout, _) = test_env.jj_cmd_ok(&repo, &["git", "fetch"]);
+    assert!(stdout.contains("origin/main"), "fetch: {stdout}");
+}
+
+/// `kiki git push --all` via dispatch hook.
+#[test]
+fn test_git_dispatch_hook_push_all() {
+    let test_env = TestEnvironment::default();
+    let url = create_bare_repo(test_env.env_root(), "upstream", seed_single_branch);
+    let repo = init_with_remote(&test_env, "repo", "origin", &url);
+
+    test_env.jj_cmd_ok(&repo, &["git", "fetch"]);
+
+    // Create a second bookmark.
+    test_env.jj_cmd_ok(&repo, &["new", "main"]);
+    test_env.jj_cmd_ok(&repo, &["describe", "-m", "dev work"]);
+    test_env.jj_cmd_ok(&repo, &["bookmark", "create", "dev", "-r", "@"]);
+    test_env.jj_cmd_ok(&repo, &["new"]);
+
+    let (_, stderr) =
+        test_env.jj_cmd_ok(&repo, &["git", "push", "--remote", "origin", "--all"]);
+    assert!(stderr.contains("main"), "push --all stderr: {stderr}");
+    assert!(stderr.contains("dev"), "push --all stderr: {stderr}");
+    assert!(stderr.contains("Done"), "push --all stderr: {stderr}");
+}
+
+/// `kiki git push -b` short flag (matching jj's interface).
+#[test]
+fn test_git_dispatch_hook_push_short_flag() {
+    let test_env = TestEnvironment::default();
+    let url = create_bare_repo(test_env.env_root(), "upstream", seed_single_branch);
+    let repo = init_with_remote(&test_env, "repo", "origin", &url);
+
+    test_env.jj_cmd_ok(&repo, &["git", "fetch"]);
+
+    test_env.jj_cmd_ok(&repo, &["new", "main"]);
+    test_env.jj_cmd_ok(&repo, &["describe", "-m", "short flag commit"]);
+    test_env.jj_cmd_ok(&repo, &["new"]);
+    test_env.jj_cmd_ok(&repo, &["bookmark", "set", "main", "-r", "@-"]);
+
+    // Use -b instead of --bookmark.
+    let (_, stderr) = test_env.jj_cmd_ok(
+        &repo,
+        &["git", "push", "--remote", "origin", "-b", "main"],
+    );
+    assert!(stderr.contains("Done"), "push -b: {stderr}");
 }
 
 // ---------------------------------------------------------------------------
