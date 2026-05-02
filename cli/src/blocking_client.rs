@@ -325,4 +325,13 @@ impl BlockingJujutsuInterfaceClient {
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.git_fetch(request))
     }
+
+    pub fn git_detect_head_change(
+        &self,
+        request: impl tonic::IntoRequest<GitDetectHeadChangeReq>,
+    ) -> Result<tonic::Response<GitDetectHeadChangeReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.git_detect_head_change(request))
+    }
 }

@@ -5,6 +5,7 @@
 //! git remote management and push/fetch by driving the `git` subprocess,
 //! matching `jj git` behavior.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -197,9 +198,60 @@ pub fn export_bookmarks(git_repo_path: &Path, bookmarks: &[(String, Vec<u8>)]) -
     Ok(())
 }
 
+/// Reset the git index to match a tree object in the bare repo.
+///
+/// Rebuilds `<git_repo>/index` so that `git status`, `git diff`, and
+/// `git add` work correctly when run from the FUSE mount. The index
+/// should match the "committed" tree (the checkout target), so `git
+/// status` shows the same diff as `jj diff`.
+pub fn reset_index(git_repo_path: &Path, tree_oid: &[u8]) -> Result<()> {
+    let repo = gix::open(git_repo_path).context("opening git repo for reset_index")?;
+    let oid = gix::ObjectId::try_from(tree_oid)
+        .map_err(|_| anyhow!("invalid tree id for reset_index"))?;
+    let mut index = if oid.is_null() || !repo.objects.exists(&oid) {
+        // Empty or missing tree → empty index.
+        gix::index::File::from_state(
+            gix::index::State::new(repo.object_hash()),
+            repo.index_path(),
+        )
+    } else {
+        repo.index_from_tree(&oid)
+            .context("building index from tree")?
+    };
+    index
+        .write(gix::index::write::Options::default())
+        .context("writing index")?;
+    Ok(())
+}
+
+/// Delete any `refs/heads/*` that are not in the active bookmarks list.
+///
+/// Called after `export_bookmarks` to remove refs for bookmarks that
+/// were deleted from the jj View.
+pub fn cleanup_stale_refs(
+    git_repo_path: &Path,
+    active_bookmark_names: &HashSet<&str>,
+) -> Result<()> {
+    let current_refs = read_local_refs(git_repo_path)?;
+    for (name, _) in &current_refs {
+        if !active_bookmark_names.contains(name.as_str()) {
+            let ref_name = format!("refs/heads/{name}");
+            let output = Command::new("git")
+                .args(["update-ref", "-d", &ref_name])
+                .current_dir(git_repo_path)
+                .output()
+                .with_context(|| format!("deleting stale ref {ref_name}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("failed to delete stale ref {ref_name}: {}", stderr.trim());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read the current HEAD commit from the bare git repo.
 /// Returns `None` if HEAD is unborn or symbolic (not detached).
-#[allow(dead_code)] // Used by tests; will be wired into import path.
 pub fn read_head(git_repo_path: &Path) -> Result<Option<Vec<u8>>> {
     let repo = gix::open(git_repo_path).context("opening git repo for read_head")?;
     let head = repo.head().context("reading HEAD")?;
@@ -211,7 +263,6 @@ pub fn read_head(git_repo_path: &Path) -> Result<Option<Vec<u8>>> {
 
 /// Read all `refs/heads/*` from the bare git repo.
 /// Returns `(bookmark_name, commit_oid_bytes)` pairs.
-#[allow(dead_code)] // Used by tests; will be wired into import path.
 pub fn read_local_refs(git_repo_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let repo = gix::open(git_repo_path).context("opening git repo for read_local_refs")?;
     let prefix = "refs/heads/";
@@ -372,5 +423,67 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].0, "my-branch");
         assert_eq!(refs[0].1, commit_oid);
+    }
+
+    #[test]
+    fn cleanup_stale_refs_deletes_old_bookmarks() {
+        let (_tmp, git_dir) = init_bare_repo();
+        let commit_oid = create_test_commit(&git_dir);
+
+        // Export two bookmarks.
+        let bookmarks = vec![
+            ("keep".to_owned(), commit_oid.clone()),
+            ("delete-me".to_owned(), commit_oid.clone()),
+        ];
+        export_bookmarks(&git_dir, &bookmarks).unwrap();
+        assert_eq!(read_local_refs(&git_dir).unwrap().len(), 2);
+
+        // Cleanup with only "keep" active.
+        let active: HashSet<&str> = ["keep"].into_iter().collect();
+        cleanup_stale_refs(&git_dir, &active).unwrap();
+
+        let refs = read_local_refs(&git_dir).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "keep");
+    }
+
+    #[test]
+    fn reset_index_populates_index_from_tree() {
+        let (_tmp, git_dir) = init_bare_repo();
+        let commit_oid = create_test_commit(&git_dir);
+
+        // Read the commit's tree id.
+        let commit_gix = gix::ObjectId::try_from(commit_oid.as_slice()).unwrap();
+        let output = Command::new("git")
+            .args(["cat-file", "-p", &commit_gix.to_string()])
+            .current_dir(&git_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let tree_hex = stdout
+            .lines()
+            .find(|l| l.starts_with("tree "))
+            .unwrap()
+            .strip_prefix("tree ")
+            .unwrap()
+            .trim();
+        let tree_oid = gix::ObjectId::from_hex(tree_hex.as_bytes()).unwrap();
+
+        // Reset index to the tree.
+        reset_index(&git_dir, tree_oid.as_bytes()).unwrap();
+
+        // Verify git sees entries in the index.
+        let output = Command::new("git")
+            .args(["ls-files", "--cached"])
+            .current_dir(&git_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let files = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            files.contains("file.txt"),
+            "index should contain file.txt, got: {files}"
+        );
     }
 }

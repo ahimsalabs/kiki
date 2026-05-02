@@ -199,6 +199,11 @@ service JujutsuInterface {
   rpc GitRemoteList(GitRemoteListReq) returns (GitRemoteListReply) {}
   rpc GitPush(GitPushReq) returns (GitPushReply) {}
   rpc GitFetch(GitFetchReq) returns (GitFetchReply) {}
+
+  // Detect external git HEAD changes. Returns the current HEAD from
+  // the bare git repo if it differs from the last daemon-exported HEAD.
+  // Used by the CLI to import `git commit` results before snapshot.
+  rpc GitDetectHeadChange(GitDetectHeadChangeReq) returns (GitDetectHeadChangeReply) {}
 }
 
 
@@ -280,6 +285,11 @@ message SnapshotReq {
 
 message SnapshotReply {
   bytes tree_id = 1;
+  // Non-empty if git HEAD was changed externally (e.g. `git commit`
+  // from the mount) since the daemon last exported HEAD. The CLI
+  // should import this commit into jj's View and update the working
+  // copy parent accordingly.
+  bytes external_git_head = 2;
 }
 
 message CheckOutReq {
@@ -542,3 +552,11 @@ message GitFetchedBookmark {
   bytes commit_id = 2;
 }
 
+message GitDetectHeadChangeReq {
+  string working_copy_path = 1;
+}
+message GitDetectHeadChangeReply {
+  // Non-empty if git HEAD differs from the last daemon-exported HEAD.
+  // The CLI should import this commit into jj's graph.
+  bytes new_head_commit_id = 1;
+}

@@ -335,6 +335,10 @@ struct Mount {
     /// forwarded socket. `None` for non-SSH remotes.
     #[allow(dead_code)] // dropped on Mount drop, never read directly
     _ssh_tunnel: Option<remote::tunnel::SshTunnel>,
+    /// Last HEAD commit id exported via `export_head`. Used to detect
+    /// external git HEAD changes (e.g. `git commit` from the mount).
+    /// Empty until the first `WriteCommit` exports HEAD.
+    last_exported_head: Vec<u8>,
 }
 
 impl Mount {
@@ -514,6 +518,7 @@ impl JujutsuService {
                 attachment,
                 meta_path,
                 _ssh_tunnel: ssh_tunnel,
+                last_exported_head: Vec::new(),
             },
         );
         info!(path = %meta.working_copy_path, "rehydrated mount");
@@ -1035,6 +1040,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             attachment,
             meta_path,
             _ssh_tunnel: ssh_tunnel,
+            last_exported_head: Vec::new(),
         };
         // Persist initial metadata so `rehydrate` can re-attach the
         // mount across daemon restarts even before the CLI's first
@@ -1341,6 +1347,12 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let git_path = store.git_repo_path().to_path_buf();
         if let Err(e) = crate::git_ops::export_head(&git_path, &id) {
             tracing::warn!("export_head after WriteCommit: {e:#}");
+        } else {
+            // Track what we exported so Snapshot can detect external changes.
+            let mut mounts = self.mounts.lock().await;
+            if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
+                mount.last_exported_head = id.clone();
+            }
         }
 
         Ok(Response::new(CommitId { commit_id: id }))
@@ -1397,12 +1409,21 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 .map_err(remote_status("remote put_blob (view)"))?;
         }
 
-        // Best-effort: export bookmarks to git refs so stock git tools
-        // see branches (e.g. `git log --all`, `git push`).
+        // Best-effort: export bookmarks to git refs and clean up stale
+        // refs so stock git tools see branches (e.g. `git log --all`,
+        // `git push`).
+        let git_path = store.git_repo_path().to_path_buf();
         if !bookmarks.is_empty() {
-            let git_path = store.git_repo_path().to_path_buf();
             if let Err(e) = crate::git_ops::export_bookmarks(&git_path, &bookmarks) {
                 warn!("export_bookmarks after WriteView: {e:#}");
+            }
+        }
+        // Delete refs/heads/* for bookmarks removed from the View.
+        {
+            let active: HashSet<&str> =
+                bookmarks.iter().map(|(n, _)| n.as_str()).collect();
+            if let Err(e) = crate::git_ops::cleanup_stale_refs(&git_path, &active) {
+                warn!("cleanup_stale_refs after WriteView: {e:#}");
             }
         }
 
@@ -1645,12 +1666,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // Clone fs / store / remote handles out from under the lock so
         // the (potentially I/O-heavy) snapshot walk + post-walk remote
         // push don't hold it. Same pattern as `check_out`.
-        let (fs, store, remote) = {
+        let (fs, store, remote, last_exported_head) = {
             let mounts = self.mounts.lock().await;
             let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
                 Status::not_found(format!("no mount at {}", req.working_copy_path))
             })?;
-            (mount.fs.clone(), mount.store.clone(), mount.remote_store.clone())
+            (
+                mount.fs.clone(),
+                mount.store.clone(),
+                mount.remote_store.clone(),
+                mount.last_exported_head.clone(),
+            )
         };
 
         let new_root = fs.snapshot().await.map_err(|e| {
@@ -1701,8 +1727,29 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             )));
         }
 
+        // Detect external git HEAD changes (e.g. `git commit` from the
+        // mount). If HEAD differs from what we last exported, surface the
+        // new commit id so the CLI can import it.
+        let external_git_head = if !last_exported_head.is_empty() {
+            let git_path = store.git_repo_path().to_path_buf();
+            match crate::git_ops::read_head(&git_path) {
+                Ok(Some(current_head)) if current_head != last_exported_head => {
+                    info!(
+                        path = %req.working_copy_path,
+                        new_head = %hex_bytes(&current_head),
+                        "detected external git HEAD change"
+                    );
+                    current_head
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         Ok(Response::new(SnapshotReply {
             tree_id: new_root.0.to_vec(),
+            external_git_head,
         }))
     }
 
@@ -1719,15 +1766,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         .map_err(decode_status("tree id"))?;
         info!(path = %req.working_copy_path, tree_id = %hex_bytes(&new_tree_id.0), "CheckOut");
 
-        // Clone the per-mount fs handle out from under the lock so the
-        // (potentially I/O-heavy) `JjKikiFs::check_out` call doesn't hold
-        // it. Mirrors how `store_for` works.
-        let fs = {
+        // Clone the per-mount fs + store handles out from under the lock
+        // so the (potentially I/O-heavy) `JjKikiFs::check_out` call
+        // doesn't hold it. Mirrors how `store_for` works.
+        let (fs, store) = {
             let mounts = self.mounts.lock().await;
             let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
                 Status::not_found(format!("no mount at {}", req.working_copy_path))
             })?;
-            mount.fs.clone()
+            (mount.fs.clone(), mount.store.clone())
         };
 
         // The VFS swap validates the tree exists in the store; map the
@@ -1766,6 +1813,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 "mount at {} disappeared during check_out",
                 req.working_copy_path
             )));
+        }
+
+        // Best-effort: rebuild the git index to match the checked-out
+        // tree so `git status`/`git diff` from the mount show the same
+        // changes as `jj diff`.
+        let git_path = store.git_repo_path().to_path_buf();
+        if let Err(e) = crate::git_ops::reset_index(&git_path, &new_tree_id.0) {
+            warn!("reset_index after CheckOut: {e:#}");
         }
 
         Ok(Response::new(CheckOutReply {}))
@@ -1855,6 +1910,35 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 .into_iter()
                 .map(|(name, commit_id)| GitFetchedBookmark { name, commit_id })
                 .collect(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn git_detect_head_change(
+        &self,
+        request: Request<GitDetectHeadChangeReq>,
+    ) -> Result<Response<GitDetectHeadChangeReply>, Status> {
+        let req = request.into_inner();
+        let (store, last_exported_head) = {
+            let mounts = self.mounts.lock().await;
+            let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
+                Status::not_found(format!("no mount at {}", req.working_copy_path))
+            })?;
+            (mount.store.clone(), mount.last_exported_head.clone())
+        };
+
+        let new_head = if !last_exported_head.is_empty() {
+            let git_path = store.git_repo_path().to_path_buf();
+            match crate::git_ops::read_head(&git_path) {
+                Ok(Some(current_head)) if current_head != last_exported_head => current_head,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        Ok(Response::new(GitDetectHeadChangeReply {
+            new_head_commit_id: new_head,
         }))
     }
 }

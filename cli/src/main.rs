@@ -239,6 +239,95 @@ fn is_kiki_backend(command_helper: &CommandHelper) -> bool {
         .unwrap_or(false)
 }
 
+/// Dispatch hook: detects external git HEAD changes (e.g. `git commit` from
+/// the mount) and imports them into jj's graph before the normal command runs.
+/// Runs before `kiki_git_dispatch_hook` so the import lands before snapshot.
+async fn kiki_git_import_hook(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    old_dispatch: BoxedAsyncCliDispatch<'_>,
+) -> Result<(), CommandError> {
+    if is_kiki_backend(command_helper) {
+        if let Err(e) = maybe_import_git_head(ui, command_helper).await {
+            // Non-fatal: log and continue. The user can reconcile manually.
+            writeln!(ui.warning_default(), "git HEAD import failed: {e:?}")?;
+        }
+    }
+    old_dispatch.call(ui, command_helper).await
+}
+
+/// Check if git HEAD was moved externally and, if so, import the commit
+/// into jj's graph so the next snapshot sees the correct parent.
+async fn maybe_import_git_head(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+) -> Result<(), CommandError> {
+    let wc_path = match workspace_path(command_helper) {
+        Ok(p) => p,
+        Err(_) => return Ok(()), // Not in a workspace — nothing to import.
+    };
+    let settings = command_helper.settings();
+    let client = daemon_client::connect_or_start(settings)
+        .map_err(|e| internal_error_with_message("connecting to daemon for git import", e))?;
+
+    let reply = client
+        .git_detect_head_change(proto::jj_interface::GitDetectHeadChangeReq {
+            working_copy_path: wc_path.clone(),
+        })
+        .map_err(|e| internal_error_with_message("GitDetectHeadChange RPC", e))?
+        .into_inner();
+
+    if reply.new_head_commit_id.is_empty() {
+        return Ok(()); // HEAD unchanged — nothing to do.
+    }
+
+    let new_head_id = jj_lib::backend::CommitId::from_bytes(&reply.new_head_commit_id);
+    use jj_lib::object_id::ObjectId as _;
+    writeln!(
+        ui.status(),
+        "Importing external git commit: {}",
+        new_head_id.hex()
+    )?;
+
+    // Load workspace without triggering snapshot (we need to import first).
+    let mut ws_helper = command_helper.workspace_helper_no_snapshot(ui)?;
+
+    // Start a transaction to import the commit and update the
+    // working-copy parent, matching jj colocated import_git_head.
+    let workspace_name = ws_helper.workspace_name().to_owned();
+    {
+        let mut tx = ws_helper.start_transaction();
+
+        // Reading the commit through the store auto-creates extras (change-id).
+        let store = tx.repo().store().clone();
+        let new_commit = store
+            .get_commit(&new_head_id)
+            .map_err(|e| internal_error_with_message("reading imported commit", e))?;
+
+        // Add the commit as a head (makes it visible in jj log).
+        tx.repo_mut()
+            .add_head(&new_commit)
+            .await
+            .map_err(|e| internal_error_with_message("adding imported commit as head", e))?;
+
+        // Check out: creates a new working-copy commit with the imported
+        // commit as parent.
+        tx.repo_mut()
+            .check_out(workspace_name, &new_commit)
+            .await
+            .map_err(|e| internal_error_with_message("checking out imported commit", e))?;
+
+        tx.finish(ui, "import git head").await?;
+    }
+
+    writeln!(
+        ui.status(),
+        "Reset the working copy parent to the new Git HEAD."
+    )?;
+
+    Ok(())
+}
+
 /// Dispatch hook: intercepts `kiki git push/fetch/remote` on kiki-backend repos,
 /// routing them through the daemon instead of jj's built-in git commands (which
 /// fail with `UnexpectedGitBackendError` on non-GitBackend repos).
@@ -782,6 +871,7 @@ fn main() -> std::process::ExitCode {
         .add_store_factories(create_store_factories())
         .add_working_copy_factories(working_copy_factories)
         .add_subcommand(run_kk_command)
+        .add_dispatch_hook(kiki_git_import_hook)
         .add_dispatch_hook(kiki_git_dispatch_hook)
         .run()
         .into()

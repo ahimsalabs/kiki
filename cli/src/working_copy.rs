@@ -219,7 +219,7 @@ impl KikiWorkingCopy {
         // path_to_str returns WorkingCopyStateError, which converts to
         // SnapshotError via `#[from]`.
         let path_str = path_to_str(&self.working_copy_path)?.to_string();
-        let tree_state = self
+        let reply = self
             .client
             .snapshot(SnapshotReq {
                 working_copy_path: path_str,
@@ -229,9 +229,10 @@ impl KikiWorkingCopy {
                 err: e.into(),
             })?
             .into_inner();
+
         Ok(MergedTree::resolved(
             self.store.clone(),
-            TreeId::new(tree_state.tree_id),
+            TreeId::new(reply.tree_id),
         ))
     }
 }
