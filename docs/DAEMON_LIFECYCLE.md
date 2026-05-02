@@ -239,7 +239,9 @@ When `KIKI_SOCKET_PATH` is set, the CLI:
 | [NAMING.md](./NAMING.md) | Binary is `kiki`, kiki-specific commands live under the `kk` subcommand. |
 | [WORKSPACES.md](./WORKSPACES.md) | The managed namespace (`~/.kiki/`) requires an always-available daemon. Auto-start makes `kiki kk clone` and `kiki kk workspace new` seamless. |
 | [GIT_CONVERGENCE.md](./GIT_CONVERGENCE.md) | Post-convergence, the daemon manages bare git repos. `kiki kk clone git@github.com:user/repo` auto-starts daemon, inits GitBackend, mounts workspace. `git gc` runs inside the daemon. |
-| [PLAN.md](./PLAN.md) | M10.7+ features (gitignore, async push, offline) are daemon-side. Auto-management means the daemon is always there. |
+| [PLAN.md](./PLAN.md) | Milestone index and architectural reference. |
+| [M10.7-GITIGNORE.md](./M10.7-GITIGNORE.md) | Gitignore-aware VFS — daemon-side. Auto-management means the daemon is always there. |
+| [M11-PUSH-QUEUE.md](./M11-PUSH-QUEUE.md) | Async push queue + offline resilience — daemon-side. |
 
 ## Open questions
 

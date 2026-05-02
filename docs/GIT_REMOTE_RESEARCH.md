@@ -1,5 +1,10 @@
 # Git Remote Support for kiki
 
+> **SUPERSEDED by [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md).** The
+> shadow-repo + object-graph-translation approach described here was
+> replaced by direct use of jj-lib's `GitBackend`. This file is kept
+> for historical reference.
+
 Research and design notes for adding GitHub/git remote support to kiki.
 
 ## Problem statement

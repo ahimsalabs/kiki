@@ -8,7 +8,8 @@ This document is intentionally separate from [`PLAN.md`](./PLAN.md).
 `PLAN.md` tracks the implementation sequence for the current daemon,
 remote, and VFS milestones. This document captures a larger UX and
 mount-topology direction that likely lands as its own milestone after
-git convergence, M10.7, and M11.
+git convergence, M10.7 ([`M10.7-GITIGNORE.md`](./M10.7-GITIGNORE.md)),
+and M11 ([`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md)).
 
 ## Goal
 
