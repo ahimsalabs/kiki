@@ -23,17 +23,26 @@ pub struct BlockingJujutsuInterfaceClient {
 }
 
 impl BlockingJujutsuInterfaceClient {
-    pub fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-    where
-        D: TryInto<tonic::transport::Endpoint>,
-        D::Error: Into<StdError>,
-    {
+    /// Connect to the daemon via a Unix domain socket.
+    pub fn connect_uds(path: std::path::PathBuf) -> std::result::Result<Self, StdError> {
+        // Quick existence check before spinning up a runtime.
+        if !path.exists() {
+            return Err(format!("socket not found: {}", path.display()).into());
+        }
         let rt = Builder::new_multi_thread().enable_all().build().unwrap();
-        let client = Arc::new(Mutex::new(
-            rt.block_on(JujutsuInterfaceClient::connect(dst))?,
-        ));
+        let channel = rt.block_on(async {
+            let path_clone = path.clone();
+            tonic::transport::Endpoint::from_static("http://[::]:50051")
+                .connect_with_connector(tower::service_fn(
+                    move |_: tonic::transport::Uri| {
+                        let path = path_clone.clone();
+                        async move { tokio::net::UnixStream::connect(path).await }
+                    },
+                ))
+                .await
+        })?;
+        let client = Arc::new(Mutex::new(JujutsuInterfaceClient::new(channel)));
         let rt = Arc::new(Mutex::new(rt));
-
         Ok(Self { client, rt })
     }
 

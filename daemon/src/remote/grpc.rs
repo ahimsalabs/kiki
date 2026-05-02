@@ -14,6 +14,8 @@
 //! `JujutsuInterface` listener: single-user, localhost. TLS + auth are
 //! M11 alongside S3.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -59,6 +61,31 @@ impl GrpcRemoteStore {
         Ok(GrpcRemoteStore {
             client: RemoteStoreClient::new(channel),
             endpoint: endpoint.to_owned(),
+        })
+    }
+
+    /// Build a client connected to a Unix domain socket.
+    ///
+    /// Used by the SSH tunnel path: the tunnel forwards a remote daemon's
+    /// UDS to a local socket, and we connect a `GrpcRemoteStore` to that
+    /// forwarded socket. The gRPC protocol is the same as TCP — only the
+    /// transport layer differs.
+    ///
+    /// Unlike [`Self::new`], this is async because UDS connection via
+    /// `connect_with_connector` requires an active tokio runtime.
+    pub async fn new_uds(socket_path: &Path) -> Result<Self> {
+        let path = socket_path.to_owned();
+        let display = path.display().to_string();
+        let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
+            .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+                let path = path.clone();
+                async move { tokio::net::UnixStream::connect(path).await }
+            }))
+            .await
+            .with_context(|| format!("connecting to UDS remote at {display}"))?;
+        Ok(GrpcRemoteStore {
+            client: RemoteStoreClient::new(channel),
+            endpoint: format!("unix://{display}"),
         })
     }
 }

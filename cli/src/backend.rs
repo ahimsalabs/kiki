@@ -43,17 +43,12 @@ impl KikiBackend {
     pub fn new(settings: &UserSettings, store_path: &Path) -> Result<Self, BackendInitError> {
         let root_commit_id = CommitId::from_bytes(&[0; COMMIT_ID_LENGTH]);
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
-        let grpc_port = settings
-            .get::<usize>("grpc_port")
-            .map_err(|e| BackendInitError(e.into()))?;
 
         let working_copy_path = derive_working_copy_path(store_path)
             .map_err(BackendInitError)?;
 
-        let client = crate::blocking_client::BlockingJujutsuInterfaceClient::connect(format!(
-            "http://[::1]:{grpc_port}"
-        ))
-        .map_err(|e| BackendInitError(e.into()))?;
+        let client = crate::daemon_client::connect_or_start(settings)
+            .map_err(BackendInitError)?;
         let empty_tree_id = TreeId::from_bytes(
             &client
                 .get_empty_tree_id(working_copy_path.clone())

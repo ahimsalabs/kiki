@@ -17,6 +17,8 @@ use jj_lib::{
 
 mod backend;
 mod blocking_client;
+mod daemon_client;
+mod daemon_cmd;
 mod op_heads_store;
 mod op_store;
 mod working_copy;
@@ -46,22 +48,8 @@ enum KikiCommands {
     Status,
     /// Git remote operations (push, fetch, remote management)
     Git(GitArgs),
-    /// Serve a store over stdin/stdout (used by SSH transport)
-    Serve(ServeArgs),
-}
-
-/// Arguments for `kiki kk serve`.
-///
-/// Serves a `FsRemoteStore` over the stdin/stdout framing protocol.
-/// Designed to be invoked by a remote daemon via SSH:
-///   `ssh user@host kiki kk serve /path/to/store`
-///
-/// No daemon required on the server — just the `kiki` binary and a
-/// directory.
-#[derive(clap::Args, Clone, Debug)]
-pub(crate) struct ServeArgs {
-    /// Absolute path to the store directory to serve
-    path: String,
+    /// Daemon lifecycle management
+    Daemon(daemon_cmd::DaemonArgs),
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -237,11 +225,7 @@ fn climb_to_workspace(op_heads_path: &std::path::Path) -> std::io::Result<String
 fn connect_daemon(
     settings: &jj_lib::settings::UserSettings,
 ) -> Result<BlockingJujutsuInterfaceClient, Box<dyn std::error::Error + Send + Sync>> {
-    let grpc_port = settings
-        .get::<usize>("grpc_port")
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    daemon_client::connect_or_start(settings)
 }
 
 /// Check if the current workspace uses the kiki backend.
@@ -309,17 +293,8 @@ async fn dispatch_kiki_git(
         ))
     })?;
 
-    let grpc_port = command_helper
-        .settings()
-        .get::<usize>("grpc_port")
-        .map_err(|e| user_error_with_message("grpc_port not configured in jj config", e))?;
-    let client = BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
-        .map_err(|e| {
-            user_error_with_message(
-                format!("Failed to connect to kiki daemon on port {grpc_port}"),
-                e,
-            )
-        })?;
+    let client = daemon_client::connect_or_start(command_helper.settings())
+        .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
 
     run_git_command(
         ui,
@@ -339,21 +314,14 @@ async fn run_kk_command(
 ) -> Result<(), CommandError> {
     let KikiSubcommand::Kk(KikiArgs { command }) = command;
 
-    // serve runs standalone — no daemon connection needed.
-    if let KikiCommands::Serve(args) = command {
-        return run_serve_store(args).await;
+    // daemon subcommands run standalone — they manage the daemon lifecycle.
+    if let KikiCommands::Daemon(ref args) = command {
+        daemon_cmd::dispatch_daemon(args)?;
+        return Ok(());
     }
 
-    let grpc_port = command_helper
-        .settings()
-        .get::<usize>("grpc_port")
-        .map_err(|e| user_error_with_message("grpc_port not configured in jj config", e))?;
-    let client = crate::blocking_client::BlockingJujutsuInterfaceClient::connect(format!(
-        "http://[::1]:{grpc_port}"
-    ))
-    .map_err(|e| {
-        user_error_with_message(format!("Failed to connect to kiki daemon on port {grpc_port}"), e)
-    })?;
+    let client = daemon_client::connect_or_start(command_helper.settings())
+        .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
     match command {
         KikiCommands::Status => {
             let resp = client
@@ -492,49 +460,11 @@ async fn run_kk_command(
         KikiCommands::Git(git_args) => {
             run_git_command(ui, command_helper, &client, git_args).await
         }
-        KikiCommands::Serve(_) => {
+        KikiCommands::Daemon(_) => {
             // Handled above before daemon connection.
             unreachable!()
         }
     }
-}
-
-/// Serve a `FsRemoteStore` over stdin/stdout using the length-prefixed
-/// protobuf framing protocol. Designed to be invoked over SSH by a
-/// remote daemon's `SshRemoteStore`.
-///
-/// Exits when the client closes the pipe (EOF on stdin).
-///
-/// Note: this function spawns its own multi-threaded tokio runtime with
-/// the IO driver enabled. The jj-cli `CliRunner` that calls `run_kk_command`
-/// does not guarantee a full tokio runtime (its async context may lack
-/// the IO reactor), but `tokio::io::stdin()`/`stdout()` and the
-/// `spawn_blocking` calls inside `FsRemoteStore` require one. Spawning
-/// a dedicated runtime here is the simplest fix that keeps the serve
-/// path self-contained.
-async fn run_serve_store(args: ServeArgs) -> Result<(), CommandError> {
-    let path = std::path::PathBuf::from(&args.path);
-    if !path.is_absolute() {
-        return Err(cli_error(
-            "serve-store path must be absolute",
-        ));
-    }
-
-    // Build a full tokio runtime so tokio::io::stdin/stdout and
-    // spawn_blocking work correctly.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| internal_error_with_message("failed to build tokio runtime", e))?;
-
-    rt.block_on(async {
-        let store = store::fs::FsRemoteStore::new(path);
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        store::framing::serve_store_loop(stdin, stdout, &store).await
-    })
-    .map_err(|e| internal_error_with_message("serve-store failed", e))?;
-    Ok(())
 }
 
 async fn run_git_command(

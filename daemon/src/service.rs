@@ -289,6 +289,11 @@ struct Mount {
     /// (`SetCheckoutState`, `CheckOut`, `Snapshot`) re-write this file
     /// so a daemon restart sees current state.
     meta_path: Option<PathBuf>,
+    /// SSH tunnel for `ssh://` remotes. Kept alive for the mount's
+    /// lifetime — dropping it kills the SSH process and removes the
+    /// forwarded socket. `None` for non-SSH remotes.
+    #[allow(dead_code)] // dropped on Mount drop, never read directly
+    _ssh_tunnel: Option<remote::tunnel::SshTunnel>,
 }
 
 impl Mount {
@@ -315,6 +320,9 @@ pub struct JujutsuService {
     vfs_handle: Option<VfsManagerHandle>,
     /// Where per-mount redb files live. M8 / Layer B.
     storage: StorageConfig,
+    /// Directory for SSH tunnel forwarded sockets. Lives in the runtime
+    /// dir alongside daemon.sock/pid/log. `None` in test mode.
+    tunnels_dir: Option<PathBuf>,
 }
 
 impl JujutsuService {
@@ -325,7 +333,7 @@ impl JujutsuService {
     /// nothing is mounted at `working_copy_path`.
     ///
     /// `storage` decides where per-mount Stores live. Production passes
-    /// `StorageConfig::OnDisk { root: <storage_dir from daemon.toml> }`;
+    /// `StorageConfig::OnDisk { root: <storage_dir> }`;
     /// tests that don't care about durability use
     /// `StorageConfig::InMemory`.
     ///
@@ -333,10 +341,12 @@ impl JujutsuService {
     /// re-attach mounts left behind by a previous daemon process, then
     /// [`Self::into_server`] to wrap it for tonic.
     pub fn new(vfs_handle: Option<VfsManagerHandle>, storage: StorageConfig) -> Self {
+        let tunnels_dir = Some(store::paths::runtime_dir().join("tunnels"));
         JujutsuService {
             mounts: Arc::new(Mutex::new(HashMap::new())),
             vfs_handle,
             storage,
+            tunnels_dir,
         }
     }
 
@@ -396,8 +406,33 @@ impl JujutsuService {
         // bug — but fail soft (anyhow::Error here is logged + the mount
         // is skipped by `rehydrate`) rather than panicking, so the
         // operator can prune the broken mount dir.
-        let remote_store = remote::parse(&meta.remote)
-            .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
+        //
+        // For `ssh://` URLs, re-establish the tunnel (the previous
+        // daemon's SSH child is dead).
+        let (remote_store, ssh_tunnel) = if remote::parse_ssh_url(&meta.remote)
+            .with_context(|| format!("parsing remote URL {:?}", meta.remote))?
+            .is_some()
+        {
+            if let Some(tunnels_dir) = &self.tunnels_dir {
+                let (store, tunnel) = remote::establish_ssh_remote(&meta.remote, tunnels_dir)
+                    .await
+                    .with_context(|| format!(
+                        "re-establishing SSH tunnel for {:?}",
+                        meta.remote
+                    ))?;
+                (Some(store), Some(tunnel))
+            } else {
+                // Test mode (no tunnels_dir) — ssh:// will fail here,
+                // which is correct since tests can't establish SSH tunnels.
+                let store = remote::parse(&meta.remote)
+                    .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
+                (store, None)
+            }
+        } else {
+            let store = remote::parse(&meta.remote)
+                .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
+            (store, None)
+        };
         // M10 §10.6: hand the remote into `KikiFs` too, so FUSE-side
         // reads on a `StoreMiss` fall through to the remote the same
         // way M9's RPC-layer reads already do.
@@ -437,6 +472,7 @@ impl JujutsuService {
                 fs,
                 attachment,
                 meta_path,
+                _ssh_tunnel: ssh_tunnel,
             },
         );
         info!(path = %meta.working_copy_path, "rehydrated mount");
@@ -455,6 +491,7 @@ impl JujutsuService {
             mounts: Arc::new(Mutex::new(HashMap::new())),
             vfs_handle: None,
             storage: StorageConfig::InMemory,
+            tunnels_dir: None,
         }
     }
 
@@ -887,8 +924,25 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // `invalid_argument` so the user gets a clean message rather
         // than a generic internal error or — worse — a silent drop into
         // "no remote configured". Empty string is still `Ok(None)`.
-        let remote_store = remote::parse(&req.remote)
-            .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?;
+        //
+        // For `ssh://` URLs, establish a persistent tunnel to the remote
+        // daemon and connect via GrpcRemoteStore over the forwarded UDS.
+        let (remote_store, ssh_tunnel) = if remote::parse_ssh_url(&req.remote)
+            .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?
+            .is_some()
+        {
+            let tunnels_dir = self.tunnels_dir.as_deref().ok_or_else(|| {
+                Status::internal("SSH tunnels not available in test mode")
+            })?;
+            let (store, tunnel) = remote::establish_ssh_remote(&req.remote, tunnels_dir)
+                .await
+                .map_err(|e| Status::internal(format!("SSH tunnel: {e:#}")))?;
+            (Some(store), Some(tunnel))
+        } else {
+            let store = remote::parse(&req.remote)
+                .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?;
+            (store, None)
+        };
 
         // Build the per-mount FS up front so we can hand the same `Arc`
         // to both the VFS bind (for kernel I/O) and the `Mount` (for
@@ -939,6 +993,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             fs,
             attachment,
             meta_path,
+            _ssh_tunnel: ssh_tunnel,
         };
         // Persist initial metadata so `rehydrate` can re-attach the
         // mount across daemon restarts even before the CLI's first

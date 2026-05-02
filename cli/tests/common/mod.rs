@@ -19,7 +19,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rand::{rng, Rng};
 use regex::{Captures, Regex};
 use tempfile::TempDir;
 
@@ -36,8 +35,8 @@ pub struct TestEnvironment {
 
     // Daemon
     daemon_child: std::process::Child,
-    daemon_port: usize,
     daemon_dir: PathBuf,
+    socket_path: PathBuf,
 }
 
 impl Drop for TestEnvironment {
@@ -66,9 +65,9 @@ impl Default for TestEnvironment {
         std::fs::create_dir(&daemon_dir).unwrap();
         let daemon_dir_str = daemon_dir.to_str().unwrap();
 
-        // Initialize a isolated daemon for this env
-        let daemon_config = config_dir.join("daemon.toml");
-        let daemon_port: usize = rng().gen_range(11000..21000);
+        // Initialize an isolated daemon for this env.
+        // Each test gets its own UDS socket — no port conflicts.
+        let socket_path = env_root.join("daemon.sock");
         // disable_mount=false routes `.jj/` and user content through the
         // daemon's FUSE adapter — the production-equivalent path that
         // exercises M7.1 (split `.jj/` from the user tree) and M7.2
@@ -76,20 +75,33 @@ impl Default for TestEnvironment {
         // op_id from `finish`). Local CI runners need `fusermount3`
         // available; on Linux distros that ship it as setuid (the
         // common case) no extra setup is required.
-        std::fs::write(
-            &daemon_config,
-            format!(
-                "grpc_addr = \"[::1]:{daemon_port}\"\nstorage_dir = \"{daemon_dir_str}\"\ndisable_mount = false\n[nfs]\nmin_port = 1100\nmax_port = 1200\n"
-            ),
-        )
-        .expect("Failed to write daemon config toml for testing setup");
-
-        let daemon = assert_cmd::cargo::cargo_bin("daemon");
-        let mut command = std::process::Command::new(daemon);
-        command.args(["--config", daemon_config.to_str().unwrap()]);
+        let kiki = assert_cmd::cargo::cargo_bin("kiki");
+        let mut command = std::process::Command::new(kiki);
+        // disable_mount=false routes `.jj/` and user content through the
+        // daemon's FUSE adapter — the production-equivalent path. Set
+        // KIKI_TEST_DISABLE_MOUNT=1 to skip FUSE in environments where
+        // fusermount3 is unavailable or FUSE is broken.
+        let disable_mount = std::env::var("KIKI_TEST_DISABLE_MOUNT").is_ok();
+        let mut args = vec![
+            "kk", "daemon", "run",
+            "--storage-dir", daemon_dir_str,
+        ];
+        if disable_mount {
+            args.push("--disable-mount");
+        }
+        command.args(&args);
+        command.env("KIKI_SOCKET_PATH", &socket_path);
         let daemon_child = command
             .spawn()
             .expect("Failed to start daemon for integration test");
+
+        // Wait for daemon to bind its UDS socket before returning.
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
         let env_vars = HashMap::new();
         let env = Self {
@@ -104,10 +116,9 @@ impl Default for TestEnvironment {
             command_number: RefCell::new(0),
 
             daemon_child,
-            daemon_port,
             daemon_dir,
+            socket_path,
         };
-        env.add_config(format!(r#"grpc_port = {daemon_port}"#).as_str());
         // Use absolute timestamps in the operation log to make tests independent of the
         // current time.
         env.add_config(
@@ -140,7 +151,7 @@ impl TestEnvironment {
         cmd.env("JJ_OP_HOSTNAME", "host.example.com");
         cmd.env("JJ_OP_USERNAME", "test-username");
         cmd.env("JJ_TZ_OFFSET_MINS", "660");
-        cmd.env("JJ_DAEMON_PORT", self.daemon_port.to_string());
+        cmd.env("KIKI_SOCKET_PATH", self.socket_path.to_str().unwrap());
 
         let mut command_number = self.command_number.borrow_mut();
         *command_number += 1;

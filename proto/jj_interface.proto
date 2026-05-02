@@ -542,36 +542,3 @@ message GitFetchedBookmark {
   bytes commit_id = 2;
 }
 
-// Stdin/stdout framing protocol for `kiki kk serve` (SSH transport).
-// Each message is length-prefixed (4-byte big-endian + protobuf bytes).
-// The client sends StoreRequest, the server responds with StoreResponse.
-// The id field is echoed back so the client can match responses.
-
-message StoreRequest {
-  uint64 id = 1;
-  oneof request {
-    GetBlobReq get_blob = 2;
-    PutBlobReq put_blob = 3;
-    HasBlobReq has_blob = 4;
-    GetRefReq get_ref = 5;
-    CasRefReq cas_ref = 6;
-    ListRefsReq list_refs = 7;
-  }
-}
-
-message StoreResponse {
-  uint64 id = 1;
-  oneof response {
-    GetBlobReply get_blob = 2;
-    PutBlobReply put_blob = 3;
-    HasBlobReply has_blob = 4;
-    GetRefReply get_ref = 5;
-    CasRefReply cas_ref = 6;
-    ListRefsReply list_refs = 7;
-    StoreError error = 8;
-  }
-}
-
-message StoreError {
-  string message = 1;
-}

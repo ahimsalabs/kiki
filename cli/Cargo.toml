@@ -20,6 +20,14 @@ clap.workspace = true
 futures.workspace = true
 pollster.workspace = true
 store.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
+daemon = { path = "../daemon" }
+tracing-log.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+toml.workspace = true
+serde.workspace = true
 
 [[test]]
 name = "runner"

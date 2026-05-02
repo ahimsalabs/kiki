@@ -10,14 +10,11 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 libc.workspace = true
-prost.workspace = true
 proto.workspace = true
 rand.workspace = true
-tokio = { workspace = true, features = ["io-util", "rt", "process"] }
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
-prost.workspace = true
-proto.workspace = true
 tempfile = "3.14.0"
 tokio = { workspace = true, features = ["full"] }

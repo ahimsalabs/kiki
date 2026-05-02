@@ -101,16 +101,11 @@ impl KikiWorkingCopy {
     }
 
     fn connect_client(
-        settings: &UserSettings,
+        _settings: &UserSettings,
     ) -> Result<BlockingJujutsuInterfaceClient, WorkingCopyStateError> {
-        // Pull the daemon port from user settings (matches KikiBackend); the
-        // integration test harness assigns a random port per env, so this
-        // must not be hardcoded.
-        let grpc_port = settings
-            .get::<usize>("grpc_port")
-            .map_err(|e| wc_state_err("grpc_port not configured", e))?;
-        BlockingJujutsuInterfaceClient::connect(format!("http://[::1]:{grpc_port}"))
-            .map_err(|e| wc_state_err("failed to connect to kiki daemon", e))
+        let socket = store::paths::socket_path();
+        BlockingJujutsuInterfaceClient::connect_uds(socket)
+            .map_err(|e| wc_state_err("failed to connect to kiki daemon via UDS", e))
     }
 
     fn init(

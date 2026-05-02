@@ -2,10 +2,9 @@
 
 //! Shared storage primitives for kiki.
 //!
-//! The `RemoteStore` trait, `BlobKind` enum, `FsRemoteStore`
-//! implementation, and the stdin/stdout framing protocol used by
-//! `kiki kk serve` (SSH transport) all live here so both the
-//! daemon and CLI crates can use them without circular dependencies.
+//! The `RemoteStore` trait, `BlobKind` enum, and `FsRemoteStore`
+//! implementation live here so both the daemon and CLI crates can
+//! use them without circular dependencies.
 
 use std::sync::Arc;
 
@@ -13,8 +12,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-pub mod framing;
 pub mod fs;
+pub mod paths;
 
 /// Which content-addressed table the (id, bytes) pair belongs to.
 /// Mirrors the object kinds in the daemon's `GitContentStore` (git

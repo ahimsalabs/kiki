@@ -5,13 +5,16 @@ version.workspace = true
 authors.workspace = true
 description.workspace = true
 
+[lib]
+name = "kiki_daemon"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 digest.workspace = true
-clap.workspace = true
 fuse3.workspace = true
 gix.workspace = true
 pollster.workspace = true
@@ -30,7 +33,9 @@ serde.workspace = true
 store.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-tokio-stream.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
+tower = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
 tokio.workspace = true
 tonic-reflection.workspace = true
 tonic.workspace = true
