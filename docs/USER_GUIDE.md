@@ -10,19 +10,11 @@ backed by a daemon that handles storage, caching, and remote synchronization.
 
 ## Architecture overview
 
-```
-┌──────────┐       gRPC        ┌──────────┐      dir:// or grpc://     ┌──────────┐
-│  kiki    │ ◄──────────────►  │  Daemon  │ ◄──────────────────────►   │  Remote  │
-│  (jj    │                   │          │                            │  Store   │
-│  superset)│                   │  FUSE /  │                            │          │
-└──────────┘                   │  NFS     │                            └──────────┘
-                               └────┬─────┘
-                                    │ mount
-                               ┌────▼─────┐
-                               │ Working  │
-                               │  copy    │
-                               │ (VFS)    │
-                               └──────────┘
+```mermaid
+graph LR
+    CLI["kiki<br/>(jj superset)"] -- gRPC --> Daemon
+    Daemon -- "dir:// / grpc://" --> Remote["Remote Store"]
+    Daemon -- mount --> VFS["Working copy<br/>(FUSE / NFS)"]
 ```
 
 - **kiki** (`kiki`): A jj superset binary that talks to the daemon over gRPC.
@@ -243,6 +235,86 @@ daemon --config daemon-a.toml   # grpc_addr = "[::1]:12000"
 # Machine B: use Machine A as the remote
 kiki kk init "grpc://machine-a:12000" project
 ```
+
+## Working with GitHub
+
+After git convergence (in progress), kiki repos store content as git
+objects. You can add GitHub as a git remote and push/fetch using
+standard git protocol.
+
+### Setup
+
+```bash
+# Initialize a local repo
+kiki kk init "" my-project
+cd my-project
+
+# Create a GitHub repo (or use an existing one)
+# Then add it as a remote:
+kiki git remote add origin git@github.com:yourorg/my-project.git
+```
+
+### Push to GitHub
+
+```bash
+# Work normally
+kiki new -m "add feature"
+mkdir src && echo 'fn main() {}' > src/main.rs
+kiki describe -m "initial commit"
+
+# Push to GitHub
+kiki git push --remote origin --bookmark main
+```
+
+### Fetch from GitHub
+
+```bash
+# Pull changes (e.g., merged PRs, teammate pushes)
+kiki git fetch --remote origin
+
+# See what came in
+kiki log
+```
+
+### Collaborating with non-kiki users
+
+Your teammates don't need kiki. They use plain git:
+
+```bash
+git clone git@github.com:yourorg/my-project.git
+cd my-project
+# normal git workflow — commit, push, PR, etc.
+```
+
+You fetch their work into your kiki workspace with `kiki git fetch`.
+
+## Syncing over SSH
+
+Use an `ssh://` URL to sync with a daemon running on a remote machine.
+No ports to configure, no tunnels to manage — kiki forwards the Unix
+domain socket over SSH automatically.
+
+```bash
+kiki kk init ssh://user@my-server/myproject ~/work/myproject
+cd ~/work/myproject
+
+# Work normally — syncs to the remote daemon over SSH
+kiki new -m "fix bug"
+vim src/auth.rs
+```
+
+A teammate runs the same command. Both of you see each other's changes
+through the shared remote daemon.
+
+Under the hood, kiki:
+1. Asks the remote for its daemon socket path (`kiki kk daemon socket-path`)
+2. Auto-starts the remote daemon if needed
+3. Opens an SSH Unix socket forward in the background
+4. Connects to the forwarded socket as if the daemon were local
+
+No TCP port is needed on either end. SSH provides encryption and
+authentication. See [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md)
+for the full design.
 
 ## Known limitations
 
