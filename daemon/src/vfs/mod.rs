@@ -22,6 +22,8 @@ mod inode;
 #[cfg(any(target_os = "macos", test))]
 pub mod nfs_adapter;
 mod kiki_fs;
+#[cfg(test)]
+mod sim_tests;
 
 // Re-exports kept tight: only the symbols `vfs_mgr.rs` and `service.rs`
 // need at the crate root. The full per-module surface is reachable via
