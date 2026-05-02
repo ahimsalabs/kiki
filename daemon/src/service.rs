@@ -339,6 +339,12 @@ struct Mount {
     /// external git HEAD changes (e.g. `git commit` from the mount).
     /// Empty until the first `WriteCommit` exports HEAD.
     last_exported_head: Vec<u8>,
+    /// Last bookmarks exported via `export_bookmarks` in the `WriteView`
+    /// handler. Used to detect external ref changes (e.g. `git fetch` or
+    /// `git branch` from the mount). `None` until the first `WriteView`;
+    /// `Some(vec![])` means "exported an empty set" (any new refs are
+    /// external additions).
+    last_exported_bookmarks: Option<Vec<(String, Vec<u8>)>>,
 }
 
 impl Mount {
@@ -519,6 +525,7 @@ impl JujutsuService {
                 meta_path,
                 _ssh_tunnel: ssh_tunnel,
                 last_exported_head: Vec::new(),
+                last_exported_bookmarks: None,
             },
         );
         info!(path = %meta.working_copy_path, "rehydrated mount");
@@ -1041,6 +1048,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             meta_path,
             _ssh_tunnel: ssh_tunnel,
             last_exported_head: Vec::new(),
+            last_exported_bookmarks: None,
         };
         // Persist initial metadata so `rehydrate` can re-attach the
         // mount across daemon restarts even before the CLI's first
@@ -1424,6 +1432,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 bookmarks.iter().map(|(n, _)| n.as_str()).collect();
             if let Err(e) = crate::git_ops::cleanup_stale_refs(&git_path, &active) {
                 warn!("cleanup_stale_refs after WriteView: {e:#}");
+            }
+        }
+
+        // Track what we exported so git_detect_head_change can detect
+        // external ref changes (e.g. `git fetch` from the mount).
+        {
+            let mut mounts = self.mounts.lock().await;
+            if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
+                mount.last_exported_bookmarks = Some(bookmarks);
             }
         }
 
@@ -1919,16 +1936,21 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitDetectHeadChangeReq>,
     ) -> Result<Response<GitDetectHeadChangeReply>, Status> {
         let req = request.into_inner();
-        let (store, last_exported_head) = {
+        let (store, last_exported_head, last_exported_bookmarks) = {
             let mounts = self.mounts.lock().await;
             let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
                 Status::not_found(format!("no mount at {}", req.working_copy_path))
             })?;
-            (mount.store.clone(), mount.last_exported_head.clone())
+            (
+                mount.store.clone(),
+                mount.last_exported_head.clone(),
+                mount.last_exported_bookmarks.clone(),
+            )
         };
 
+        let git_path = store.git_repo_path().to_path_buf();
+
         let new_head = if !last_exported_head.is_empty() {
-            let git_path = store.git_repo_path().to_path_buf();
             match crate::git_ops::read_head(&git_path) {
                 Ok(Some(current_head)) if current_head != last_exported_head => current_head,
                 _ => Vec::new(),
@@ -1937,8 +1959,51 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             Vec::new()
         };
 
+        // Detect external bookmark changes: compare current refs/heads/*
+        // against what we last exported in WriteView. `None` means no
+        // WriteView has happened yet — skip detection.
+        let bookmark_changes = if let Some(ref exported_bookmarks) = last_exported_bookmarks {
+            let exported: HashMap<&str, &[u8]> = exported_bookmarks
+                .iter()
+                .map(|(n, id)| (n.as_str(), id.as_slice()))
+                .collect();
+            let current_refs = crate::git_ops::read_local_refs(&git_path)
+                .unwrap_or_default();
+            let current: HashMap<&str, &[u8]> = current_refs
+                .iter()
+                .map(|(n, id)| (n.as_str(), id.as_slice()))
+                .collect();
+
+            let mut changes = Vec::new();
+            // Added or changed bookmarks.
+            for (name, cur_id) in &current {
+                match exported.get(name) {
+                    Some(exp_id) if *exp_id == *cur_id => {} // unchanged
+                    _ => {
+                        changes.push(GitBookmarkChange {
+                            name: name.to_string(),
+                            commit_id: cur_id.to_vec(),
+                        });
+                    }
+                }
+            }
+            // Deleted bookmarks.
+            for (name, _) in &exported {
+                if !current.contains_key(name) {
+                    changes.push(GitBookmarkChange {
+                        name: name.to_string(),
+                        commit_id: Vec::new(), // empty = deleted
+                    });
+                }
+            }
+            changes
+        } else {
+            Vec::new()
+        };
+
         Ok(Response::new(GitDetectHeadChangeReply {
             new_head_commit_id: new_head,
+            bookmark_changes,
         }))
     }
 }
@@ -3598,5 +3663,146 @@ mod tests {
             .expect("resolve prefix (miss)")
             .into_inner();
         assert_eq!(got.resolution, 0); // no match
+    }
+
+    /// After WriteView exports bookmarks, external ref changes
+    /// (add/change/delete) are detected by git_detect_head_change.
+    #[tokio::test]
+    async fn git_detect_bookmark_changes() {
+        let svc = JujutsuService::bare();
+        let path = "/tmp/bookmark_detect";
+        init_mount(&svc, path).await;
+
+        // Write a commit so we have a valid OID for bookmarks.
+        let empty = svc
+            .get_empty_tree_id(Request::new(GetEmptyTreeIdReq {
+                working_copy_path: path.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let root_parent = vec![0; COMMIT_ID_LENGTH];
+        let commit_id = svc
+            .write_commit(Request::new(WriteCommitReq {
+                working_copy_path: path.into(),
+                commit: Some(Commit {
+                    parents: vec![root_parent],
+                    root_tree: vec![empty.tree_id.clone()],
+                    description: "test".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .commit_id;
+
+        // WriteView stamps last_exported_bookmarks (the root view has
+        // no bookmarks, so it's Some(vec![])).
+        let (view_id, view_data) = make_view_blob().await;
+        svc.write_view(Request::new(WriteViewReq {
+            working_copy_path: path.into(),
+            view_id,
+            data: view_data,
+        }))
+        .await
+        .expect("write_view");
+
+        // Before any external change, detect should find nothing.
+        let reply = svc
+            .git_detect_head_change(Request::new(GitDetectHeadChangeReq {
+                working_copy_path: path.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            reply.bookmark_changes.is_empty(),
+            "no changes expected before external modification"
+        );
+
+        // Get the git repo path to manipulate refs directly.
+        let git_path = {
+            let mounts = svc.mounts.lock().await;
+            let mount = mounts.get(path).unwrap();
+            mount.store.git_repo_path().to_path_buf()
+        };
+
+        // --- Test addition: add a ref externally ---
+        crate::git_ops::export_bookmarks(
+            &git_path,
+            &[("external-branch".to_string(), commit_id.clone())],
+        )
+        .unwrap();
+
+        let reply = svc
+            .git_detect_head_change(Request::new(GitDetectHeadChangeReq {
+                working_copy_path: path.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.bookmark_changes.len(), 1);
+        assert_eq!(reply.bookmark_changes[0].name, "external-branch");
+        assert_eq!(reply.bookmark_changes[0].commit_id, commit_id);
+
+        // --- Test deletion: simulate the daemon exporting a bookmark,
+        // then an external tool deleting it ---
+        // Directly stamp the mount's last_exported_bookmarks as if
+        // WriteView had exported "external-branch".
+        {
+            let mut mounts = svc.mounts.lock().await;
+            let mount = mounts.get_mut(path).unwrap();
+            mount.last_exported_bookmarks =
+                Some(vec![("external-branch".to_string(), commit_id.clone())]);
+        }
+
+        // Now the ref exists and matches — no changes.
+        let reply = svc
+            .git_detect_head_change(Request::new(GitDetectHeadChangeReq {
+                working_copy_path: path.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            reply.bookmark_changes.is_empty(),
+            "no changes when refs match exported bookmarks"
+        );
+
+        // Delete it externally.
+        let keep_none: HashSet<&str> = HashSet::new();
+        crate::git_ops::cleanup_stale_refs(&git_path, &keep_none).unwrap();
+
+        let reply = svc
+            .git_detect_head_change(Request::new(GitDetectHeadChangeReq {
+                working_copy_path: path.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.bookmark_changes.len(), 1);
+        assert_eq!(reply.bookmark_changes[0].name, "external-branch");
+        assert!(
+            reply.bookmark_changes[0].commit_id.is_empty(),
+            "deleted bookmark should have empty commit_id"
+        );
+
+        // --- Before first WriteView, detection is skipped ---
+        let svc2 = JujutsuService::bare();
+        let path2 = "/tmp/bookmark_detect_2";
+        init_mount(&svc2, path2).await;
+        let reply = svc2
+            .git_detect_head_change(Request::new(GitDetectHeadChangeReq {
+                working_copy_path: path2.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            reply.bookmark_changes.is_empty(),
+            "no detection before first WriteView"
+        );
     }
 }

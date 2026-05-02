@@ -239,8 +239,8 @@ fn is_kiki_backend(command_helper: &CommandHelper) -> bool {
         .unwrap_or(false)
 }
 
-/// Dispatch hook: detects external git HEAD changes (e.g. `git commit` from
-/// the mount) and imports them into jj's graph before the normal command runs.
+/// Dispatch hook: detects external git changes (HEAD and bookmark refs) and
+/// imports them into jj's graph before the normal command runs.
 /// Runs before `kiki_git_dispatch_hook` so the import lands before snapshot.
 async fn kiki_git_import_hook(
     ui: &mut Ui,
@@ -248,17 +248,18 @@ async fn kiki_git_import_hook(
     old_dispatch: BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
     if is_kiki_backend(command_helper) {
-        if let Err(e) = maybe_import_git_head(ui, command_helper).await {
+        if let Err(e) = maybe_import_git_changes(ui, command_helper).await {
             // Non-fatal: log and continue. The user can reconcile manually.
-            writeln!(ui.warning_default(), "git HEAD import failed: {e:?}")?;
+            writeln!(ui.warning_default(), "git import failed: {e:?}")?;
         }
     }
     old_dispatch.call(ui, command_helper).await
 }
 
-/// Check if git HEAD was moved externally and, if so, import the commit
-/// into jj's graph so the next snapshot sees the correct parent.
-async fn maybe_import_git_head(
+/// Check if git HEAD or refs/heads/* were moved externally and, if so,
+/// import the changes into jj's graph so the next snapshot sees the
+/// correct state.
+async fn maybe_import_git_changes(
     ui: &mut Ui,
     command_helper: &CommandHelper,
 ) -> Result<(), CommandError> {
@@ -277,53 +278,128 @@ async fn maybe_import_git_head(
         .map_err(|e| internal_error_with_message("GitDetectHeadChange RPC", e))?
         .into_inner();
 
-    if reply.new_head_commit_id.is_empty() {
-        return Ok(()); // HEAD unchanged — nothing to do.
+    let has_head_change = !reply.new_head_commit_id.is_empty();
+    let has_bookmark_changes = !reply.bookmark_changes.is_empty();
+
+    if !has_head_change && !has_bookmark_changes {
+        return Ok(()); // Nothing changed — nothing to do.
     }
 
-    let new_head_id = jj_lib::backend::CommitId::from_bytes(&reply.new_head_commit_id);
     use jj_lib::object_id::ObjectId as _;
-    writeln!(
-        ui.status(),
-        "Importing external git commit: {}",
-        new_head_id.hex()
-    )?;
 
     // Load workspace without triggering snapshot (we need to import first).
     let mut ws_helper = command_helper.workspace_helper_no_snapshot(ui)?;
 
-    // Start a transaction to import the commit and update the
-    // working-copy parent, matching jj colocated import_git_head.
     let workspace_name = ws_helper.workspace_name().to_owned();
     {
         let mut tx = ws_helper.start_transaction();
-
-        // Reading the commit through the store auto-creates extras (change-id).
         let store = tx.repo().store().clone();
-        let new_commit = store
-            .get_commit(&new_head_id)
-            .map_err(|e| internal_error_with_message("reading imported commit", e))?;
 
-        // Add the commit as a head (makes it visible in jj log).
-        tx.repo_mut()
-            .add_head(&new_commit)
-            .await
-            .map_err(|e| internal_error_with_message("adding imported commit as head", e))?;
+        // Import external HEAD change (e.g. `git commit` from the mount).
+        if has_head_change {
+            let new_head_id =
+                jj_lib::backend::CommitId::from_bytes(&reply.new_head_commit_id);
+            writeln!(
+                ui.status(),
+                "Importing external git commit: {}",
+                new_head_id.hex()
+            )?;
 
-        // Check out: creates a new working-copy commit with the imported
-        // commit as parent.
-        tx.repo_mut()
-            .check_out(workspace_name, &new_commit)
-            .await
-            .map_err(|e| internal_error_with_message("checking out imported commit", e))?;
+            let new_commit = store
+                .get_commit(&new_head_id)
+                .map_err(|e| internal_error_with_message("reading imported commit", e))?;
 
-        tx.finish(ui, "import git head").await?;
+            tx.repo_mut()
+                .add_head(&new_commit)
+                .await
+                .map_err(|e| {
+                    internal_error_with_message("adding imported commit as head", e)
+                })?;
+
+            tx.repo_mut()
+                .check_out(workspace_name, &new_commit)
+                .await
+                .map_err(|e| {
+                    internal_error_with_message("checking out imported commit", e)
+                })?;
+        }
+
+        // Import external bookmark changes (e.g. `git fetch` or `git branch`
+        // from the mount).
+        if has_bookmark_changes {
+            use jj_lib::op_store::RefTarget;
+            use jj_lib::ref_name::RefName;
+
+            for change in &reply.bookmark_changes {
+                let bookmark_name = RefName::new(&change.name);
+                if change.commit_id.is_empty() {
+                    // Bookmark was deleted externally.
+                    writeln!(
+                        ui.status(),
+                        "Importing deleted git bookmark: {}",
+                        change.name
+                    )?;
+                    tx.repo_mut().set_local_bookmark_target(
+                        bookmark_name,
+                        RefTarget::absent(),
+                    );
+                } else {
+                    // Bookmark was added or changed externally.
+                    let commit_id =
+                        jj_lib::backend::CommitId::from_bytes(&change.commit_id);
+                    writeln!(
+                        ui.status(),
+                        "Importing external git bookmark: {} -> {}",
+                        change.name,
+                        commit_id.hex()
+                    )?;
+
+                    // Read the commit through the store (auto-creates extras).
+                    let commit = store.get_commit(&commit_id).map_err(|e| {
+                        internal_error_with_message(
+                            format!(
+                                "reading commit for imported bookmark '{}'",
+                                change.name
+                            ),
+                            e,
+                        )
+                    })?;
+
+                    // Make the commit visible in jj log.
+                    tx.repo_mut().add_head(&commit).await.map_err(|e| {
+                        internal_error_with_message(
+                            format!(
+                                "adding head for imported bookmark '{}'",
+                                change.name
+                            ),
+                            e,
+                        )
+                    })?;
+
+                    tx.repo_mut().set_local_bookmark_target(
+                        bookmark_name,
+                        RefTarget::normal(commit_id),
+                    );
+                }
+            }
+        }
+
+        let description = if has_head_change && has_bookmark_changes {
+            "import git head and bookmarks"
+        } else if has_head_change {
+            "import git head"
+        } else {
+            "import git bookmarks"
+        };
+        tx.finish(ui, description).await?;
     }
 
-    writeln!(
-        ui.status(),
-        "Reset the working copy parent to the new Git HEAD."
-    )?;
+    if has_head_change {
+        writeln!(
+            ui.status(),
+            "Reset the working copy parent to the new Git HEAD."
+        )?;
+    }
 
     Ok(())
 }

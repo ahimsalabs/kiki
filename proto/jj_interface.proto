@@ -559,4 +559,17 @@ message GitDetectHeadChangeReply {
   // Non-empty if git HEAD differs from the last daemon-exported HEAD.
   // The CLI should import this commit into jj's graph.
   bytes new_head_commit_id = 1;
+  // Bookmark changes detected since the last daemon-exported bookmarks.
+  // Non-empty when refs/heads/* in the bare git repo differ from the
+  // bookmarks last exported by WriteView. The CLI should import these
+  // as local bookmark updates in jj's View.
+  repeated GitBookmarkChange bookmark_changes = 2;
+}
+
+// A bookmark that was added, changed, or deleted externally in the
+// bare git repo (e.g. via `git fetch` or `git branch` from the mount).
+message GitBookmarkChange {
+  string name = 1;
+  // Raw commit OID (20 bytes). Empty means the bookmark was deleted.
+  bytes commit_id = 2;
 }
