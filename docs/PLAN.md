@@ -1,10 +1,11 @@
 # kiki: Implementation Plan
 
 Status: active. Transport architecture decided (§4.3 Path C). M1–M10.6
-done — see milestone index below for per-milestone detail. 192/167 daemon
-tests + 15/10 cli tests pass; `cargo clippy --workspace --all-targets
+done — see milestone index below for per-milestone detail. 192 tests (167 daemon + 15 cli unit + 10 cli integration) pass; `cargo clippy --workspace --all-targets
 -- -D warnings` is clean. Next up: M10.7 (gitignore-aware VFS),
-daemon lifecycle (auto-start), git convergence. Last updated: 2026-05-01
+daemon lifecycle (auto-start), git convergence. EdenFS-informed items
+(inode GC, graceful restart, durability testing, fsnotify,
+observability) added to §10. Last updated: 2026-05-02
 
 This document captures the roadmap for getting kiki from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -39,6 +40,15 @@ wasted effort. If it does, B and C are routine engineering.
 | **Git convergence** — replace custom content store with jj-lib `GitBackend` | active | [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md) |
 | **Daemon lifecycle** — auto-start, launchd/systemd integration | active | [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md) |
 | **Workspaces** — managed namespace, multi-workspace orchestration | future | [`WORKSPACES.md`](./WORKSPACES.md) |
+| **Linear history & segment index** — `linear` ref protection, O(1) ancestor queries | future | [`LINEAR_HISTORY.md`](./LINEAR_HISTORY.md) |
+| **Inode GC** — evict unused inodes from memory (critical for macOS NFS) | future | §10 |
+| **Graceful restart / takeover** — fd-passing so daemon upgrades don't unmount | future | §10 |
+| **fsmonitor / fsnotify** — emit file-change events for IDE and build-tool integration | future | §10 |
+| **Observability** — per-operation latency histograms, cache hit rates, queue depths | future | §10 |
+| **Ref protection** — server-side enforcement of bookmark/ref rules | future | [`REF_PROTECTION.md`](./REF_PROTECTION.md) |
+| **Code review** — submissions, approvals, OWNERS, `land` operation | future | [`REVIEW.md`](./REVIEW.md) |
+| **Authentication** — identity, auth mechanisms, authorization | future | [`AUTH.md`](./AUTH.md) |
+| **Approvals** — change-scoped approval storage, staleness detection | future | [`APPROVALS.md`](./APPROVALS.md) |
 
 ## 3. What's deferred
 
@@ -335,7 +345,7 @@ other's full operation history. Full history: [`PLAN-M1-6.md`](./PLAN-M1-6.md),
 **Still open:** M11 (async push queue + offline resilience,
 [`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md)), M12 (auth/TLS/S3),
 the `fuser` migration (§9), inode-id stability across restarts
-(§7 decision 6).
+(§7 decision 6), and the EdenFS-informed items (§10).
 
 **Hygiene still pending:**
 
@@ -396,4 +406,159 @@ need it. Still small relative to the rest of the migration.
 
 Land alongside Layer B if possible (we'll already be touching
 per-Mount state for stable inode ids).
+
+## 10. EdenFS-informed work items
+
+Informed by reviewing Meta's EdenFS design docs
+(`facebook/sapling/eden/fs/docs/`). These are engineering facts
+and architectural patterns learned from EdenFS's production
+experience with VFS-served source control working copies.
+
+### 10.1 Inode GC (memory management)
+
+**Problem:** The `InodeSlab` grows without bound. On macOS NFS this
+is especially bad — NFSv3 has no `FORGET` message (unlike FUSE),
+so the daemon never learns that the kernel no longer needs an
+inode. EdenFS documents this explicitly: "inode count grows
+unboundedly" on NFS, mitigated by background GC with access-time
+cutoffs (default 6 hours).
+
+**Design sketch:** Periodic GC task per mount. Walk the slab,
+evict non-dirty inodes whose last access time exceeds a cutoff.
+On FUSE (Linux), the kernel sends `FUSE_FORGET` naturally, so GC
+is less critical but still useful for memory pressure. On NFS
+(macOS), GC is the only mechanism.
+
+Reference: ghfs blob cache uses sampled-LRU (power-of-K-choices,
+K=5) with platform-specific atime extraction
+(`syscall.Stat_t.Atim` on Linux, `Atimespec` on Darwin). The
+same atime-based eviction pattern applies to inodes — track last
+access in the `Inode` struct, sample K candidates, evict the
+oldest.
+
+### 10.2 Graceful restart / takeover
+
+**Problem:** Daemon restart (upgrade, config change, crash
+recovery) unmounts everything, breaking every open terminal, IDE,
+and build process.
+
+**Mechanism:** fd-passing over a Unix domain socket via
+`sendmsg`/`recvmsg` with `SCM_RIGHTS`. Old daemon sends new
+daemon:
+- FUSE `/dev/fuse` fd (Linux) — mount stays alive
+- NFS TCP listener socket fd (macOS) — client connection
+  migrates
+- UDS listener fd — new daemon picks up CLI connections
+- Serialized mount state (inode slab, dirty state, op-id)
+
+EdenFS confirms the NFS client (kernel) tolerates server-side
+socket ownership change. Their takeover protocol is
+capability-based (version 7) with ping verification, chunked
+state transfer, and UID validation.
+
+**Rust crates:** `sendfd` for fd-passing, or raw
+`libc::sendmsg`. The serialization payload can use the existing
+protobuf types.
+
+**Prerequisite:** Inode handle stability (§7 decision 6) — the
+new daemon must produce the same inode numbers as the old one,
+otherwise the kernel's dcache is invalid.
+
+### 10.3 Durability invariants and testing
+
+**Problem:** If the daemon crashes between promoting a child
+inode to dirty and updating the parent's tree entry in redb,
+rehydrate may see inconsistent state. EdenFS documents strict
+ordering: "materialized children's overlay data must be written
+before the parent records them as materialized" and the reverse
+for dematerialization.
+
+**Properties to verify:**
+1. No data loss: every dirty inode persisted to redb before crash
+   is recoverable after rehydrate
+2. No phantom files: no files appear that weren't written
+3. Parent consistency: dirty child implies dirty parent chain
+4. Ordering: crash between child persist and parent update
+   produces a recoverable (not corrupt) state
+
+**Testing approach:** Property-based simulation using `proptest`
+or `bolero`. Model the state machine as:
+```
+enum Op {
+    CreateFile(path),
+    Write(path, data),
+    Mkdir(path),
+    Rename(from, to),
+    Remove(path),
+    Snapshot,
+    Crash,              // truncate ops at arbitrary point
+    Rehydrate,          // reconstruct state from redb
+}
+```
+Generate random `Vec<Op>` with `Crash` inserted at arbitrary
+positions. Assert: `run(ops_before_crash); rehydrate()` produces
+a state consistent with the properties above. This tests the
+`Store` + `InodeSlab` layer directly — no FUSE/NFS needed, so
+it's fast.
+
+Secondary: property-test the takeover serialization:
+`forall(state: MountState): deserialize(serialize(state)) == state`.
+
+### 10.4 fsmonitor / fsnotify
+
+**Problem:** The daemon owns every write, so *snapshot* doesn't
+need fsmonitor. But external tools (VS Code, IntelliJ, Watchman,
+build systems) expect file-change notifications. On FUSE (Linux),
+inotify works naturally through the kernel VFS layer. On NFS
+(macOS), FSEvents may or may not fire reliably for NFS mounts.
+
+EdenFS solves this with a **Journal** — a log of modifying
+filesystem operations, exposed via `getFilesChangedSince()` Thrift
+API, consumed by Watchman.
+
+**Design options:**
+- **(a)** Expose a `FilesChangedSince(token) -> Vec<ChangedFile>`
+  gRPC endpoint. The daemon already knows every mutation — log
+  them in a ring buffer with monotonic sequence numbers.
+- **(b)** Implement jj-lib's fsmonitor integration point to return
+  the dirty set from the slab directly (the daemon already knows).
+- **(c)** On macOS NFS, if FSEvents don't fire for NFS mounts,
+  the Journal API becomes the only mechanism for IDE integration.
+
+### 10.5 Observability
+
+**Problem:** No per-operation metrics. When something is slow, no
+way to distinguish local redb latency from remote fetch latency
+from VFS overhead.
+
+EdenFS tracks counters and duration histograms at every layer:
+VFS ops (per FUSE/NFS/ProjFS command), object store (memory cache
+vs backing store hit rates), overlay ops, backing store (queue
+time vs fetch time), cache eviction rates.
+
+**Minimum viable instrumentation:**
+- Per-VFS-op latency (read, write, lookup, readdir, getattr) via
+  `tracing` spans or `metrics` crate histograms
+- Cache hit/miss rates: local redb hit vs remote fetch
+- Push queue depth + drain rate (M11)
+- Inode slab size (loaded count, dirty count, memory estimate)
+- Expose via `DaemonStatus` RPC and/or Prometheus endpoint
+
+### 10.6 macOS NFS hardening
+
+Known issues from EdenFS's macOS NFS experience to track:
+
+- **Hung mounts on daemon death.** Unlike FUSE (returns ENOTCONN),
+  NFS mounts become unresponsive. Mitigation: launchd/systemd
+  watchdog, or document `umount -f` in troubleshooting.
+- **`.nfs-xxxx` temporary files.** Created when a file is removed
+  while another process has it open. Filter from snapshot.
+- **No xattr support (NFSv3).** Xcode and Finder use xattrs.
+  Document as a known limitation.
+- **readdir returns names only.** No file types → n+1 LOOKUP
+  round-trips per directory listing. Consider `readdirplus` if
+  nfsserve supports it.
+- **Case-insensitivity.** macOS NFS mounts are case-insensitive
+  by default. May cause silent name collisions in case-sensitive
+  repos.
 

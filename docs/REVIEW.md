@@ -60,6 +60,10 @@ Approval {
   commit_id: CommitId,        // the specific revision reviewed
   approver: String,           // identity envelope (email)
   attestor: String,           // who signed (daemon or self)
+  path_snapshots: Vec<(PathBuf, ContentHash)>,
+                              // content hashes of paths the approver
+                              // owns at approval time — enables O(1)
+                              // staleness checks without tree diffs
   timestamp: DateTime,
   signature: Bytes,
 }
@@ -69,6 +73,10 @@ Stored at: `refs/approvals/<change_id>/<approver>`
 
 Multiple approvers each get their own ref. Re-approving (after a
 revision) overwrites the ref via CAS.
+
+**Scoping:** Approval blobs are repo-wide — `cas_ref` enforcement
+must see all of them regardless of caller. But storage is repo-wide,
+queries are scoped. See [Query scoping](#query-scoping) below.
 
 ### Ref namespace
 
@@ -405,6 +413,63 @@ Recommendation: configure `immutable_heads()` in the repo's
 jj config to match `protect.toml` rules. This gives users fast
 client-side feedback ("you can't rewrite this") without waiting
 for a server rejection.
+
+## Query scoping
+
+In a monorepo with many teams, `list_refs("approvals/")` and
+`kiki kk pending` would return thousands of entries, mostly
+irrelevant. Storage is repo-wide (enforcement needs full
+visibility), but every query surface is scoped.
+
+Three scoping mechanisms, layered:
+
+### OWNERS-derived (implicit default)
+
+The daemon knows the caller's identity and which OWNERS groups they
+belong to. Default query behavior: show changes that touch paths
+the caller owns.
+
+```bash
+kiki kk pending
+# Only shows submissions where changed paths overlap with my OWNERS scope
+```
+
+### Path prefix (explicit)
+
+For browsing or cross-team visibility:
+
+```bash
+kiki kk pending --scope "src/payments/**"
+kiki kk approvals xyz --scope "src/api/**"
+```
+
+### Workspace-derived (automatic)
+
+If the workspace has a declared scope (see
+[`WORKSPACES.md`](./WORKSPACES.md)), use it as the default filter.
+A workspace scoped to `src/payments/` automatically filters queries
+to that subtree.
+
+```toml
+# workspace config or mount metadata
+[scope]
+paths = ["src/payments/**"]
+```
+
+`kiki kk pending` from that workspace implicitly means
+`kiki kk pending --scope "src/payments/**"`. The `--scope` flag
+overrides the workspace default.
+
+### Implementation
+
+`ListApprovals` and `ListSubmissions` RPCs each gain an optional
+`repeated string scope` field (path patterns). The daemon diffs
+each change's tree against the scope and skips non-overlapping
+entries. When no explicit scope is provided, the daemon falls back
+to the OWNERS-derived scope for the authenticated caller, then to
+the workspace scope if set.
+
+Enforcement at `cas_ref` time is always unscoped — full visibility.
 
 ## Open questions
 

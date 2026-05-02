@@ -34,29 +34,47 @@ detect staleness by content, not by commit identity.
 
 ### Approval storage
 
-The team daemon maintains an approvals table in its redb store:
+Approvals are content-addressed blobs stored as refs in the
+`RemoteStore`, consistent with the rest of kiki's data model (see
+[`REVIEW.md`](./REVIEW.md) for the full data model):
 
 ```
-approvals:
-  (change_id, approver_identity) → ApprovalRecord
+refs/approvals/<change_id>/<approver_identity> → Approval blob
 ```
+
+The approval blob contains:
 
 ```rust
-struct ApprovalRecord {
+struct Approval {
+    change_id: ChangeId,
     /// Commit ID at the time of approval (for staleness checks).
     approved_commit: CommitId,
     /// Content hashes of paths the approver is an owner of,
-    /// at the time of approval.
+    /// at the time of approval. Enables O(1) staleness checks
+    /// without re-diffing trees.
     path_snapshots: Vec<(PathBuf, ContentHash)>,
+    /// Identity of the approver.
+    approver: String,
+    /// Who signed: the daemon (on behalf of the user) or the user directly.
+    attestor: String,
     /// When the approval was recorded.
     timestamp: DateTime,
+    /// Cryptographic signature over the above fields.
+    signature: Bytes,
 }
 ```
 
-Approvals are local to the daemon — they don't replicate to remotes.
-The team daemon is the approval authority, just as GitHub is the
-approval authority for GitHub PRs. This is intentional: approval is a
-social/organizational fact, not a content fact.
+Approvals replicate via `RemoteStore` like all other data. This means:
+
+- In a **team-server topology** (shared daemon), approvals are
+  effectively local — there's only one daemon.
+- In a **peer topology** (daemon-to-daemon sync), approvals replicate
+  naturally. The enforcing daemon at `cas_ref` time has full visibility
+  regardless of which daemon recorded the approval.
+
+Enforcement is always daemon-side at `cas_ref` time — the daemon that
+owns the ref is the sole authority for its refs, regardless of where
+the approval blob originated.
 
 ### Approval RPC
 
@@ -88,6 +106,11 @@ message ApproveReply {
 message ListApprovalsReq {
   string working_copy_path = 1;
   string change_id = 2;
+  // Optional path scope filter. When set, only approvals for
+  // changes touching these paths are returned. When empty, falls
+  // back to OWNERS-derived scope for the caller, then workspace
+  // scope. See REVIEW.md "Query scoping".
+  repeated string scope = 3;
 }
 
 message ListApprovalsReply {
