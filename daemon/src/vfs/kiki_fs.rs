@@ -29,9 +29,11 @@
 //! `fs_err_to_errno`) so the same domain code maps to both protocols
 //! without duplicating the match arms.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use jj_lib::gitignore::GitIgnoreFile;
 use parking_lot::Mutex;
 
 use crate::{
@@ -54,6 +56,14 @@ const JJ_DIR: &str = ".jj";
 /// Contains `gitdir: <path>\n` so that stock git tools work against
 /// the mount. Pinned outside the content-addressed tree, same as `.jj/`.
 const GIT_FILE: &str = ".git";
+
+const GITIGNORE_FILE: &str = ".gitignore";
+
+/// Repo-root config listing directories to redirect to local scratch
+/// storage (one path per line, repo-root-relative). Redirected dirs
+/// become symlinks to a per-mount scratch directory and bypass both
+/// the VFS hot path and the snapshot.
+const KIKI_REDIRECTIONS_FILE: &str = ".kiki-redirections";
 
 /// Kind of filesystem object. Smaller than the NFS `ftype3` and FUSE
 /// `FileType` enums; we never serve block/char/socket/fifo nodes.
@@ -327,6 +337,19 @@ pub struct KikiFs {
     /// the authoritative copy lives in the slab as a `DirtyFile`.
     #[allow(dead_code)]
     git_file_content: Vec<u8>,
+    /// M10.7: gitignore rules loaded from `.gitignore` files in the
+    /// content tree. Updated at `check_out` time and on `.gitignore`
+    /// writes (hot-reload). Consulted by `create_file`/`mkdir`/`symlink`
+    /// to tag new inodes as ignored.
+    ignore_rules: Mutex<Arc<GitIgnoreFile>>,
+    /// M10.7: repo-root-relative paths configured as redirections (from
+    /// `.kiki-redirections`). `mkdir` for a redirected path creates a
+    /// symlink to a scratch directory on real local disk instead of a
+    /// `DirtyTree`, bypassing FUSE for all I/O inside.
+    redirections: Mutex<Vec<String>>,
+    /// Per-mount scratch directory for redirections. Created under
+    /// `<storage_dir>/scratch/`. `None` disables redirections (tests).
+    scratch_dir: Option<std::path::PathBuf>,
 }
 
 impl KikiFs {
@@ -347,6 +370,7 @@ impl KikiFs {
         store: Arc<GitContentStore>,
         root_tree: Id,
         remote: Option<Arc<dyn RemoteStore>>,
+        scratch_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let slab = InodeSlab::new(root_tree);
         let git_content =
@@ -359,6 +383,9 @@ impl KikiFs {
                 executable: false,
             },
         );
+        // Load .gitignore and .kiki-redirections from the initial tree.
+        let ignore_rules = Self::load_gitignore_from_store(&store, &root_tree);
+        let redirections = Self::load_redirections_from_store(&store, &root_tree);
         // NOTE: do NOT call slab.attach_child — pinned like .jj/
         KikiFs {
             store,
@@ -367,7 +394,148 @@ impl KikiFs {
             jj_subtree: Mutex::new(None),
             git_file,
             git_file_content: git_content,
+            ignore_rules: Mutex::new(ignore_rules),
+            redirections: Mutex::new(redirections),
+            scratch_dir,
         }
+    }
+
+    /// Load `.gitignore` rules from the root of the content tree.
+    ///
+    /// Reads only the root-level `.gitignore` — nested `.gitignore`
+    /// files are picked up via the hot-reload path when they are
+    /// written through the VFS, or can be extended here for known
+    /// subdirectories.
+    fn load_gitignore_from_store(
+        store: &GitContentStore,
+        tree_id: &Id,
+    ) -> Arc<GitIgnoreFile> {
+        let base = GitIgnoreFile::empty();
+        let tree = match store.read_tree(&tree_id.0) {
+            Ok(Some(t)) => t,
+            _ => return base,
+        };
+        for entry in &tree {
+            if entry.name == GITIGNORE_FILE
+                && matches!(entry.kind, GitEntryKind::File { .. })
+                && let Ok(id) = <[u8; 20]>::try_from(entry.id.as_slice())
+                && let Ok(Some(content)) = store.read_file(&id)
+            {
+                return base
+                    .chain("", Path::new(GITIGNORE_FILE), &content)
+                    .unwrap_or(base);
+            }
+        }
+        base
+    }
+
+    /// Load `.kiki-redirections` from the root of the content tree.
+    /// Returns a list of repo-root-relative paths to redirect to
+    /// scratch storage.
+    fn load_redirections_from_store(
+        store: &GitContentStore,
+        tree_id: &Id,
+    ) -> Vec<String> {
+        let tree = match store.read_tree(&tree_id.0) {
+            Ok(Some(t)) => t,
+            _ => return Vec::new(),
+        };
+        for entry in &tree {
+            if entry.name == KIKI_REDIRECTIONS_FILE
+                && matches!(entry.kind, GitEntryKind::File { .. })
+                && let Ok(id) = <[u8; 20]>::try_from(entry.id.as_slice())
+                && let Ok(Some(content)) = store.read_file(&id)
+            {
+                return Self::parse_redirections(&content);
+            }
+        }
+        Vec::new()
+    }
+
+    /// Parse `.kiki-redirections`: one path per line, `#` comments,
+    /// blank lines skipped.
+    fn parse_redirections(content: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(content);
+        text.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.trim_end_matches('/').to_owned())
+            .collect()
+    }
+
+    /// Build a repo-root-relative path string for a child being
+    /// created under `parent` with the given `name`. Walks parent
+    /// pointers in the slab to reconstruct the full path.
+    fn repo_path_str(&self, parent: InodeId, name: &str) -> String {
+        let mut components = vec![name.to_owned()];
+        let mut current = parent;
+        loop {
+            if current == self.root() {
+                break;
+            }
+            let inode = match self.slab.get(current) {
+                Some(i) => i,
+                None => break,
+            };
+            if inode.parent == current {
+                break; // reached root (self-referencing)
+            }
+            components.push(inode.name.clone());
+            current = inode.parent;
+        }
+        components.reverse();
+        components.join("/")
+    }
+
+    /// Check whether a new entry at `(parent, name)` should be tagged
+    /// as ignored. Fast path: parent is ignored → child inherits.
+    /// Slow path: consult gitignore rules with the full repo-relative
+    /// path.
+    fn is_ignored(&self, parent: InodeId, name: &str, is_dir: bool) -> bool {
+        // Fast path: parent is ignored → child inherits.
+        if self.slab.get(parent).is_some_and(|i| i.ignored) {
+            return true;
+        }
+        // Consult gitignore rules. Trailing `/` signals "is directory"
+        // to jj-lib 0.40's `GitIgnoreFile::matches`.
+        let path = self.repo_path_str(parent, name);
+        if path.is_empty() {
+            return false;
+        }
+        let match_path = if is_dir {
+            format!("{path}/")
+        } else {
+            path
+        };
+        let rules = self.ignore_rules.lock();
+        rules.matches(&match_path)
+    }
+
+    /// Hot-reload ignore or redirection rules from a `.gitignore` or
+    /// `.kiki-redirections` write. Called from the `write` handler when
+    /// the written file's name matches.
+    fn reload_rules(&self, file_name: &str, content: &[u8]) {
+        if file_name == GITIGNORE_FILE {
+            // Re-chain from the empty base with the new content.
+            // TODO: handle nested .gitignore files by tracking the
+            // prefix from the parent chain.
+            let base = GitIgnoreFile::empty();
+            let rules = base
+                .chain("", Path::new(GITIGNORE_FILE), content)
+                .unwrap_or(base);
+            *self.ignore_rules.lock() = rules;
+        } else if file_name == KIKI_REDIRECTIONS_FILE {
+            *self.redirections.lock() = Self::parse_redirections(content);
+        }
+    }
+
+    /// Check whether `name` under root is a configured redirection.
+    fn is_redirection(&self, parent: InodeId, name: &str) -> bool {
+        if parent != self.root() {
+            return false;
+        }
+        let redirections = self.redirections.lock();
+        redirections.iter().any(|r| r == name)
     }
 
     /// Returns the pinned `.jj/` inode if it exists.
@@ -774,6 +942,12 @@ impl KikiFs {
                         continue;
                     }
                     let child = self.slab.get(child_id).ok_or(FsError::NotFound)?;
+                    // M10.7: skip gitignored inodes. They remain fully
+                    // functional in the VFS but are never persisted to the
+                    // content store or pushed to a remote.
+                    if child.ignored {
+                        continue;
+                    }
                     let (kind, child_content_id) = match child.node {
                         NodeRef::Tree(id) => (GitEntryKind::Tree, id),
                         NodeRef::DirtyTree { .. } => {
@@ -990,6 +1164,11 @@ impl JjKikiFs for KikiFs {
         // isn't yet local.
         let _ = self.read_tree(new_root_tree).await?;
         self.slab.swap_root(new_root_tree);
+        // M10.7: reload ignore rules and redirections from the new tree.
+        *self.ignore_rules.lock() =
+            Self::load_gitignore_from_store(&self.store, &new_root_tree);
+        *self.redirections.lock() =
+            Self::load_redirections_from_store(&self.store, &new_root_tree);
         Ok(())
     }
 
@@ -1003,18 +1182,17 @@ impl JjKikiFs for KikiFs {
             return Err(FsError::AlreadyExists);
         }
         self.ensure_dirty_tree(parent).await?;
-        let child = self.slab.alloc(
+        let ignored = self.is_ignored(parent, name, false);
+        let child = self.slab.alloc_with_ignored(
             parent,
             name.to_owned(),
             NodeRef::DirtyFile {
                 content: Vec::new(),
                 executable,
             },
+            ignored,
         );
         if !self.slab.attach_child(parent, name.to_owned(), child) {
-            // Concurrent creator beat us. Race is unlikely in practice
-            // (one CLI per mount, single-threaded write path), but
-            // surface it cleanly rather than corrupting state.
             return Err(FsError::AlreadyExists);
         }
         let attr = self.attr_for(child).await?;
@@ -1058,12 +1236,37 @@ impl JjKikiFs for KikiFs {
             return Err(FsError::AlreadyExists);
         }
         self.ensure_dirty_tree(parent).await?;
-        let child = self.slab.alloc(
+        // M10.7: redirection → symlink to scratch dir on real local
+        // disk. All I/O inside the directory bypasses FUSE entirely.
+        if self.is_redirection(parent, name)
+            && let Some(scratch) = &self.scratch_dir
+        {
+            let target_dir = scratch.join(name);
+            std::fs::create_dir_all(&target_dir).map_err(|e| {
+                FsError::StoreError(format!("creating scratch dir: {e}"))
+            })?;
+            let child = self.slab.alloc_with_ignored(
+                parent,
+                name.to_owned(),
+                NodeRef::DirtySymlink {
+                    target: target_dir.to_string_lossy().into_owned(),
+                },
+                true, // always ignored
+            );
+            if !self.slab.attach_child(parent, name.to_owned(), child) {
+                return Err(FsError::AlreadyExists);
+            }
+            let attr = self.attr_for(child).await?;
+            return Ok((child, attr));
+        }
+        let ignored = self.is_ignored(parent, name, true);
+        let child = self.slab.alloc_with_ignored(
             parent,
             name.to_owned(),
             NodeRef::DirtyTree {
                 children: std::collections::BTreeMap::new(),
             },
+            ignored,
         );
         if !self.slab.attach_child(parent, name.to_owned(), child) {
             return Err(FsError::AlreadyExists);
@@ -1082,12 +1285,14 @@ impl JjKikiFs for KikiFs {
             return Err(FsError::AlreadyExists);
         }
         self.ensure_dirty_tree(parent).await?;
-        let child = self.slab.alloc(
+        let ignored = self.is_ignored(parent, name, false);
+        let child = self.slab.alloc_with_ignored(
             parent,
             name.to_owned(),
             NodeRef::DirtySymlink {
                 target: target.to_owned(),
             },
+            ignored,
         );
         if !self.slab.attach_child(parent, name.to_owned(), child) {
             return Err(FsError::AlreadyExists);
@@ -1125,11 +1330,23 @@ impl JjKikiFs for KikiFs {
             content.resize(end, 0);
         }
         content[offset as usize..end].copy_from_slice(data);
+        let file_name = inode.name.clone();
         let new = NodeRef::DirtyFile {
             content: std::mem::take(content),
             executable,
         };
         self.slab.replace_node(ino, new);
+        // M10.7: hot-reload gitignore / redirection rules when the
+        // written file is `.gitignore` or `.kiki-redirections`.
+        if file_name == GITIGNORE_FILE || file_name == KIKI_REDIRECTIONS_FILE {
+            // Re-read the complete buffer from the slab (the splice
+            // above may have been a partial write).
+            if let Some(updated) = self.slab.get(ino)
+                && let NodeRef::DirtyFile { ref content, .. } = updated.node
+            {
+                self.reload_rules(&file_name, content);
+            }
+        }
         Ok(data.len() as u32)
     }
 
@@ -1476,7 +1693,7 @@ mod tests {
     async fn empty_repo_has_only_root() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let entries = fs.readdir(fs.root()).await.expect("readdir empty root");
         // The only entry in an empty repo is the synthesized `.git`.
         assert_eq!(entries.len(), 1, "got {entries:?}");
@@ -1489,7 +1706,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_finds_top_level_file() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.expect("lookup");
         let attr = fs.getattr(id).await.expect("getattr");
         assert_eq!(attr.kind, FileKind::Regular);
@@ -1500,7 +1717,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_traverses_subdirectory() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let bin_id = fs.lookup(fs.root(), "bin").await.expect("bin");
         let bin_attr = fs.getattr(bin_id).await.expect("getattr bin");
         assert_eq!(bin_attr.kind, FileKind::Directory);
@@ -1513,7 +1730,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_is_idempotent() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let a = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         let b = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         assert_eq!(a, b);
@@ -1522,7 +1739,7 @@ mod tests {
     #[tokio::test]
     async fn read_returns_file_content_with_eof_flag() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.unwrap();
 
         // Whole file in one shot.
@@ -1544,7 +1761,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_lists_all_top_level_entries_with_kind() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let mut entries = fs.readdir(fs.root()).await.unwrap();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -1564,7 +1781,7 @@ mod tests {
     #[tokio::test]
     async fn readlink_returns_target() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let id = fs.lookup(fs.root(), "link").await.unwrap();
         assert_eq!(fs.readlink(id).await.unwrap(), "hello.txt");
     }
@@ -1572,7 +1789,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_unknown_name_is_not_found() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let err = fs.lookup(fs.root(), "missing").await.unwrap_err();
         assert_eq!(err, FsError::NotFound);
     }
@@ -1580,7 +1797,7 @@ mod tests {
     #[tokio::test]
     async fn read_on_directory_is_not_a_file() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let err = fs.read(fs.root(), 0, 16).await.unwrap_err();
         assert_eq!(err, FsError::NotAFile);
     }
@@ -1588,7 +1805,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_on_file_is_not_a_directory() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let id = fs.lookup(fs.root(), "hello.txt").await.unwrap();
         let err = fs.readdir(id).await.unwrap_err();
         assert_eq!(err, FsError::NotADirectory);
@@ -1597,7 +1814,7 @@ mod tests {
     #[tokio::test]
     async fn getattr_on_unknown_inode_is_not_found() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let err = fs.getattr(99_999).await.unwrap_err();
         assert_eq!(err, FsError::NotFound);
     }
@@ -1628,7 +1845,7 @@ mod tests {
             .unwrap();
         let tree_b = vec_to_id(&tree_b_bytes);
 
-        let fs = KikiFs::new(store, tree_a, None);
+        let fs = KikiFs::new(store, tree_a, None, None);
         // Tree A is visible.
         fs.lookup(fs.root(), "only-in-a.txt").await.expect("A");
         assert_eq!(
@@ -1651,7 +1868,7 @@ mod tests {
     #[tokio::test]
     async fn check_out_unknown_tree_is_store_miss() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store, root, None);
+        let fs = KikiFs::new(store, root, None, None);
         let err = fs.check_out(Id([0xff; 20])).await.unwrap_err();
         assert_eq!(err, FsError::StoreMiss);
         // Original tree is still visible.
@@ -1703,7 +1920,7 @@ mod tests {
     async fn create_write_read_round_trips() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (file_ino, attr) = fs
             .create_file(fs.root(), "hello.txt", false)
             .await
@@ -1740,7 +1957,7 @@ mod tests {
     async fn mkdir_then_create_inside_round_trips() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.expect("mkdir");
         let (file_ino, _) = fs
@@ -1770,7 +1987,7 @@ mod tests {
     async fn symlink_round_trips() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (link_ino, attr) = fs
             .symlink(fs.root(), "link", "target")
             .await
@@ -1796,7 +2013,7 @@ mod tests {
     async fn create_collision_is_already_exists() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         fs.create_file(fs.root(), "a", false).await.unwrap();
         let err = fs
             .create_file(fs.root(), "a", false)
@@ -1811,7 +2028,7 @@ mod tests {
     async fn setattr_truncates_file() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1832,7 +2049,7 @@ mod tests {
     async fn setattr_chmod_preserves_content() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"hello").await.unwrap();
 
@@ -1855,7 +2072,7 @@ mod tests {
     async fn remove_file_then_lookup_is_not_found() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.remove(fs.root(), "f").await.expect("remove");
         let err = fs.lookup(fs.root(), "f").await.unwrap_err();
@@ -1868,7 +2085,7 @@ mod tests {
     async fn remove_non_empty_directory_is_not_empty() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (dir, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         fs.create_file(dir, "f", false).await.unwrap();
 
@@ -1883,7 +2100,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_clean_returns_existing_root() {
         let (store, root) = build_synthetic_tree();
-        let fs = KikiFs::new(store.clone(), root, None);
+        let fs = KikiFs::new(store.clone(), root, None, None);
         let id = fs.snapshot().await.expect("snapshot");
         assert_eq!(id, root);
     }
@@ -1895,13 +2112,13 @@ mod tests {
     async fn snapshot_is_deterministic_under_insertion_order() {
         let settings = test_settings();
         let store_a = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs_a = KikiFs::new(store_a.clone(), empty_tree_id(&store_a), None);
+        let fs_a = KikiFs::new(store_a.clone(), empty_tree_id(&store_a), None, None);
         fs_a.create_file(fs_a.root(), "a", false).await.unwrap();
         fs_a.create_file(fs_a.root(), "b", false).await.unwrap();
         let id_a = fs_a.snapshot().await.unwrap();
 
         let store_b = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs_b = KikiFs::new(store_b.clone(), empty_tree_id(&store_b), None);
+        let fs_b = KikiFs::new(store_b.clone(), empty_tree_id(&store_b), None, None);
         // Inserted in the opposite order — final tree should hash the same.
         fs_b.create_file(fs_b.root(), "b", false).await.unwrap();
         fs_b.create_file(fs_b.root(), "a", false).await.unwrap();
@@ -1917,7 +2134,7 @@ mod tests {
     async fn snapshot_preserves_inode_ids() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (ino, _) = fs.create_file(fs.root(), "f", false).await.unwrap();
         fs.write(ino, 0, b"x").await.unwrap();
         fs.snapshot().await.unwrap();
@@ -1934,7 +2151,7 @@ mod tests {
     async fn jj_dir_excluded_from_snapshot() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         // Create `.jj/` and a file inside it (matches what jj-lib does
         // during `init_with_factories`).
@@ -1980,7 +2197,7 @@ mod tests {
     async fn jj_dir_survives_check_out() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         // Set up a `.jj/` with some content.
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
@@ -2021,7 +2238,7 @@ mod tests {
     async fn jj_dir_pin_is_unique() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         fs.mkdir(fs.root(), ".jj").await.expect("mkdir .jj");
         let err = fs.mkdir(fs.root(), ".jj").await.expect_err("dup mkdir");
         assert_eq!(err, FsError::AlreadyExists);
@@ -2050,7 +2267,7 @@ mod tests {
             }])
             .unwrap();
         let legacy_tree = vec_to_id(&legacy_tree_bytes);
-        let fs = KikiFs::new(store.clone(), legacy_tree, None);
+        let fs = KikiFs::new(store.clone(), legacy_tree, None, None);
 
         // Without a pin, lookup of `.jj` falls through to the user tree
         // and returns the legacy file.
@@ -2069,7 +2286,7 @@ mod tests {
     async fn jj_dir_remove_respects_rmdir_empty() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         fs.create_file(jj_ino, "f", false).await.unwrap();
         let err = fs.remove(fs.root(), ".jj").await.unwrap_err();
@@ -2089,7 +2306,7 @@ mod tests {
     async fn jj_dir_dirty_buffers_cleaned_on_snapshot() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let (jj_ino, _) = fs.mkdir(fs.root(), ".jj").await.unwrap();
         let (file_ino, _) = fs.create_file(jj_ino, "config", false).await.unwrap();
         fs.write(file_ino, 0, b"settings").await.unwrap();
@@ -2123,7 +2340,7 @@ mod tests {
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
         let expected =
             format!("gitdir: {}\n", store.git_repo_path().display());
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         // lookup resolves the synthesized `.git` inode.
         let git_ino = fs.lookup(fs.root(), ".git").await.expect("lookup .git");
@@ -2160,7 +2377,7 @@ mod tests {
     async fn git_file_is_read_only() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
         let git_ino = fs.lookup(fs.root(), ".git").await.unwrap();
 
         let err = fs.write(git_ino, 0, b"nope").await.unwrap_err();
@@ -2175,7 +2392,7 @@ mod tests {
     async fn git_file_cannot_be_removed_or_renamed() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let err = fs.remove(fs.root(), ".git").await.unwrap_err();
         assert!(matches!(err, FsError::StoreError(_)));
@@ -2209,7 +2426,7 @@ mod tests {
     async fn write_after_snapshot_deep_in_tree_is_visible() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         // Build /dir/subdir/file with initial content.
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
@@ -2253,7 +2470,7 @@ mod tests {
     async fn remove_after_snapshot_deep_in_tree_is_visible() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         let (file_ino, _) = fs.create_file(dir_ino, "inner", false).await.unwrap();
@@ -2284,7 +2501,7 @@ mod tests {
     async fn setattr_after_snapshot_is_visible() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let (dir_ino, _) = fs.mkdir(fs.root(), "dir").await.unwrap();
         let (file_ino, _) = fs.create_file(dir_ino, "f", false).await.unwrap();
@@ -2320,7 +2537,7 @@ mod tests {
     #[tokio::test]
     async fn write_to_existing_tree_child_survives_materialization() {
         let (store, root_id) = build_synthetic_tree();
-        let fs = KikiFs::new(store.clone(), root_id, None);
+        let fs = KikiFs::new(store.clone(), root_id, None, None);
 
         // Look up the existing "hello.txt" (clean File from the store).
         let hello_ino = fs.lookup(fs.root(), "hello.txt").await.unwrap();
@@ -2357,7 +2574,7 @@ mod tests {
     async fn rename_atomic_save_pattern() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         // Original file.
         let (orig_ino, _) = fs.create_file(fs.root(), "foo.rs", false).await.unwrap();
@@ -2409,7 +2626,7 @@ mod tests {
     async fn write_to_cross_dir_renamed_file_after_snapshot() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         // Create /a/file and /b/.
         let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
@@ -2455,7 +2672,7 @@ mod tests {
     async fn create_at_old_name_after_rename() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let (a_ino, _) = fs.mkdir(fs.root(), "a").await.unwrap();
         let (b_ino, _) = fs.mkdir(fs.root(), "b").await.unwrap();
@@ -2492,7 +2709,7 @@ mod tests {
     async fn same_dir_rename_then_write() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let (file_ino, _) = fs.create_file(fs.root(), "old_name", false).await.unwrap();
         fs.write(file_ino, 0, b"content").await.unwrap();
@@ -2523,7 +2740,7 @@ mod tests {
     async fn rename_atomic_save_in_subdirectory() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let (src_ino, _) = fs.mkdir(fs.root(), "src").await.unwrap();
         let (orig_ino, _) = fs.create_file(src_ino, "lib.rs", false).await.unwrap();
@@ -2563,7 +2780,7 @@ mod tests {
     async fn three_snapshot_cycles() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         let (file_ino, _) = fs.create_file(fs.root(), "counter", false).await.unwrap();
         fs.write(file_ino, 0, b"1").await.unwrap();
@@ -2593,7 +2810,7 @@ mod tests {
     async fn modify_after_check_out_to_different_tree() {
         let settings = test_settings();
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
-        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None);
+        let fs = KikiFs::new(store.clone(), empty_tree_id(&store), None, None);
 
         // Build tree A: /file with "aaa".
         let (file_ino, _) = fs.create_file(fs.root(), "file", false).await.unwrap();
@@ -2651,7 +2868,7 @@ mod tests {
     #[tokio::test]
     async fn create_file_in_existing_subdirectory() {
         let (store, root_id) = build_synthetic_tree();
-        let fs = KikiFs::new(store.clone(), root_id, None);
+        let fs = KikiFs::new(store.clone(), root_id, None, None);
 
         // Look up the existing "bin/" directory.
         let bin_ino = fs.lookup(fs.root(), "bin").await.unwrap();
@@ -2682,7 +2899,7 @@ mod tests {
     #[tokio::test]
     async fn delete_from_existing_subtree_after_snapshot() {
         let (store, root_id) = build_synthetic_tree();
-        let fs = KikiFs::new(store.clone(), root_id, None);
+        let fs = KikiFs::new(store.clone(), root_id, None, None);
 
         // Snapshot should be a no-op on a clean tree.
         let snap1 = fs.snapshot().await.unwrap();
@@ -2697,5 +2914,227 @@ mod tests {
         let tree = read_tree(&store, snap2);
         let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["bin", "link"], "hello.txt should be gone");
+    }
+
+    // ---- M10.7: gitignore + redirections tests ----
+
+    /// Build a store + root tree that contains a `.gitignore` with the
+    /// given content. Returns `(store, root_tree_id)`.
+    fn build_tree_with_gitignore(gitignore_content: &str) -> (Arc<GitContentStore>, Id) {
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let gi_id = store.write_file(gitignore_content.as_bytes()).unwrap();
+        let entries = vec![GitTreeEntry {
+            name: ".gitignore".into(),
+            kind: GitEntryKind::File { executable: false },
+            id: gi_id,
+        }];
+        let root_id = store.write_tree(&entries).unwrap();
+        (store, vec_to_id(&root_id))
+    }
+
+    #[tokio::test]
+    async fn ignored_file_skipped_in_snapshot() {
+        let (store, root) = build_tree_with_gitignore("*.log\nnode_modules/\n");
+        let fs = KikiFs::new(store.clone(), root, None, None);
+        // Create an ignored file at root level.
+        fs.create_file(fs.root(), "debug.log", false)
+            .await
+            .unwrap();
+        // Create a tracked file too.
+        fs.create_file(fs.root(), "app.js", false).await.unwrap();
+        fs.write(
+            fs.lookup(fs.root(), "app.js").await.unwrap(),
+            0,
+            b"hello",
+        )
+        .await
+        .unwrap();
+        let snap = fs.snapshot().await.unwrap();
+        let tree = read_tree(&store, snap);
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        // .gitignore is from the checked-out tree; app.js was created.
+        // debug.log is ignored → not in the tree.
+        assert!(names.contains(&".gitignore"));
+        assert!(names.contains(&"app.js"));
+        assert!(!names.contains(&"debug.log"), "ignored file should not be in snapshot");
+    }
+
+    #[tokio::test]
+    async fn ignored_file_still_readable() {
+        let (store, root) = build_tree_with_gitignore("*.log\n");
+        let fs = KikiFs::new(store, root, None, None);
+        fs.create_file(fs.root(), "debug.log", false)
+            .await
+            .unwrap();
+        let ino = fs.lookup(fs.root(), "debug.log").await.unwrap();
+        fs.write(ino, 0, b"some log data").await.unwrap();
+        // The file is ignored but still readable through the VFS.
+        let (data, _) = fs.read(ino, 0, 1024).await.unwrap();
+        assert_eq!(data, b"some log data");
+    }
+
+    #[tokio::test]
+    async fn ignored_dir_children_inherit() {
+        let (store, root) = build_tree_with_gitignore("node_modules/\n");
+        let fs = KikiFs::new(store.clone(), root, None, None);
+        fs.mkdir(fs.root(), "node_modules").await.unwrap();
+        let nm = fs.lookup(fs.root(), "node_modules").await.unwrap();
+        // Create a file inside node_modules.
+        fs.create_file(nm, "lodash.js", false).await.unwrap();
+        // Create a nested subdir.
+        fs.mkdir(nm, "express").await.unwrap();
+        let express = fs.lookup(nm, "express").await.unwrap();
+        fs.create_file(express, "index.js", false).await.unwrap();
+        let snap = fs.snapshot().await.unwrap();
+        let tree = read_tree(&store, snap);
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        // node_modules and everything inside it should be excluded.
+        assert!(!names.contains(&"node_modules"), "ignored dir should not be in snapshot");
+    }
+
+    #[tokio::test]
+    async fn already_tracked_file_not_ignored() {
+        // Build a tree that contains `vendor/lib.js`.
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let lib_id = store.write_file(b"lib").unwrap();
+        let vendor_entries = vec![GitTreeEntry {
+            name: "lib.js".into(),
+            kind: GitEntryKind::File { executable: false },
+            id: lib_id,
+        }];
+        let vendor_tree = store.write_tree(&vendor_entries).unwrap();
+        // Root tree with vendor/ and .gitignore that ignores vendor/.
+        let gi_id = store.write_file(b"vendor/\n").unwrap();
+        let root_entries = vec![
+            GitTreeEntry {
+                name: ".gitignore".into(),
+                kind: GitEntryKind::File { executable: false },
+                id: gi_id,
+            },
+            GitTreeEntry {
+                name: "vendor".into(),
+                kind: GitEntryKind::Tree,
+                id: vendor_tree,
+            },
+        ];
+        let root_id = store.write_tree(&root_entries).unwrap();
+        let root = vec_to_id(&root_id);
+
+        let fs = KikiFs::new(store.clone(), root, None, None);
+        // vendor/ comes from check_out → ignored: false (already tracked).
+        let vendor = fs.lookup(fs.root(), "vendor").await.unwrap();
+        let lib = fs.lookup(vendor, "lib.js").await.unwrap();
+        // Modify the tracked file.
+        fs.write(lib, 0, b"modified lib").await.unwrap();
+        let snap = fs.snapshot().await.unwrap();
+        let tree = read_tree(&store, snap);
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"vendor"), "already-tracked dir must remain in snapshot");
+    }
+
+    #[tokio::test]
+    async fn gitignore_hot_reload() {
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let empty = empty_tree_id(&store);
+        let fs = KikiFs::new(store.clone(), empty, None, None);
+
+        // Create a file that will become ignored after .gitignore write.
+        fs.create_file(fs.root(), "tmp.log", false).await.unwrap();
+        let snap1 = fs.snapshot().await.unwrap();
+        let tree1 = read_tree(&store, snap1);
+        assert!(
+            tree1.iter().any(|e| e.name == "tmp.log"),
+            "before .gitignore, tmp.log should be in snapshot"
+        );
+
+        // Write a .gitignore that ignores *.log.
+        fs.create_file(fs.root(), ".gitignore", false)
+            .await
+            .unwrap();
+        let gi = fs.lookup(fs.root(), ".gitignore").await.unwrap();
+        fs.write(gi, 0, b"*.log\n").await.unwrap();
+
+        // Create another .log file — should now be ignored.
+        fs.create_file(fs.root(), "other.log", false)
+            .await
+            .unwrap();
+
+        let snap2 = fs.snapshot().await.unwrap();
+        let tree2 = read_tree(&store, snap2);
+        let names: Vec<&str> = tree2.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&".gitignore"));
+        // tmp.log was created before the .gitignore → not ignored
+        // (already in the slab with ignored: false).
+        assert!(names.contains(&"tmp.log"));
+        // other.log was created after the .gitignore → ignored.
+        assert!(!names.contains(&"other.log"), "post-gitignore file should be ignored");
+    }
+
+    #[tokio::test]
+    async fn negation_pattern() {
+        let (store, root) = build_tree_with_gitignore("*.log\n!important.log\n");
+        let fs = KikiFs::new(store.clone(), root, None, None);
+        fs.create_file(fs.root(), "debug.log", false)
+            .await
+            .unwrap();
+        fs.create_file(fs.root(), "important.log", false)
+            .await
+            .unwrap();
+        let snap = fs.snapshot().await.unwrap();
+        let tree = read_tree(&store, snap);
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"debug.log"), "debug.log should be ignored");
+        assert!(names.contains(&"important.log"), "!important.log negation should keep it");
+    }
+
+    #[tokio::test]
+    async fn redirections_creates_symlink() {
+        let settings = test_settings();
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        // Build a tree with .kiki-redirections.
+        let redir_id = store.write_file(b"node_modules\n").unwrap();
+        let entries = vec![GitTreeEntry {
+            name: KIKI_REDIRECTIONS_FILE.into(),
+            kind: GitEntryKind::File { executable: false },
+            id: redir_id,
+        }];
+        let root_id = store.write_tree(&entries).unwrap();
+        let root = vec_to_id(&root_id);
+
+        let scratch = tempfile::tempdir().expect("scratch tmpdir");
+        let fs = KikiFs::new(store.clone(), root, None, Some(scratch.path().to_owned()));
+
+        // mkdir("node_modules") should create a symlink, not a dir.
+        fs.mkdir(fs.root(), "node_modules").await.unwrap();
+        let ino = fs.lookup(fs.root(), "node_modules").await.unwrap();
+        let attr = fs.getattr(ino).await.unwrap();
+        assert_eq!(attr.kind, FileKind::Symlink, "redirected dir should be a symlink");
+
+        // The symlink target should point into the scratch dir.
+        let target = fs.readlink(ino).await.unwrap();
+        assert!(
+            target.starts_with(scratch.path().to_str().unwrap()),
+            "symlink should point into scratch dir, got: {target}"
+        );
+
+        // The scratch dir should actually exist on disk.
+        let target_path = std::path::Path::new(&target);
+        assert!(target_path.is_dir(), "scratch dir should exist on disk");
+
+        // Snapshot should not include the redirected entry.
+        let snap = fs.snapshot().await.unwrap();
+        let tree = read_tree(&store, snap);
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"node_modules"), "redirected dir should not be in snapshot");
+    }
+
+    #[tokio::test]
+    async fn parse_redirections_format() {
+        let content = b"# build outputs\ntarget\n\nnode_modules/\n  .venv  \n";
+        let result = KikiFs::parse_redirections(content);
+        assert_eq!(result, vec!["target", "node_modules", ".venv"]);
     }
 }

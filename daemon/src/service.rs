@@ -82,6 +82,17 @@ impl StorageConfig {
             StorageConfig::InMemory => None,
         }
     }
+
+    /// Scratch directory for VFS redirections (M10.7). Lives under
+    /// `<root>/mounts/<hash>/scratch/`. Returns `None` for in-memory.
+    fn scratch_dir_for(&self, working_copy_path: &str) -> Option<PathBuf> {
+        match self {
+            StorageConfig::OnDisk { root } => {
+                Some(mount_meta::mount_dir(root, working_copy_path).join("scratch"))
+            }
+            StorageConfig::InMemory => None,
+        }
+    }
 }
 
 /// Map a fallible proto-decode error onto an `invalid_argument` gRPC status.
@@ -487,8 +498,9 @@ impl JujutsuService {
         // M10 §10.6: hand the remote into `KikiFs` too, so FUSE-side
         // reads on a `StoreMiss` fall through to the remote the same
         // way M9's RPC-layer reads already do.
+        let scratch_dir = self.storage.scratch_dir_for(&meta.working_copy_path);
         let fs: Arc<dyn JjKikiFs> =
-            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone()));
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir));
 
         // On Linux (FUSE), the kernel tears down the mount when the
         // daemon's process exits — the path is usually a clean empty dir
@@ -1072,8 +1084,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // M10 §10.6: the remote is threaded into `KikiFs` too — kernel
         // reads on local-store miss fall through the same way the M9
         // RPC layer already does at `service.rs`.
+        let scratch_dir = self.storage.scratch_dir_for(&req.path);
         let fs: Arc<dyn JjKikiFs> =
-            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone()));
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir));
 
         // Production path validates and binds; test path skips both so
         // unit tests can use arbitrary string paths.
@@ -1487,10 +1500,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // refs so stock git tools see branches (e.g. `git log --all`,
         // `git push`).
         let git_path = store.git_repo_path().to_path_buf();
-        if !bookmarks.is_empty() {
-            if let Err(e) = crate::git_ops::export_bookmarks(&git_path, &bookmarks) {
-                warn!("export_bookmarks after WriteView: {e:#}");
-            }
+        if !bookmarks.is_empty()
+            && let Err(e) = crate::git_ops::export_bookmarks(&git_path, &bookmarks)
+        {
+            warn!("export_bookmarks after WriteView: {e:#}");
         }
         // Delete refs/heads/* for bookmarks removed from the View.
         {
@@ -2054,7 +2067,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 }
             }
             // Deleted bookmarks.
-            for (name, _) in &exported {
+            for name in exported.keys() {
                 if !current.contains_key(name) {
                     changes.push(GitBookmarkChange {
                         name: name.to_string(),
@@ -3971,7 +3984,7 @@ mod tests {
         };
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
         let root = ty::Id(store.empty_tree_id().as_bytes().try_into().unwrap());
-        let fs: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root, None));
+        let fs: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root, None, None));
         let (_transport, attachment) = vfs_handle
             .bind(mount_path.clone(), fs)
             .await

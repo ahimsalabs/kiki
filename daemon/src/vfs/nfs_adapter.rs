@@ -396,7 +396,7 @@ mod tests {
         ];
         let root_id_bytes = store.write_tree(&entries).unwrap();
         let root_id = Id(root_id_bytes.try_into().expect("20-byte tree id"));
-        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None));
+        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None, None));
         NfsAdapter::new(kiki)
     }
 

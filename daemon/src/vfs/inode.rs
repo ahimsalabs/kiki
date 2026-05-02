@@ -102,6 +102,13 @@ pub struct Inode {
     #[allow(dead_code)]
     pub name: String,
     pub node: NodeRef,
+    /// Whether this inode is gitignored. Ignored inodes are fully
+    /// functional (readable, writable) but skipped by `snapshot_node` —
+    /// their content is never persisted to the content store or pushed
+    /// to a remote. Set at creation time by consulting the per-mount
+    /// `IgnoreRules`; children of an ignored directory inherit the flag.
+    /// Files from `check_out` (already tracked) are always `false`.
+    pub ignored: bool,
 }
 
 #[derive(Debug, Default)]
@@ -133,6 +140,7 @@ impl InodeSlab {
                 parent: ROOT_INODE,
                 name: String::new(),
                 node: NodeRef::Tree(root_tree),
+                ignored: false,
             },
         );
         InodeSlab {
@@ -191,6 +199,7 @@ impl InodeSlab {
                 parent: ROOT_INODE,
                 name: String::new(),
                 node: NodeRef::Tree(new_root_tree),
+                ignored: false,
             },
         );
         // Drop only (ROOT_INODE, *) mappings. Pre-M7 behaviour was to
@@ -236,6 +245,7 @@ impl InodeSlab {
                 parent,
                 name: name.to_owned(),
                 node,
+                ignored: false,
             },
         );
         inner.by_parent.insert(key, id);
@@ -250,12 +260,25 @@ impl InodeSlab {
     /// without leaving a stale `by_parent` entry pointing at a
     /// not-yet-attached child.
     pub fn alloc(&self, parent: InodeId, name: String, node: NodeRef) -> InodeId {
+        self.alloc_with_ignored(parent, name, node, false)
+    }
+
+    /// Like [`alloc`](Self::alloc) but allows the caller to set the
+    /// `ignored` flag on the new inode. Used by the VFS write path to
+    /// tag gitignored entries at creation time.
+    pub fn alloc_with_ignored(
+        &self,
+        parent: InodeId,
+        name: String,
+        node: NodeRef,
+        ignored: bool,
+    ) -> InodeId {
         let mut inner = self.inner.lock();
         let id = inner.next_id;
         inner.next_id += 1;
         inner
             .inodes
-            .insert(id, Inode { parent, name, node });
+            .insert(id, Inode { parent, name, node, ignored });
         id
     }
 
@@ -326,6 +349,7 @@ impl InodeSlab {
                                 parent: dir,
                                 name: name.clone(),
                                 node: child_node,
+                                ignored: false, // materialized from content tree = tracked
                             },
                         );
                         inner.by_parent.insert(key, id);
@@ -341,6 +365,7 @@ impl InodeSlab {
                         node: NodeRef::DirtyTree {
                             children: children.clone(),
                         },
+                        ignored: inode.ignored,
                     },
                 );
                 Some(children)

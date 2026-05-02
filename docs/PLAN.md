@@ -1,14 +1,17 @@
 # kiki: Implementation Plan
 
-Status: active. Transport architecture decided (§4.3 Path C). M1–M10.6
-done — see milestone index below for per-milestone detail. 250 tests
-(225 daemon + 25 store) pass; `cargo clippy --workspace --all-targets
--- -D warnings` is clean. SSH remote transport (`ssh://`) landed:
-`store` crate extracted, `kiki kk serve` subcommand, `SshRemoteStore`
-in daemon, `kiki://` scheme alias for `grpc://`. Next up: M10.7
-(gitignore-aware VFS), daemon lifecycle (auto-start), git convergence.
-EdenFS-informed items (inode GC, graceful restart, durability testing,
-fsnotify, observability) added to §10. Last updated: 2026-05-02
+Status: active. Transport architecture decided (§4.3 Path C). M1–M10.7
+done — see milestone index below for per-milestone detail. 330 tests
+(250 daemon + 17 CLI + 41 integration + 22 store) pass; `cargo clippy
+--workspace --all-targets -- -D warnings` is clean. SSH remote
+transport (`ssh://`) landed. **M10.7 (gitignore-aware VFS +
+redirections) landed:** `.gitignore` rules loaded at checkout, new
+files tagged `ignored` at creation, `snapshot_node` skips ignored
+inodes. `.kiki-redirections` file redirects configured dirs
+(`node_modules/`, `target/`, etc.) to local scratch storage via
+symlinks — all I/O bypasses FUSE entirely. Hot-reload on `.gitignore`
+and `.kiki-redirections` writes. Next up: M11 (async push queue),
+daemon lifecycle polish, workspaces. Last updated: 2026-05-02
 
 This document captures the roadmap for getting kiki from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -39,7 +42,7 @@ wasted effort. If it does, B and C are routine engineering.
 | **M7–M9** — `.jj/` separation, durable storage, remote blob CAS | ✅ done | [`PLAN-M7-9.md`](./PLAN-M7-9.md) |
 | **M10/M10.5/M10.6** — mutable pointers (CAS-arbitrated catalog), op-heads store, op-store contents, FUSE read-through | ✅ done | [`PLAN-M10.md`](./PLAN-M10.md) |
 | **SSH remote** — `ssh://` transport, `store` crate, `kiki kk serve`, `kiki://` scheme | ✅ done | — |
-| **M10.7** — gitignore-aware VFS | active | [`M10.7-GITIGNORE.md`](./M10.7-GITIGNORE.md) |
+| **M10.7** — gitignore-aware VFS + redirections | ✅ done | [`M10.7-GITIGNORE.md`](./M10.7-GITIGNORE.md) |
 | **M11** — async push queue + offline resilience | active | [`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md) |
 | **Git convergence** — replace custom content store with jj-lib `GitBackend` | active | [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md) |
 | **Daemon lifecycle** — auto-start, launchd/systemd integration | active | [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md) |
