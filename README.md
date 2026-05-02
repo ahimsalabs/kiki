@@ -1,117 +1,100 @@
 # kiki
 
-A virtual filesystem for your repos, backed by
-[jj](https://jj-vcs.github.io/jj/latest/).
+A virtual filesystem for your repos. Built on
+[jj](https://jj-vcs.github.io/jj/latest/), stored as git.
 
 ```bash
-kiki kk init dir:///shared/store ~/work/myproject
+kiki kk init ssh://devbox/repos/myproject ~/work/myproject
 cd ~/work/myproject
-vim src/main.rs          # writes sync to the shared store
+vim src/main.rs       # files appear on read, sync on write
 ```
-
-On another machine pointed at the same store:
-
-```bash
-kiki workspace update-stale   # reconcile the operation log
-cat src/main.rs               # changes are there
-```
-
-The repo is a daemon-managed mount point. Files appear when you
-read them and sync when you write them.
 
 > **Experimental.** Works end-to-end on Linux and macOS.
 > Not yet ready for real projects.
 
-## The idea
+## What is this
 
-Google has [CitC](https://abseil.io/resources/swe-book/html/ch16.html#clients_in_the_cloud_citc).
-Meta has [EdenFS](https://github.com/facebook/sapling/tree/main/eden/fs).
-kiki is an open-source attempt at the same idea: a daemon-backed
-virtual filesystem that serves your repo as a directory and syncs
-content in the background. It's built on
-[jj](https://jj-vcs.github.io/jj/latest/) and converging to git
-— so you can push to GitHub and external contributors just
-`git clone`.
+A daemon serves your repo as a mount point — FUSE on Linux, NFS
+on macOS. Files are fetched lazily on read and synced to a remote
+store in the background. No checkout step, no full clone.
 
-## What works today
+Same idea as Google's
+[CitC](https://abseil.io/resources/swe-book/html/ch16.html#clients_in_the_cloud_citc)
+or Meta's
+[EdenFS](https://github.com/facebook/sapling/tree/main/eden/fs),
+but built on jj and open source.
 
-**Instant workspaces.** No checkout, no clone. Mount a repo,
-`cd` into it, start working. Multiple workspaces share content;
-each one is a FUSE (Linux) or NFS (macOS) mount.
+## jj superset
 
-**Background sync.** Writes flow to the remote store
-automatically. Reads fetch on demand and cache locally.
-
-**Git interop.** `kiki git push/fetch/remote` routes through
-the daemon. The storage format is git objects (via jj-lib's
-`GitBackend`), so GitHub and GitLab work as remotes. Stock git
-tools (`git log`, `git blame`, editors) work against mounts —
-the VFS synthesizes a `.git` gitdir pointer at the workspace root.
-
-## GitHub example
+The `kiki` binary wraps `jj` — every jj command works unchanged.
+kiki adds a daemon, a virtual filesystem layer, and remote sync.
 
 ```bash
-kiki kk init dir:///shared/store ~/work/myproject
-cd ~/work/myproject
-
-kiki git remote add origin git@github.com:yourorg/myproject.git
-kiki git fetch --remote origin
-
-# work normally
-kiki describe -m "fix auth bug"
-vim src/auth.rs
-
-# push to GitHub — standard git protocol
-kiki git push --remote origin --bookmark main
-
-# teammates without kiki just use git
-git clone git@github.com:yourorg/myproject.git
+kiki log                        # this is jj log
+kiki new -m "add feature"       # this is jj new
+kiki describe -m "fix auth bug" # this is jj describe
 ```
 
-## How it works
+The `kk` subcommand handles kiki-specific operations that would
+collide with jj builtins (`kk init`, `kk status`, `kk daemon`).
 
-kiki is a [jj](https://jj-vcs.github.io/jj/latest/) superset —
-all jj commands work unchanged. `kiki git push/fetch/remote`
-routes through the daemon automatically on kiki repos. The `kk`
-subcommand is only needed for operations that collide with jj
-builtins (`kk init`, `kk status`).
+## Git-native storage
 
-```mermaid
-graph LR
-    CLI["kiki<br/>(jj superset)"] -- "gRPC (UDS)" --> Daemon
-    Daemon -- "dir:// / ssh:// / kiki://" --> Remote["Remote Store"]
-    Daemon -- mount --> VFS["Working copy<br/>(FUSE / NFS)"]
+The content store is a bare git repo — git objects addressed by
+SHA-1, managed by jj-lib's `GitBackend`. There is no custom
+format and no translation layer.
+
+This means:
+- `kiki git push` sends objects to GitHub with zero conversion
+- Teammates without kiki just `git clone`
+- Every remote type (`dir://`, `ssh://`, `kiki://`, git forges)
+  stores identical bytes — same objects, different transport
+- Stock git tools (`git log`, `git blame`) work against mounts
+  via a synthesized `.git` pointer
+
+## Architecture
+
+```
+kiki (CLI)
+  │  gRPC over Unix socket
+  ▼
+daemon
+  ├─ GitBackend    bare git repo (content store)
+  ├─ RemoteStore   dir:// · ssh:// · kiki:// (grpc)
+  └─ VFS           FUSE (Linux) · NFS (macOS)
 ```
 
-The **daemon** runs on your machine (auto-started on first
-command — no manual setup needed). It serves the virtual
-filesystem, caches content locally, and syncs with a remote in
-the background. The **remote** can be a shared directory, another
-daemon over SSH, or a peer daemon over gRPC.
+The daemon auto-starts on first command and runs in the
+background. It manages the mount, the local object cache, and
+background sync. `kiki kk daemon status` shows what's running.
 
 ## Status
 
-Working: FUSE (Linux), NFS (macOS), read/write/snapshot,
-multi-machine sync via `dir://`, `ssh://`, and `kiki://`,
-durable local storage, operation log sharing, `git push`/`git fetch`,
-git-convergent storage (git objects via `GitBackend`),
-stock git tool support (`.git` synthesis in VFS).
+**Working:** read/write/snapshot, FUSE and NFS mounts, background
+sync, multi-machine sharing via `dir://` / `ssh://` / `kiki://`,
+git push and fetch to GitHub/GitLab, operation log sharing.
 
-In progress: `.gitignore`-aware VFS,
-async offline push queue.
+**In progress:** `.gitignore`-aware VFS, async offline push queue,
+daemon lifecycle (launchd/systemd auto-start).
 
-Designed: [managed workspaces](./docs/WORKSPACES.md),
+**Designed:** [managed workspaces](./docs/WORKSPACES.md),
 [code review](./docs/REVIEW.md),
 [auth](./docs/AUTH.md),
 [ref protection](./docs/REF_PROTECTION.md).
 
-## Get started
+## Build
 
-See the **[User Guide](./docs/USER_GUIDE.md)** for build
-instructions and a full walkthrough.
+Requires Rust (stable) and `libfuse3-dev` (Linux) or Xcode
+command-line tools (macOS).
 
-The **[design docs](./docs/)** cover the roadmap, architecture
-decisions, and every future feature in detail.
+```bash
+cargo build --release
+# binary at target/release/kiki
+```
+
+See the **[User Guide](./docs/USER_GUIDE.md)** for a full
+walkthrough. The **[design docs](./docs/)** cover the roadmap and
+architecture decisions.
 
 ## License
 
