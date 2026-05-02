@@ -831,7 +831,7 @@ fn signature_from_proto(
         email: proto.email,
         timestamp: jj_lib::backend::Timestamp {
             timestamp: jj_lib::backend::MillisSinceEpoch(ts.millis_since_epoch),
-            tz_offset: ts.tz_offset as i32,
+            tz_offset: ts.tz_offset,
         },
     })
 }

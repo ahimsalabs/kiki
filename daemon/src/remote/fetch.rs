@@ -55,13 +55,6 @@ pub enum FetchError {
     },
 }
 
-/// `BlobKind` display for error messages.
-impl std::fmt::Display for BlobKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

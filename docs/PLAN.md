@@ -1,11 +1,14 @@
 # kiki: Implementation Plan
 
 Status: active. Transport architecture decided (§4.3 Path C). M1–M10.6
-done — see milestone index below for per-milestone detail. 192 tests (167 daemon + 15 cli unit + 10 cli integration) pass; `cargo clippy --workspace --all-targets
--- -D warnings` is clean. Next up: M10.7 (gitignore-aware VFS),
-daemon lifecycle (auto-start), git convergence. EdenFS-informed items
-(inode GC, graceful restart, durability testing, fsnotify,
-observability) added to §10. Last updated: 2026-05-02
+done — see milestone index below for per-milestone detail. 250 tests
+(225 daemon + 25 store) pass; `cargo clippy --workspace --all-targets
+-- -D warnings` is clean. SSH remote transport (`ssh://`) landed:
+`store` crate extracted, `kiki kk serve` subcommand, `SshRemoteStore`
+in daemon, `kiki://` scheme alias for `grpc://`. Next up: M10.7
+(gitignore-aware VFS), daemon lifecycle (auto-start), git convergence.
+EdenFS-informed items (inode GC, graceful restart, durability testing,
+fsnotify, observability) added to §10. Last updated: 2026-05-02
 
 This document captures the roadmap for getting kiki from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -35,6 +38,7 @@ wasted effort. If it does, B and C are routine engineering.
 | **M1–M6** — Layer A foundation (daemon WC state, VFS trait, mount, checkout, write+snapshot) | ✅ done | [`PLAN-M1-6.md`](./PLAN-M1-6.md) |
 | **M7–M9** — `.jj/` separation, durable storage, remote blob CAS | ✅ done | [`PLAN-M7-9.md`](./PLAN-M7-9.md) |
 | **M10/M10.5/M10.6** — mutable pointers (CAS-arbitrated catalog), op-heads store, op-store contents, FUSE read-through | ✅ done | [`PLAN-M10.md`](./PLAN-M10.md) |
+| **SSH remote** — `ssh://` transport, `store` crate, `kiki kk serve`, `kiki://` scheme | ✅ done | — |
 | **M10.7** — gitignore-aware VFS | active | [`M10.7-GITIGNORE.md`](./M10.7-GITIGNORE.md) |
 | **M11** — async push queue + offline resilience | active | [`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md) |
 | **Git convergence** — replace custom content store with jj-lib `GitBackend` | active | [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md) |

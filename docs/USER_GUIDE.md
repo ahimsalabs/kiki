@@ -13,7 +13,7 @@ backed by a daemon that handles storage, caching, and remote synchronization.
 ```mermaid
 graph LR
     CLI["kiki<br/>(jj superset)"] -- gRPC --> Daemon
-    Daemon -- "dir:// / grpc://" --> Remote["Remote Store"]
+    Daemon -- "dir:// / kiki:// / ssh://" --> Remote["Remote Store"]
     Daemon -- mount --> VFS["Working copy<br/>(FUSE / NFS)"]
 ```
 
@@ -24,9 +24,10 @@ graph LR
 - **Daemon** (`daemon`): Long-lived process on the local machine. Mounts repos
   as virtual filesystems, manages a durable per-mount store (redb), and
   optionally syncs blobs and operation state to a remote.
-- **Remote** (`dir://` or `grpc://`): Content-addressed blob store with
-  compare-and-swap mutable refs. Any running daemon can also serve as a
-  remote for another daemon.
+- **Remote** (`dir://`, `ssh://`, or `kiki://`): Content-addressed blob store
+  with compare-and-swap mutable refs. `ssh://` remotes need only the `kiki`
+  binary on the server (no daemon). `kiki://` remotes connect to a running
+  daemon on another machine (e.g., over Tailscale).
 
 ## Prerequisites
 
@@ -122,11 +123,13 @@ kiki kk init <remote> [destination]
 
 **`<remote>`** is the remote store URL. Supported schemes:
 
-| Scheme    | Example                    | Description |
-|-----------|----------------------------|-------------|
-| `dir://`  | `dir:///tmp/kiki-remote`   | Filesystem-backed remote. Good for local testing and single-machine use. |
-| `grpc://` | `grpc://[::1]:12000`       | Another kiki daemon's gRPC endpoint. Enables peer-to-peer sync. |
-| (empty)   | `""`                       | No remote. Local-only operation with redb-backed storage. |
+| Scheme    | Example                          | Description |
+|-----------|----------------------------------|-------------|
+| `dir://`  | `dir:///tmp/kiki-remote`         | Filesystem-backed remote. Good for local testing and single-machine use. |
+| `ssh://`  | `ssh://user@host/data/store`     | SSH transport. No daemon needed on the server — just the `kiki` binary and a directory. |
+| `kiki://` | `kiki://myserver:12000`          | Another kiki daemon's gRPC endpoint. Enables peer-to-peer sync (e.g., over Tailscale). |
+| `grpc://` | `grpc://[::1]:12000`             | Alias for `kiki://`. |
+| (empty)   | `""`                             | No remote. Local-only operation with redb-backed storage. |
 
 **`[destination]`** is the directory to create the repo in (default: `.`).
 
@@ -139,8 +142,11 @@ kiki kk init "" my-project
 # Repo backed by a filesystem remote
 kiki kk init "dir:///shared/kiki-store" my-project
 
-# Repo syncing to another daemon
-kiki kk init "grpc://[::1]:13000" my-project
+# Repo syncing over SSH (no daemon needed on the server)
+kiki kk init "ssh://user@myserver/data/kiki-store" my-project
+
+# Repo syncing to another daemon (e.g., over Tailscale)
+kiki kk init "kiki://myserver:12000" my-project
 ```
 
 On Linux, `kiki kk init` tells the daemon to FUSE-mount the working copy at the
@@ -196,8 +202,8 @@ remote URL (if configured).
 
 ## Multi-user / multi-machine sync
 
-When two CLIs point at the same remote (e.g., a shared `dir://` path or a
-`grpc://` peer), kiki serializes operation-log advances via compare-and-swap
+When two CLIs point at the same remote (e.g., a shared `ssh://` server, a
+`dir://` path, or a `kiki://` peer), kiki serializes operation-log advances via compare-and-swap
 on the remote's mutable ref catalog. This means:
 
 - **Blob sync:** Every write is pushed to the remote immediately
@@ -223,17 +229,32 @@ kiki kk init "dir:///shared/remote" project
 # Both machines see each other's commits and operations
 ```
 
-### Example: peer-to-peer via grpc://
+### Example: two machines sharing an ssh:// remote
+
+No daemon needed on the server. Each machine SSHes to the server and
+reads/writes the shared store directory directly:
+
+```bash
+# Machine A
+kiki kk init "ssh://user@server/data/remote" project
+
+# Machine B
+kiki kk init "ssh://user@server/data/remote" project
+
+# Both machines see each other's commits and operations
+```
+
+### Example: peer-to-peer via kiki:// (Tailscale, LAN)
 
 Every daemon also serves the `RemoteStore` gRPC service, so any daemon can act
-as the remote for another:
+as the remote for another. Use `kiki://` (or the legacy `grpc://` alias):
 
 ```bash
 # Machine A: daemon on port 12000
-daemon --config daemon-a.toml   # grpc_addr = "[::1]:12000"
+daemon --config daemon-a.toml   # grpc_addr = "0.0.0.0:12000"
 
-# Machine B: use Machine A as the remote
-kiki kk init "grpc://machine-a:12000" project
+# Machine B: use Machine A as the remote (e.g., over Tailscale)
+kiki kk init "kiki://machine-a:12000" project
 ```
 
 ## Working with GitHub
@@ -290,42 +311,65 @@ You fetch their work into your kiki workspace with `kiki git fetch`.
 
 ## Syncing over SSH
 
-Use an `ssh://` URL to sync with a daemon running on a remote machine.
-No ports to configure, no tunnels to manage — kiki forwards the Unix
-domain socket over SSH automatically.
+Use an `ssh://` URL to sync with a remote machine. No daemon needed on
+the server — just the `kiki` binary installed and SSH access.
 
 ```bash
-kiki kk init ssh://user@my-server/myproject ~/work/myproject
+kiki kk init ssh://user@my-server/data/myproject ~/work/myproject
 cd ~/work/myproject
 
-# Work normally — syncs to the remote daemon over SSH
+# Work normally — syncs to the server over SSH
 kiki new -m "fix bug"
 vim src/auth.rs
 ```
 
 A teammate runs the same command. Both of you see each other's changes
-through the shared remote daemon.
+through the shared store directory on the server.
 
-Under the hood, kiki:
-1. Asks the remote for its daemon socket path (`kiki kk daemon socket-path`)
-2. Auto-starts the remote daemon if needed
-3. Opens an SSH Unix socket forward in the background
-4. Connects to the forwarded socket as if the daemon were local
+### How it works
 
-No TCP port is needed on either end. SSH provides encryption and
-authentication. See [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md)
-for the full design.
+The local daemon spawns an SSH connection to the server:
+
+```
+ssh user@my-server kiki kk serve /data/myproject
+```
+
+The remote `kiki kk serve` process serves the store over stdin/stdout
+using a length-prefixed protobuf protocol. The local daemon speaks this
+protocol to read/write blobs and refs. Multiple SSH connections to the
+same store directory are concurrency-safe — `FsRemoteStore` uses
+`flock` to serialize ref updates.
+
+No TCP port, no tunnel, no remote daemon. SSH provides the transport,
+encryption, and authentication.
+
+### Prerequisites on the server
+
+1. `kiki` binary in `$PATH`
+2. A directory for the store (created on first write)
+3. SSH access with key-based auth (BatchMode — no interactive prompts)
+
+### Standalone serve mode
+
+You can also run `kiki kk serve` directly for testing:
+
+```bash
+# On the server (or locally for testing)
+kiki kk serve /path/to/store
+# Reads StoreRequest messages from stdin, writes StoreResponse to stdout
+```
 
 ## Known limitations
 
 - **Linux-primary.** FUSE on Linux is the well-tested path. macOS NFS works but
   has cache-coherency caveats (mitigated by mounting with `actimeo=0`) and
   occasional Apple-version-specific quirks.
-- **No auth or TLS.** The daemon listens on localhost only. All communication is
-  unencrypted and unauthenticated. Don't expose the gRPC port to untrusted
-  networks.
-- **No S3 / cloud remote.** Only `dir://` and `grpc://` backends exist today.
-  Cloud storage is planned for a future milestone.
+- **No auth or TLS on kiki:// (gRPC).** The daemon listens on localhost only
+  by default. For `kiki://` remotes on a LAN or Tailscale, the network
+  provides the trust boundary. Don't expose the gRPC port to untrusted
+  networks. `ssh://` remotes inherit SSH's authentication and encryption.
+- **No S3 / cloud remote.** Only `dir://`, `ssh://`, and `kiki://` backends
+  exist today. Cloud storage is planned for a future milestone.
 - **No sparse patterns.** `set_sparse_patterns` is unimplemented. With a
   lazy VFS this is less important than for on-disk working copies.
 - **Daemon restart drops kernel file handles.** The inode slab is in-memory;

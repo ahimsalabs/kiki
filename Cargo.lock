@@ -767,6 +767,7 @@ dependencies = [
  "rand 0.9.4",
  "redb",
  "serde",
+ "store",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2981,6 +2982,7 @@ dependencies = [
  "reqwest",
  "scopeguard",
  "serde_json",
+ "store",
  "tempfile",
  "tokio",
  "tonic",
@@ -4679,6 +4681,22 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "libc",
+ "prost 0.12.6",
+ "proto",
+ "rand 0.9.4",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "strsim"

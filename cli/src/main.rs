@@ -46,6 +46,22 @@ enum KikiCommands {
     Status,
     /// Git remote operations (push, fetch, remote management)
     Git(GitArgs),
+    /// Serve a store over stdin/stdout (used by SSH transport)
+    Serve(ServeArgs),
+}
+
+/// Arguments for `kiki kk serve`.
+///
+/// Serves a `FsRemoteStore` over the stdin/stdout framing protocol.
+/// Designed to be invoked by a remote daemon via SSH:
+///   `ssh user@host kiki kk serve /path/to/store`
+///
+/// No daemon required on the server — just the `kiki` binary and a
+/// directory.
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct ServeArgs {
+    /// Absolute path to the store directory to serve
+    path: String,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -247,21 +263,21 @@ async fn kiki_git_dispatch_hook(
     command_helper: &CommandHelper,
     old_dispatch: BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
-    if let Some(("git", git_matches)) = command_helper.matches().subcommand() {
-        if is_kiki_backend(command_helper) {
-            match git_matches.subcommand_name() {
-                Some("push") | Some("fetch") | Some("remote") => {
-                    return dispatch_kiki_git(ui, command_helper).await;
-                }
-                Some(other) => {
-                    return Err(user_error(format!(
-                        "'git {other}' is not supported on kiki-backend repositories\n\
-                         Supported: git push, git fetch, git remote"
-                    )));
-                }
-                None => {
-                    // `kiki git` with no subcommand — fall through to jj's help.
-                }
+    if let Some(("git", git_matches)) = command_helper.matches().subcommand()
+        && is_kiki_backend(command_helper)
+    {
+        match git_matches.subcommand_name() {
+            Some("push") | Some("fetch") | Some("remote") => {
+                return dispatch_kiki_git(ui, command_helper).await;
+            }
+            Some(other) => {
+                return Err(user_error(format!(
+                    "'git {other}' is not supported on kiki-backend repositories\n\
+                     Supported: git push, git fetch, git remote"
+                )));
+            }
+            None => {
+                // `kiki git` with no subcommand — fall through to jj's help.
             }
         }
     }
@@ -322,6 +338,11 @@ async fn run_kk_command(
     command: KikiSubcommand,
 ) -> Result<(), CommandError> {
     let KikiSubcommand::Kk(KikiArgs { command }) = command;
+
+    // serve runs standalone — no daemon connection needed.
+    if let KikiCommands::Serve(args) = command {
+        return run_serve_store(args).await;
+    }
 
     let grpc_port = command_helper
         .settings()
@@ -471,7 +492,49 @@ async fn run_kk_command(
         KikiCommands::Git(git_args) => {
             run_git_command(ui, command_helper, &client, git_args).await
         }
+        KikiCommands::Serve(_) => {
+            // Handled above before daemon connection.
+            unreachable!()
+        }
     }
+}
+
+/// Serve a `FsRemoteStore` over stdin/stdout using the length-prefixed
+/// protobuf framing protocol. Designed to be invoked over SSH by a
+/// remote daemon's `SshRemoteStore`.
+///
+/// Exits when the client closes the pipe (EOF on stdin).
+///
+/// Note: this function spawns its own multi-threaded tokio runtime with
+/// the IO driver enabled. The jj-cli `CliRunner` that calls `run_kk_command`
+/// does not guarantee a full tokio runtime (its async context may lack
+/// the IO reactor), but `tokio::io::stdin()`/`stdout()` and the
+/// `spawn_blocking` calls inside `FsRemoteStore` require one. Spawning
+/// a dedicated runtime here is the simplest fix that keeps the serve
+/// path self-contained.
+async fn run_serve_store(args: ServeArgs) -> Result<(), CommandError> {
+    let path = std::path::PathBuf::from(&args.path);
+    if !path.is_absolute() {
+        return Err(cli_error(
+            "serve-store path must be absolute",
+        ));
+    }
+
+    // Build a full tokio runtime so tokio::io::stdin/stdout and
+    // spawn_blocking work correctly.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| internal_error_with_message("failed to build tokio runtime", e))?;
+
+    rt.block_on(async {
+        let store = store::fs::FsRemoteStore::new(path);
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
+        store::framing::serve_store_loop(stdin, stdout, &store).await
+    })
+    .map_err(|e| internal_error_with_message("serve-store failed", e))?;
+    Ok(())
 }
 
 async fn run_git_command(

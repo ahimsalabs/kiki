@@ -185,10 +185,10 @@ impl Sim {
                 let Ok(ino) = self.rt.block_on(fs.lookup(ROOT_INODE, name)) else {
                     return;
                 };
-                if self.rt.block_on(fs.write(ino, 0, data)).is_ok() {
-                    if let Some(ModelNode::File(c)) = self.model.get_mut(name) {
-                        model_write(c, 0, data);
-                    }
+                if self.rt.block_on(fs.write(ino, 0, data)).is_ok()
+                    && let Some(ModelNode::File(c)) = self.model.get_mut(name)
+                {
+                    model_write(c, 0, data);
                 }
             }
             Op::Symlink { name, target } => {
@@ -207,10 +207,10 @@ impl Sim {
                 let r = self
                     .rt
                     .block_on(fs.rename(ROOT_INODE, old, ROOT_INODE, new));
-                if r.is_ok() {
-                    if let Some(node) = self.model.remove(old) {
-                        self.model.insert(new.clone(), node);
-                    }
+                if r.is_ok()
+                    && let Some(node) = self.model.remove(old)
+                {
+                    self.model.insert(new.clone(), node);
                 }
             }
             Op::CreateInDir { dir, name } => {
@@ -221,10 +221,9 @@ impl Sim {
                     .rt
                     .block_on(fs.create_file(dir_ino, name, false))
                     .is_ok()
+                    && let Some(ModelNode::Dir(children)) = self.model.get_mut(dir)
                 {
-                    if let Some(ModelNode::Dir(children)) = self.model.get_mut(dir) {
-                        children.insert(name.clone(), ModelNode::File(Vec::new()));
-                    }
+                    children.insert(name.clone(), ModelNode::File(Vec::new()));
                 }
             }
             Op::WriteInDir { dir, name, data } => {
@@ -234,12 +233,11 @@ impl Sim {
                 let Ok(file_ino) = self.rt.block_on(fs.lookup(dir_ino, name)) else {
                     return;
                 };
-                if self.rt.block_on(fs.write(file_ino, 0, data)).is_ok() {
-                    if let Some(ModelNode::Dir(children)) = self.model.get_mut(dir) {
-                        if let Some(ModelNode::File(c)) = children.get_mut(name) {
-                            model_write(c, 0, data);
-                        }
-                    }
+                if self.rt.block_on(fs.write(file_ino, 0, data)).is_ok()
+                    && let Some(ModelNode::Dir(children)) = self.model.get_mut(dir)
+                    && let Some(ModelNode::File(c)) = children.get_mut(name)
+                {
+                    model_write(c, 0, data);
                 }
             }
             Op::Snapshot => {

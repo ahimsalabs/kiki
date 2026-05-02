@@ -1743,7 +1743,6 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 #[cfg(test)]
 mod tests {
     const COMMIT_ID_LENGTH: usize = 20;
-    const CHANGE_ID_LENGTH: usize = 16;
 
     use assert_matches::assert_matches;
     use proto::jj_interface::jujutsu_interface_server::JujutsuInterface;
