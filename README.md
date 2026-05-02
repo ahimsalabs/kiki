@@ -51,8 +51,6 @@ the VFS synthesizes a `.git` gitdir pointer at the workspace root.
 ## GitHub example
 
 ```bash
-kiki kk daemon run &   # will be automatic in a future release
-
 kiki kk init dir:///shared/store ~/work/myproject
 cd ~/work/myproject
 
@@ -80,15 +78,16 @@ builtins (`kk init`, `kk status`).
 
 ```mermaid
 graph LR
-    CLI["kiki<br/>(jj superset)"] -- gRPC --> Daemon
-    Daemon -- "dir:// / grpc://" --> Remote["Remote Store"]
+    CLI["kiki<br/>(jj superset)"] -- "gRPC (UDS)" --> Daemon
+    Daemon -- "dir:// / ssh:// / kiki://" --> Remote["Remote Store"]
     Daemon -- mount --> VFS["Working copy<br/>(FUSE / NFS)"]
 ```
 
-The **daemon** runs on your machine. It serves the virtual
+The **daemon** runs on your machine (auto-started on first
+command — no manual setup needed). It serves the virtual
 filesystem, caches content locally, and syncs with a remote in
 the background. The **remote** can be a shared directory, another
-daemon, or (future) S3.
+daemon over SSH, or a peer daemon over gRPC.
 
 ## Status
 

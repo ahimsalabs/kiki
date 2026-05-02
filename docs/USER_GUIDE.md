@@ -12,22 +12,24 @@ backed by a daemon that handles storage, caching, and remote synchronization.
 
 ```mermaid
 graph LR
-    CLI["kiki<br/>(jj superset)"] -- gRPC --> Daemon
-    Daemon -- "dir:// / kiki:// / ssh://" --> Remote["Remote Store"]
+    CLI["kiki<br/>(jj superset)"] -- "gRPC (UDS)" --> Daemon
+    Daemon -- "dir:// / ssh:// / kiki://" --> Remote["Remote Store"]
     Daemon -- mount --> VFS["Working copy<br/>(FUSE / NFS)"]
 ```
 
-- **kiki** (`kiki`): A jj superset binary that talks to the daemon over gRPC.
-  Stores no persistent data itself. All standard jj commands (`kiki log`,
-  `kiki new`, `kiki describe`, `kiki diff`, etc.) work normally. The `kk`
-  subcommand provides kiki-specific operations.
-- **Daemon** (`daemon`): Long-lived process on the local machine. Mounts repos
-  as virtual filesystems, manages a durable per-mount store (redb), and
-  optionally syncs blobs and operation state to a remote.
+- **kiki** (`kiki`): A jj superset binary that talks to the local daemon over
+  a Unix domain socket. Stores no persistent data itself. All standard jj
+  commands (`kiki log`, `kiki new`, `kiki describe`, `kiki diff`, etc.) work
+  normally. The `kk` subcommand provides kiki-specific operations.
+- **Daemon**: Long-lived process on the local machine, auto-started on first
+  command. Mounts repos as virtual filesystems, manages a durable per-mount
+  store (redb), and optionally syncs blobs and operation state to a remote.
+  No manual configuration needed.
 - **Remote** (`dir://`, `ssh://`, or `kiki://`): Content-addressed blob store
   with compare-and-swap mutable refs. `ssh://` remotes need only the `kiki`
-  binary on the server (no daemon). `kiki://` remotes connect to a running
-  daemon on another machine (e.g., over Tailscale).
+  binary on the server — the local daemon manages a persistent SSH tunnel to
+  the remote daemon. `kiki://` remotes connect to a running daemon on another
+  machine (e.g., over Tailscale).
 
 ## Prerequisites
 
@@ -45,77 +47,60 @@ cargo build --workspace            # debug build
 cargo build --workspace --release  # release build
 ```
 
-The workspace produces two binaries:
+The workspace produces one binary:
 
-| Binary   | Location (debug)        | Description              |
-|----------|-------------------------|--------------------------|
-| `daemon` | `target/debug/daemon`   | The kiki daemon          |
-| `kiki`   | `target/debug/kiki`     | jj superset with kiki backend |
+| Binary | Location (debug)      | Description                          |
+|--------|-----------------------|--------------------------------------|
+| `kiki` | `target/debug/kiki`   | jj superset + daemon (unified binary)|
 
 ## Configuration
 
-### Daemon configuration
+### Zero-config defaults
 
-The daemon reads a TOML config file passed via `--config`. A minimal example:
+kiki requires **no configuration** for local use. The daemon is auto-started
+when you run your first `kiki` command. It communicates over a Unix domain
+socket at a platform-appropriate path:
 
-```toml
-# daemon.toml
-grpc_addr = "[::1]:12000"
-storage_dir = "/tmp/kiki-storage"
+| Platform | Socket path |
+|----------|-------------|
+| Linux    | `$XDG_RUNTIME_DIR/kiki/daemon.sock` (or `/tmp/kiki-$UID/daemon.sock`) |
+| macOS    | `~/Library/Caches/kiki/daemon.sock` |
 
-[nfs]
-min_port = 12000
-max_port = 12010
-```
+Storage lives at `~/.local/state/kiki` (Linux) or
+`~/Library/Application Support/kiki` (macOS).
 
-| Key           | Description |
-|---------------|-------------|
-| `grpc_addr`   | Address the gRPC server listens on. The CLI connects here. |
-| `storage_dir` | Root directory for per-mount durable storage. Each mount gets a redb file at `<storage_dir>/mounts/<hash>/store.redb`. Created on demand. |
-| `nfs.min_port` / `nfs.max_port` | Port range for NFS mounts (macOS only). |
+### Optional config file
 
-Optional keys:
-
-| Key             | Default | Description |
-|-----------------|---------|-------------|
-| `disable_mount` | `false` | Skip the actual VFS mount. Useful for integration testing only. |
-
-### CLI configuration
-
-The CLI needs to know which port the daemon is listening on. Add this to your
-[jj config](https://jj-vcs.github.io/jj/latest/config/):
+For power users, `~/.config/kiki/config.toml` can override defaults:
 
 ```toml
-grpc_port = 12000
+# All fields are optional.
+
+# TCP listener for daemon-to-daemon remote access (kiki:// scheme).
+# Default: disabled.
+# grpc_addr = "[::1]:12000"
+
+# Override storage directory.
+# storage_dir = "/path/to/storage"
+
+# NFS port range (macOS only).
+# [nfs]
+# min_port = 12000
+# max_port = 12010
 ```
 
-This must match the port in `grpc_addr` from the daemon config.
+### Environment overrides
 
-You can set it via:
-
-```bash
-kiki config set --user grpc_port 12000
-```
+| Variable | Effect |
+|----------|--------|
+| `KIKI_SOCKET_PATH` | Override socket location. Disables auto-start (user manages daemon). |
+| `RUST_LOG` | Control daemon log verbosity (e.g., `info`, `debug`). |
 
 ## Getting started
 
-### 1. Start the daemon
+### 1. Initialize a repository
 
-```bash
-./target/debug/daemon --config daemon.toml
-```
-
-The daemon logs to stderr. Set `RUST_LOG` for more detail:
-
-```bash
-RUST_LOG=info ./target/debug/daemon --config daemon.toml
-RUST_LOG=debug ./target/debug/daemon --config daemon.toml  # very verbose
-```
-
-The daemon persists mount state to disk. On restart, it rehydrates previously
-mounted repos automatically.
-
-### 2. Initialize a repository
+The daemon starts automatically on your first command — no manual setup.
 
 ```bash
 kiki kk init <remote> [destination]
@@ -126,7 +111,7 @@ kiki kk init <remote> [destination]
 | Scheme    | Example                          | Description |
 |-----------|----------------------------------|-------------|
 | `dir://`  | `dir:///tmp/kiki-remote`         | Filesystem-backed remote. Good for local testing and single-machine use. |
-| `ssh://`  | `ssh://user@host/data/store`     | SSH transport. No daemon needed on the server — just the `kiki` binary and a directory. |
+| `ssh://`  | `ssh://user@host/data/store`     | SSH transport. Needs only the `kiki` binary on the server. The local daemon manages a persistent SSH tunnel. |
 | `kiki://` | `kiki://myserver:12000`          | Another kiki daemon's gRPC endpoint. Enables peer-to-peer sync (e.g., over Tailscale). |
 | `grpc://` | `grpc://[::1]:12000`             | Alias for `kiki://`. |
 | (empty)   | `""`                             | No remote. Local-only operation with redb-backed storage. |
@@ -191,14 +176,23 @@ like regular jj. The difference is that snapshots happen in the daemon's
 in-memory inode slab and persist to the redb store, rather than scanning the
 filesystem.
 
-### 4. Check daemon status
+### 4. Daemon management
+
+The daemon is invisible in normal use. For debugging:
+
+```bash
+kiki kk daemon status       # PID, socket path, mount count
+kiki kk daemon logs         # tail the log file
+kiki kk daemon logs -f      # follow (like tail -f)
+kiki kk daemon stop         # graceful shutdown
+kiki kk daemon socket-path  # print the resolved socket path
+```
+
+To see all mounted repositories:
 
 ```bash
 kiki kk status
 ```
-
-Lists all currently mounted repositories, showing the working-copy path and
-remote URL (if configured).
 
 ## Multi-user / multi-machine sync
 
@@ -219,11 +213,9 @@ on the remote's mutable ref catalog. This means:
 
 ```bash
 # Machine A
-daemon --config daemon.toml  # storage_dir = /tmp/kiki-a
 kiki kk init "dir:///shared/remote" project
 
 # Machine B
-daemon --config daemon.toml  # storage_dir = /tmp/kiki-b
 kiki kk init "dir:///shared/remote" project
 
 # Both machines see each other's commits and operations
@@ -247,11 +239,12 @@ kiki kk init "ssh://user@server/data/remote" project
 ### Example: peer-to-peer via kiki:// (Tailscale, LAN)
 
 Every daemon also serves the `RemoteStore` gRPC service, so any daemon can act
-as the remote for another. Use `kiki://` (or the legacy `grpc://` alias):
+as the remote for another. Use `kiki://` (or the `grpc://` alias). Requires
+`grpc_addr` in the server's `~/.config/kiki/config.toml`:
 
 ```bash
-# Machine A: daemon on port 12000
-daemon --config daemon-a.toml   # grpc_addr = "0.0.0.0:12000"
+# Machine A: enable TCP listener in ~/.config/kiki/config.toml
+#   grpc_addr = "0.0.0.0:12000"
 
 # Machine B: use Machine A as the remote (e.g., over Tailscale)
 kiki kk init "kiki://machine-a:12000" project
@@ -311,8 +304,8 @@ You fetch their work into your kiki workspace with `kiki git fetch`.
 
 ## Syncing over SSH
 
-Use an `ssh://` URL to sync with a remote machine. No daemon needed on
-the server — just the `kiki` binary installed and SSH access.
+Use an `ssh://` URL to sync with a remote machine. Only the `kiki` binary
+needs to be on the server.
 
 ```bash
 kiki kk init ssh://user@my-server/data/myproject ~/work/myproject
@@ -324,40 +317,30 @@ vim src/auth.rs
 ```
 
 A teammate runs the same command. Both of you see each other's changes
-through the shared store directory on the server.
+through the shared store on the server.
 
 ### How it works
 
-The local daemon spawns an SSH connection to the server:
+On `kiki kk init ssh://...`, the local daemon:
 
-```
-ssh user@my-server kiki kk serve /data/myproject
-```
+1. **Discovers** the remote socket: `ssh user@host kiki kk daemon socket-path`
+2. **Starts** the remote daemon if not running: `ssh user@host kiki kk daemon run --managed`
+3. **Opens a persistent tunnel**: `ssh -L local.sock:remote.sock user@host -N`
+4. **Connects** a gRPC client to the forwarded socket
 
-The remote `kiki kk serve` process serves the store over stdin/stdout
-using a length-prefixed protobuf protocol. The local daemon speaks this
-protocol to read/write blobs and refs. Multiple SSH connections to the
-same store directory are concurrency-safe — `FsRemoteStore` uses
-`flock` to serialize ref updates.
+The tunnel stays alive for the mount's lifetime — subsequent CLI commands
+reuse it with zero SSH handshake cost. The local daemon manages the tunnel
+process and cleans up on shutdown.
 
-No TCP port, no tunnel, no remote daemon. SSH provides the transport,
-encryption, and authentication.
+The full gRPC protocol runs over the tunnel, giving access to all
+`RemoteStore` operations (blob CAS + mutable refs). Multiple local
+daemons sharing the same remote serialize ref updates via compare-and-swap.
 
 ### Prerequisites on the server
 
 1. `kiki` binary in `$PATH`
-2. A directory for the store (created on first write)
-3. SSH access with key-based auth (BatchMode — no interactive prompts)
-
-### Standalone serve mode
-
-You can also run `kiki kk serve` directly for testing:
-
-```bash
-# On the server (or locally for testing)
-kiki kk serve /path/to/store
-# Reads StoreRequest messages from stdin, writes StoreResponse to stdout
-```
+2. SSH access with key-based auth (BatchMode — no interactive prompts)
+3. The remote daemon auto-starts and manages its own storage
 
 ## Known limitations
 
@@ -384,9 +367,10 @@ kiki kk serve /path/to/store
 
 ## Troubleshooting
 
-**"Failed to connect to kiki daemon on port N"**
-The daemon isn't running, or `grpc_port` in your jj config doesn't match the
-daemon's `grpc_addr`.
+**"daemon not reachable"**
+If `KIKI_SOCKET_PATH` is set, the CLI won't auto-start the daemon.
+Check with `kiki kk daemon status`. Otherwise the daemon auto-starts —
+check `kiki kk daemon logs` for errors.
 
 **"mount failed" / FUSE errors on init**
 Check that `fusermount3` is installed and setuid. On most Linux distros:
@@ -400,12 +384,25 @@ If the daemon crashes and leaves a stale FUSE mount, unmount it manually:
 ```bash
 fusermount3 -u /path/to/repo
 ```
-Then restart the daemon. It will rehydrate persisted mounts on startup.
+Then restart the daemon (`kiki kk daemon run`). It rehydrates persisted
+mounts on startup.
 
 **Verbose logging**
 ```bash
-RUST_LOG=daemon=debug,service=debug ./target/debug/daemon --config daemon.toml
+RUST_LOG=debug kiki kk daemon run
+# Or check the auto-managed daemon's log:
+kiki kk daemon logs -f
 ```
+
+**SSH tunnel issues**
+If an `ssh://` remote fails to connect:
+```bash
+# Test SSH connectivity manually
+ssh user@host kiki kk daemon socket-path
+ssh user@host kiki kk daemon status
+```
+The local daemon's log (`kiki kk daemon logs`) shows tunnel establishment
+details and errors.
 
 ## Running tests
 
@@ -413,5 +410,7 @@ RUST_LOG=daemon=debug,service=debug ./target/debug/daemon --config daemon.toml
 cargo test --workspace
 ```
 
-Integration tests spin up a temporary daemon per test with `disable_mount=false`,
-exercising the full FUSE path. They require `fusermount3` to be available.
+Integration tests spin up a temporary daemon per test (using `KIKI_SOCKET_PATH`
+for isolation), exercising the full FUSE path. They require `fusermount3` to be
+available. Set `KIKI_TEST_DISABLE_MOUNT=1` to skip FUSE in environments where
+it's unavailable.
