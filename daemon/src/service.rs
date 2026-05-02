@@ -679,10 +679,10 @@ fn force_unmount(path: &str) -> anyhow::Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     let output = std::process::Command::new("fusermount3")
-        .arg("-u")
+        .arg("-uz") // lazy unmount: detach immediately even if busy
         .arg(path)
         .output()
-        .context("running fusermount3 -u")?;
+        .context("running fusermount3 -uz")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
