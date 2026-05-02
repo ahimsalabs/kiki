@@ -20,6 +20,7 @@ blake3 = { version = "1.5.4", features = ["traits-preview"] }
 clap = { version = "4.5.0", features = ["derive"] }
 chrono = { version = "0.4.38", default-features = false, features = ["std", "clock"] }
 digest = "0.10"
+gix = { version = "0.81", default-features = false }
 # fuse3 0.8 builds on Linux + macOS but real mounts only land on Linux
 # (per `docs/PLAN.md` §4.3). The adapter is built on every platform so the
 # code compiles in CI; it's only wired up to a kernel mount on Linux at M4.
