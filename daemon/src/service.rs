@@ -490,11 +490,33 @@ impl JujutsuService {
         let fs: Arc<dyn JjKikiFs> =
             Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone()));
 
-        // The previous daemon's FUSE/NFS mount went away when its
-        // process exited (kernel drops the mount). On restart the path
-        // is no longer a mountpoint, so `validate_mountpoint` should
-        // accept it as long as no one repopulated the dir in between.
+        // On Linux (FUSE), the kernel tears down the mount when the
+        // daemon's process exits — the path is usually a clean empty dir
+        // by the time we rehydrate.
+        //
+        // On macOS (NFS), the kernel mount survives the daemon's death
+        // and becomes a hung mount. The stale mount can manifest as any
+        // of several validate_mountpoint errors (NotEmpty if the mount
+        // is still functional, Io if the NFS server is dead and reads
+        // return EIO, or AlreadyMounted if the dir happened to be
+        // empty). Rather than pattern-matching on the error, check
+        // is_mountpoint up front — if the path is still a mountpoint
+        // and we're rehydrating (so we *know* it was ours), tear it
+        // down before validating.
         let attachment = if let Some(vfs) = &self.vfs_handle {
+            if is_mountpoint(Path::new(&meta.working_copy_path)).unwrap_or(false) {
+                warn!(
+                    path = %meta.working_copy_path,
+                    "stale mount detected during rehydrate; force-unmounting"
+                );
+                force_unmount(&meta.working_copy_path).with_context(|| {
+                    format!(
+                        "force-unmounting stale mount at {} — \
+                         try `umount -f {}` manually",
+                        meta.working_copy_path, meta.working_copy_path,
+                    )
+                })?;
+            }
             validate_mountpoint(&meta.working_copy_path).map_err(|e| {
                 anyhow::anyhow!("mountpoint no longer valid for rehydrate: {e}")
             })?;
@@ -577,8 +599,10 @@ enum MountpointError {
 }
 
 /// Reject anything that would either lose user data or shadow an existing
-/// mount. Conservative on purpose — we never auto-unmount stale mounts
-/// (would mask daemon-restart bugs that Layer B is supposed to fix).
+/// mount. Conservative for `Initialize` (fresh mounts) — a stale mount
+/// from another process is a legitimate conflict. During rehydration,
+/// callers handle `AlreadyMounted` by force-unmounting (we *know* the
+/// mount was ours).
 fn validate_mountpoint(path: &str) -> Result<(), MountpointError> {
     let p = Path::new(path);
     let meta = std::fs::metadata(p)
@@ -616,6 +640,48 @@ fn is_mountpoint(path: &Path) -> std::io::Result<bool> {
     };
     let parent_meta = std::fs::metadata(parent)?;
     Ok(path_meta.dev() != parent_meta.dev())
+}
+
+/// Force-unmount a stale mountpoint left behind by a previous daemon
+/// that crashed or was killed without clean shutdown.
+///
+/// On macOS, NFS mounts survive the daemon's death (the kernel NFS client
+/// keeps trying to reach the dead NFS server). `umount -f` is the only
+/// reliable way to tear them down.
+///
+/// On Linux, FUSE mounts normally disappear when the daemon process exits
+/// (the kernel closes the `/dev/fuse` fd), but `fusermount3 -u` handles
+/// the rare case where a mount lingers (e.g. lazy unmount, external FUSE
+/// mount at the same path).
+///
+/// Only called during rehydration where we *know* the path was previously
+/// managed by kiki — never during `Initialize` where an existing mount
+/// might belong to something else.
+fn force_unmount(path: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    let output = std::process::Command::new("umount")
+        .arg("-f")
+        .arg(path)
+        .output()
+        .context("running umount -f")?;
+
+    #[cfg(not(target_os = "macos"))]
+    let output = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(path)
+        .output()
+        .context("running fusermount3 -u")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "force unmount of {path} failed (exit {}): {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    info!(path, "force-unmounted stale mountpoint");
+    Ok(())
 }
 
 fn mountpoint_status(e: MountpointError) -> Status {
@@ -3804,5 +3870,155 @@ mod tests {
             reply.bookmark_changes.is_empty(),
             "no detection before first WriteView"
         );
+    }
+
+    // ---- Stale mount / force_unmount tests ----
+
+    #[test]
+    fn force_unmount_on_non_mountpoint_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_str().unwrap();
+        let result = force_unmount(path);
+        assert!(result.is_err(), "force_unmount should fail on a plain directory");
+    }
+
+    #[test]
+    fn is_mountpoint_detects_real_mountpoints() {
+        // /proc is always a separate filesystem on Linux.
+        #[cfg(target_os = "linux")]
+        {
+            let result = is_mountpoint(Path::new("/proc"));
+            assert!(matches!(result, Ok(true)), "/proc should be a mountpoint");
+        }
+
+        // A tempdir is on the same device as its parent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = is_mountpoint(dir.path());
+        assert!(
+            matches!(result, Ok(false)),
+            "tempdir should NOT be a mountpoint"
+        );
+    }
+
+    #[test]
+    fn validate_mountpoint_rejects_non_empty_mountpoint() {
+        // /proc is a mountpoint and non-empty — validate catches it at
+        // the emptiness check (before the dev-id check). Both are
+        // valid rejection reasons.
+        #[cfg(target_os = "linux")]
+        {
+            let result = validate_mountpoint("/proc");
+            assert!(result.is_err(), "/proc should not pass mountpoint validation");
+        }
+    }
+
+    /// Full integration test: create a mount, simulate a stale FUSE mount
+    /// left behind by a crashed daemon, then verify rehydration detects and
+    /// force-unmounts it before re-binding.
+    ///
+    /// Requires /dev/fuse — skipped if unavailable (CI without FUSE).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_force_unmounts_stale_fuse_mount() {
+        use crate::vfs_mgr::{VfsManager, VfsManagerConfig};
+
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping: /dev/fuse not available");
+            return;
+        }
+
+        let storage_dir = tempfile::tempdir().expect("storage tempdir");
+        let mount_dir = tempfile::tempdir().expect("mount tempdir");
+        let mount_path = mount_dir.path().to_str().unwrap().to_owned();
+
+        // Phase 1: use a bare service (no VFS) to initialize and persist
+        // the mount metadata + redb store.
+        let svc1 = JujutsuService::new(
+            None,
+            StorageConfig::on_disk(storage_dir.path().to_owned()),
+        );
+        svc1.initialize(Request::new(InitializeReq {
+            path: mount_path.clone(),
+            remote: String::new(),
+        }))
+        .await
+        .expect("initialize");
+        drop(svc1);
+
+        // Phase 2: create a FUSE mount at mount_path to simulate a stale
+        // mount left behind by a crashed daemon. The VFS manager creates
+        // a real kernel mount; we `mem::forget` the attachment so it
+        // stays alive after we lose the handle.
+        let mut vfs = VfsManager::new(VfsManagerConfig {
+            min_nfs_port: 0,
+            max_nfs_port: 0,
+        });
+        let vfs_handle = vfs.handle();
+
+        // The VFS manager needs to run as a task so bind() can complete.
+        let vfs_task = tokio::spawn(async move { vfs.serve().await });
+
+        // Create a minimal KikiFs for the stale mount — content doesn't
+        // matter, we just need a real FUSE session at the mountpoint.
+        let settings = {
+            let mut config = jj_lib::config::StackedConfig::with_defaults();
+            config.add_layer(
+                jj_lib::config::ConfigLayer::parse(
+                    jj_lib::config::ConfigSource::User,
+                    "user.name = \"Test\"\nuser.email = \"t@t\"\noperation.hostname = \"t\"\noperation.username = \"t\"",
+                ).unwrap(),
+            );
+            jj_lib::settings::UserSettings::from_config(config).unwrap()
+        };
+        let store = Arc::new(GitContentStore::new_in_memory(&settings));
+        let root = ty::Id(store.empty_tree_id().as_bytes().try_into().unwrap());
+        let fs: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root, None));
+        let (_transport, attachment) = vfs_handle
+            .bind(mount_path.clone(), fs)
+            .await
+            .expect("bind FUSE for stale mount");
+
+        // Confirm the path is now a mountpoint.
+        assert!(
+            is_mountpoint(Path::new(&mount_path)).unwrap(),
+            "mount_path should be a mountpoint after FUSE bind"
+        );
+
+        // Leak the attachment so the FUSE mount survives — simulating a
+        // daemon crash where the mount handle was never dropped cleanly.
+        std::mem::forget(attachment);
+
+        // Phase 3: a new service with a VFS handle rehydrates from the
+        // same storage dir. It should detect the stale mount, call
+        // fusermount3 -u, and re-bind successfully.
+        let mut vfs2 = VfsManager::new(VfsManagerConfig {
+            min_nfs_port: 0,
+            max_nfs_port: 0,
+        });
+        let vfs_handle2 = vfs2.handle();
+        let vfs_task2 = tokio::spawn(async move { vfs2.serve().await });
+
+        let svc2 = JujutsuService::new(
+            Some(vfs_handle2),
+            StorageConfig::on_disk(storage_dir.path().to_owned()),
+        );
+        svc2.rehydrate().await.expect(
+            "rehydrate should succeed after force-unmounting stale mount"
+        );
+
+        // Verify the mount was rehydrated: DaemonStatus should list it.
+        let status = svc2
+            .daemon_status(Request::new(DaemonStatusReq {}))
+            .await
+            .expect("daemon_status")
+            .into_inner();
+        assert_eq!(status.data.len(), 1, "one mount should be rehydrated");
+        assert_eq!(status.data[0].path, mount_path);
+
+        // Clean up: dropping svc2 drops the new mount attachment,
+        // which unmounts the re-bound FUSE mount.
+        drop(svc2);
+        drop(vfs_handle);
+        vfs_task.abort();
+        vfs_task2.abort();
     }
 }
