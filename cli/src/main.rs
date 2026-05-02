@@ -8,7 +8,7 @@ use jj_cli::{
 use jj_lib::{
     file_util,
     ref_name::WorkspaceName,
-    repo::{ReadonlyRepo, StoreFactories},
+    repo::{ReadonlyRepo, Repo, StoreFactories},
     signing::Signer,
     workspace::{WorkingCopyFactories, Workspace, WorkspaceInitError},
 };
@@ -494,14 +494,76 @@ async fn run_git_command(
             let fetched = resp.into_inner().bookmarks;
             if fetched.is_empty() {
                 writeln!(ui.status(), "Nothing new from remote.")?;
-            } else {
+                return Ok(());
+            }
+
+            // Print fetched bookmarks.
+            {
                 let mut formatter = ui.stdout_formatter();
                 for b in &fetched {
-                    let hex: String = b.commit_id.iter().map(|byte| format!("{byte:02x}")).collect();
+                    let hex: String =
+                        b.commit_id.iter().map(|byte| format!("{byte:02x}")).collect();
                     let short = &hex[..12.min(hex.len())];
-                    writeln!(formatter, "  {}: {short}", b.name)?;
+                    writeln!(formatter, "  {}/{}: {short}", fetch_args.remote, b.name)?;
                 }
             }
+
+            // Update jj's View: set remote-tracking bookmarks so that
+            // `jj log` shows e.g. `main@origin` at the fetched commits.
+            use jj_lib::backend::CommitId;
+            use jj_lib::op_store::{RemoteRef, RemoteRefState, RefTarget};
+            use jj_lib::ref_name::{RefName, RemoteName};
+
+            let mut workspace_command = command_helper.workspace_helper(ui)?;
+            let mut tx = workspace_command.start_transaction();
+
+            let remote_name = RemoteName::new(fetch_args.remote.as_str());
+            for b in &fetched {
+                let bookmark_name = RefName::new(b.name.as_str());
+                let commit_id = CommitId::new(b.commit_id.clone());
+                let remote_ref = RemoteRef {
+                    target: RefTarget::normal(commit_id),
+                    state: RemoteRefState::Tracked,
+                };
+                tx.repo_mut().set_remote_bookmark(
+                    bookmark_name.to_remote_symbol(remote_name),
+                    remote_ref,
+                );
+            }
+
+            // For tracked remote bookmarks, also update local bookmarks
+            // when the local target is absent (new bookmark) or is an
+            // ancestor of the fetched commit (fast-forward). Skip
+            // conflicting updates — the user can resolve manually.
+            for b in &fetched {
+                let bookmark_name = RefName::new(b.name.as_str());
+                let commit_id = CommitId::new(b.commit_id.clone());
+                let local_target = tx.repo().view().get_local_bookmark(bookmark_name);
+                if local_target.is_absent() {
+                    // New bookmark — create local tracking it.
+                    tx.repo_mut().set_local_bookmark_target(
+                        bookmark_name,
+                        RefTarget::normal(commit_id),
+                    );
+                } else if let Some(local_id) = local_target.as_normal() {
+                    // Check if this is a fast-forward (local is ancestor of fetched).
+                    let index = tx.repo().index();
+                    if index.is_ancestor(local_id, &commit_id).unwrap_or(false) {
+                        tx.repo_mut().set_local_bookmark_target(
+                            bookmark_name,
+                            RefTarget::normal(commit_id),
+                        );
+                    }
+                    // else: diverged — leave local as-is, user resolves.
+                }
+            }
+
+            tx.finish(
+                ui,
+                format!("fetch from git remote(s) {}", fetch_args.remote),
+            )
+            .await?;
+
             Ok(())
         }
     }
