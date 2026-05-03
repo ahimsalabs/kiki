@@ -309,9 +309,9 @@ fn is_stale_mount(path: &Path) -> Option<String> {
         Ok(_) => None, // accessible — not stale
         Err(e) => {
             let raw = e.raw_os_error();
-            // ENOTCONN (107): "Transport endpoint is not connected"
-            // ESTALE (116): "Stale file handle"
-            if raw == Some(107) || raw == Some(116) {
+            // ENOTCONN: "Transport endpoint is not connected" (Linux FUSE)
+            // ESTALE: "Stale file handle" (NFS / FUSE)
+            if raw == Some(libc::ENOTCONN) || raw == Some(libc::ESTALE) {
                 Some(format!("{e}"))
             } else {
                 None
@@ -340,6 +340,18 @@ fn is_mountpoint(path: &Path) -> bool {
     {
         let _ = path;
         false
+    }
+}
+
+/// Platform-appropriate manual unmount command for user-facing messages.
+fn unmount_command(path: &Path) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!("umount -f {}", path.display())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!("fusermount3 -u {}", path.display())
     }
 }
 
@@ -380,16 +392,16 @@ fn check_stale_mounts(
                         writeln!(ui.status(), "FAILED: {e}")?;
                         writeln!(
                             ui.status(),
-                            "    Try manually: fusermount3 -u {}",
-                            mount_root.display()
+                            "    Try manually: {}",
+                            unmount_command(&mount_root),
                         )?;
                     }
                 }
             } else {
                 writeln!(
                     ui.status(),
-                    "    Fix with: fusermount3 -u {}",
-                    mount_root.display()
+                    "    Fix with: {}",
+                    unmount_command(&mount_root),
                 )?;
             }
             *total_errors += 1;
@@ -425,16 +437,16 @@ fn check_stale_mounts(
                                 writeln!(ui.status(), "FAILED: {e}")?;
                                 writeln!(
                                     ui.status(),
-                                    "    Try manually: fusermount3 -u {}",
-                                    meta.working_copy_path
+                                    "    Try manually: {}",
+                                    unmount_command(mount_path),
                                 )?;
                             }
                         }
                     } else {
                         writeln!(
                             ui.status(),
-                            "    Fix with: fusermount3 -u {}",
-                            meta.working_copy_path
+                            "    Fix with: {}",
+                            unmount_command(mount_path),
                         )?;
                     }
                     *total_errors += 1;

@@ -16,7 +16,7 @@ synchronization.
 graph LR
     CLI["kiki<br/>(jj superset)"] -- "gRPC (UDS)" --> Daemon
     Daemon -- "dir:// / s3:// / kiki+ssh:// / kiki://" --> Remote["Remote Store"]
-    Daemon -- "single FUSE mount" --> VFS["~/kiki/<br/>repo/workspace/"]
+    Daemon -- "FUSE (Linux) / NFS (macOS)" --> VFS["~/kiki/<br/>repo/workspace/"]
 ```
 
 - **kiki** (`kiki`): A jj superset binary that talks to the local daemon over
@@ -25,10 +25,10 @@ graph LR
   normally. Top-level commands handle repo and workspace lifecycle (`kiki clone`,
   `kiki workspace`). The `kk` subcommand provides other kiki-specific operations.
 - **Daemon**: Long-lived process on the local machine, auto-started on first
-  command. Serves a single FUSE mount at `~/kiki/` containing all repos and
-  workspaces. Manages per-repo git stores (shared across workspaces), a durable
-  redb database, and optionally syncs blobs and operation state to a remote.
-  No manual configuration needed.
+  command. Serves a single VFS mount (FUSE on Linux, NFS on macOS) at `~/kiki/`
+  containing all repos and workspaces. Manages per-repo git stores (shared
+  across workspaces), a durable redb database, and optionally syncs blobs and
+  operation state to a remote. No manual configuration needed.
 - **Remote** (`dir://`, `s3://`, `kiki+ssh://`, or `kiki://`): Content-addressed
   blob store with compare-and-swap mutable refs. `s3://` remotes use the AWS
   SDK default credential chain. `kiki+ssh://` remotes need only the `kiki` binary on
@@ -42,8 +42,8 @@ graph LR
   as a setuid binary on most distros, so no `sudo` is needed to mount.
 - **macOS:** `mount_nfs` (ships with macOS). No extra packages required, but
   loopback NFS has occasional version-specific quirks. The managed workspace
-  namespace (`~/kiki/`) requires the macOS NFS RootFs adapter (not yet
-  available) — macOS currently uses per-workspace NFS mounts via `kk init`.
+  namespace (`~/kiki/`) works via a single NFS mount served by the daemon,
+  matching the Linux FUSE path.
 - **Rust toolchain:** edition 2024 (nightly or stable 1.85+).
 - **jj** 0.40.x (jj-lib 0.40 is the pinned dependency).
 
@@ -77,10 +77,10 @@ Two separate directories:
 ~/.local/share/kiki/store/      # git stores, redb, workspace metadata
 ~/.local/share/kiki/config.toml # optional config
 
-~/kiki/                          # KIKI_MOUNT — FUSE mount (repos/workspaces)
+~/kiki/                          # KIKI_MOUNT — VFS mount (repos/workspaces)
 ```
 
-The FUSE mount point (`~/kiki/`) must be empty before the daemon mounts it.
+The mount point (`~/kiki/`) must be empty before the daemon mounts it.
 Repos appear as `~/kiki/<repo>/<workspace>/` when the daemon is running.
 
 ### Optional config file
@@ -108,7 +108,7 @@ Repos appear as `~/kiki/<repo>/<workspace>/` when the daemon is running.
 | Variable | Effect |
 |----------|--------|
 | `KIKI_HOME` | State directory (stores, config, daemon runtime). Default: `~/.local/share/kiki`. |
-| `KIKI_MOUNT` | FUSE mount point (repos/workspaces appear here). Default: `~/kiki`. |
+| `KIKI_MOUNT` | VFS mount point (repos/workspaces appear here). Default: `~/kiki`. |
 | `KIKI_SOCKET_PATH` | Override socket location. Disables auto-start (user manages daemon). |
 | `RUST_LOG` | Control daemon log verbosity (e.g., `info`, `debug`). |
 
@@ -117,7 +117,8 @@ Repos appear as `~/kiki/<repo>/<workspace>/` when the daemon is running.
 ### 1. Clone a repository
 
 The daemon starts automatically on your first command — no manual setup.
-A single FUSE mount at `~/kiki/` serves all repos and workspaces.
+A single mount at `~/kiki/` (FUSE on Linux, NFS on macOS) serves all repos
+and workspaces.
 
 Run `kiki kk setup` to verify prerequisites (fusermount3, mount root) before
 your first clone, or just dive in — the error messages will guide you.
@@ -540,9 +541,10 @@ daemons sharing the same remote serialize ref updates via compare-and-swap.
 
 ## Known limitations
 
-- **Linux-primary.** FUSE on Linux is the well-tested path. macOS NFS works but
-  has cache-coherency caveats (mitigated by mounting with `actimeo=0`) and
-  occasional Apple-version-specific quirks.
+- **Linux-primary.** FUSE on Linux is the well-tested path. macOS NFS works
+  (the managed namespace uses a single NFS mount, matching the Linux FUSE
+  architecture) but has cache-coherency caveats (mitigated by mounting with
+  `actimeo=0`) and occasional Apple-version-specific quirks.
 - **No auth or TLS on kiki:// (gRPC).** The daemon listens on localhost only
   by default. For `kiki://` remotes on a LAN or Tailscale, the network
   provides the trust boundary. Don't expose the gRPC port to untrusted
@@ -578,21 +580,22 @@ The default mount root is `~/kiki/` (created automatically). If you've
 configured a custom `mount_root` (e.g. `/mnt/kiki`), ensure it exists
 and is owned by your user.
 
-**"mount failed" / FUSE errors on clone**
-Check that `fusermount3` is installed and setuid:
-```bash
-kiki kk setup               # checks everything
-which fusermount3
-ls -la $(which fusermount3)  # should show the setuid bit
-```
+**"mount failed" / VFS errors on clone**
+Check prerequisites with `kiki kk setup` or `kiki kk doctor`. On Linux,
+ensure `fusermount3` is installed and setuid. On macOS, `mount_nfs` ships
+with the OS — run `kiki kk setup` to verify.
 
 **Stale mount after daemon crash**
-If the daemon crashes and leaves a stale FUSE mount, unmount it manually:
+If the daemon crashes and leaves a stale mount, unmount it manually:
 ```bash
+# Linux
 fusermount3 -u ~/kiki
+# macOS
+umount -f ~/kiki
 ```
+Or run `kiki kk doctor --fix` to auto-detect and clean up stale mounts.
 Then restart the daemon (`kiki kk daemon run`). It re-reads `repos.toml`
-and workspace metadata, re-binds the FUSE mount, and lazily hydrates
+and workspace metadata, re-binds the VFS mount, and lazily hydrates
 workspaces on first access.
 
 **Verbose logging**
@@ -619,6 +622,7 @@ cargo test --workspace
 ```
 
 Integration tests spin up a temporary daemon per test (using `KIKI_SOCKET_PATH`
-for isolation), exercising the full FUSE path. They require `fusermount3` to be
-available. Set `KIKI_TEST_DISABLE_MOUNT=1` to skip FUSE in environments where
-it's unavailable.
+for isolation), exercising the full VFS path (FUSE on Linux, NFS on macOS).
+They require `fusermount3` (Linux) or `mount_nfs` (macOS) to be available.
+Set `KIKI_TEST_DISABLE_MOUNT=1` to skip VFS mounts in environments where
+they're unavailable.

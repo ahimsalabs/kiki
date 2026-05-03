@@ -1276,7 +1276,7 @@ fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
     writeln!(ui.status(), "kiki setup")?;
     writeln!(ui.status())?;
 
-    // ── 1. Check fusermount3 (Linux only) ──────────────────────────
+    // ── 1. Check VFS prerequisites ─────────────────────────────────
     #[cfg(target_os = "linux")]
     {
         write!(ui.status(), "  fusermount3 ... ")?;
@@ -1298,6 +1298,29 @@ fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
                      sudo apt install fuse3   # Debian/Ubuntu\n  \
                      sudo dnf install fuse3   # Fedora\n  \
                      sudo pacman -S fuse3     # Arch",
+                )?;
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        write!(ui.status(), "  mount_nfs ... ")?;
+        match std::process::Command::new("which")
+            .arg("mount_nfs")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let path = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_string();
+                writeln!(ui.status(), "ok ({})", path)?;
+            }
+            _ => {
+                writeln!(ui.status(), "MISSING")?;
+                writeln!(
+                    ui.warning_default(),
+                    "mount_nfs not found. This ships with macOS — \
+                     check your PATH or reinstall Command Line Tools.",
                 )?;
             }
         }

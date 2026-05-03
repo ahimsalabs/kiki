@@ -4,7 +4,7 @@
 //!
 //! - **`KIKI_HOME`** — state directory (stores, config, daemon runtime).
 //!   Default: `$XDG_DATA_HOME/kiki` or `~/.local/share/kiki`.
-//! - **`KIKI_MOUNT`** — FUSE mount point (repos/workspaces appear here).
+//! - **`KIKI_MOUNT`** — VFS mount point (repos/workspaces appear here).
 //!   Default: `~/kiki`.
 //!
 //! ```text
@@ -15,10 +15,10 @@
 //! ~/.local/share/kiki/daemon.pid
 //! ~/.local/share/kiki/daemon.log
 //! ~/.local/share/kiki/tunnels/
-//! ~/kiki/                        # KIKI_MOUNT — FUSE mount (repos/workspaces)
+//! ~/kiki/                        # KIKI_MOUNT — VFS mount (repos/workspaces)
 //! ```
 //!
-//! The FUSE mount point must be empty before mounting. State never lives
+//! The mount point must be empty before mounting. State never lives
 //! inside the mount — they are completely separate directories.
 //!
 //! Directory creation is the caller's responsibility.
@@ -42,7 +42,7 @@ pub fn kiki_home() -> PathBuf {
     PathBuf::from(home).join(".local/share/kiki")
 }
 
-/// Resolve the FUSE mount point where repos/workspaces appear.
+/// Resolve the VFS mount point where repos/workspaces appear.
 ///
 /// Resolution order:
 /// 1. `KIKI_MOUNT` env var
@@ -122,11 +122,11 @@ pub fn config_path() -> PathBuf {
     kiki_home().join("config.toml")
 }
 
-/// Default mount root (FUSE mount point): resolved from `KIKI_MOUNT`.
+/// Default mount root: resolved from `KIKI_MOUNT`.
 ///
-/// The FUSE mount is bound here. Repos appear as
-/// `$KIKI_MOUNT/<repo>/<workspace>/`. The directory must be empty
-/// before mounting.
+/// The VFS mount (FUSE on Linux, NFS on macOS) is bound here. Repos
+/// appear as `$KIKI_MOUNT/<repo>/<workspace>/`. The directory must be
+/// empty before mounting.
 pub fn default_mount_root() -> PathBuf {
     mount_root()
 }

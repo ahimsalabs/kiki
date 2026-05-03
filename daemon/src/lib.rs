@@ -76,10 +76,10 @@ impl DaemonConfig {
     }
 }
 
-/// Try to unmount a stale FUSE mount at `path`. A mount is "stale" when
-/// the directory inode exists but the FUSE connection is dead (stat returns
-/// ENOTCONN / "Transport endpoint is not connected"). This happens when a
-/// previous daemon crashed without unmounting.
+/// Try to unmount a stale mount at `path`. A mount is "stale" when
+/// the directory inode exists but the VFS connection is dead — on Linux
+/// FUSE returns ENOTCONN, on macOS NFS returns ESTALE or hangs on the
+/// dead TCP endpoint.
 fn cleanup_stale_mount(path: &std::path::Path) {
     // Quick check: if stat succeeds, the mount is either live or it's a
     // plain directory — either way, nothing to clean up.
@@ -87,7 +87,7 @@ fn cleanup_stale_mount(path: &std::path::Path) {
         return;
     }
     // The inode exists (create_dir_all returned AlreadyExists) but stat
-    // failed — likely a stale FUSE mount. Try fusermount3 -u.
+    // failed — likely a stale mount. Try platform-appropriate unmount.
     #[cfg(target_os = "linux")]
     {
         match std::process::Command::new("fusermount3")
@@ -119,8 +119,9 @@ fn cleanup_stale_mount(path: &std::path::Path) {
     }
     #[cfg(target_os = "macos")]
     {
+        // Force-unmount to avoid hanging on a dead NFS server.
         match std::process::Command::new("umount")
-            .arg(&path.to_string_lossy().to_string())
+            .args(["-f", &path.to_string_lossy()])
             .output()
         {
             Ok(output) if output.status.success() => {
@@ -130,6 +131,66 @@ fn cleanup_stale_mount(path: &std::path::Path) {
                 );
             }
             _ => {} // Best-effort on macOS.
+        }
+    }
+}
+
+/// Attach an NFS kernel mount at `path` for an NFS server on `port`.
+/// Called once at daemon startup for the managed namespace mount.
+#[cfg(target_os = "macos")]
+fn mount_nfs_at(path: &std::path::Path, port: u16) -> anyhow::Result<()> {
+    let port_arg = format!(
+        "port={port},mountport={port},nolocks,vers=3,actimeo=0"
+    );
+    let output = std::process::Command::new("mount_nfs")
+        .arg("-o")
+        .arg(&port_arg)
+        .arg("localhost:/")
+        .arg(path)
+        .output()
+        .with_context(|| "failed to run mount_nfs")?;
+
+    if output.status.success() {
+        info!(
+            mount_root = %path.display(),
+            port,
+            "NFS kernel mount attached"
+        );
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow!(
+            "mount_nfs exited with {}: {}",
+            output.status,
+            stderr.trim(),
+        ))
+    }
+}
+
+/// Detach the NFS kernel mount at `path` during graceful shutdown.
+#[cfg(target_os = "macos")]
+fn unmount_nfs(path: &std::path::Path) {
+    match std::process::Command::new("umount")
+        .arg(path)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!(mount_root = %path.display(), "NFS mount unmounted");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                mount_root = %path.display(),
+                stderr = %stderr.trim(),
+                "umount failed during shutdown; mount may need manual cleanup"
+            );
+        }
+        Err(e) => {
+            warn!(
+                mount_root = %path.display(),
+                error = %e,
+                "could not run umount during shutdown"
+            );
         }
     }
 }
@@ -190,8 +251,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
     // ── M12: managed workspace rehydration ─────────────────────────
     //
     // Read repos.toml, reconstruct RootFs with all registered repos
-    // and workspaces, bind the single FUSE mount at mount_root, and
-    // hand the RootFs to the service so M12 RPCs work.
+    // and workspaces, bind a single VFS mount (FUSE on Linux, NFS on
+    // macOS) at mount_root, and hand the RootFs to the service so
+    // M12 RPCs work.
     let root_fs = rehydrate_root_fs(&config).context("rehydrating managed workspaces")?;
     let mount_attachment = if !config.disable_mount {
         if let Some(ref handle) = vfs_handle {
@@ -210,30 +272,57 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
                         warn!(
                             error = %e,
                             mount_root = %config.mount_root.display(),
-                            "cannot create mount root; RootFs FUSE mount skipped"
+                            "cannot create mount root; RootFs mount skipped"
                         );
                         false
                     }
                 }
             };
             if mount_root_ready {
-                // Clean up a stale FUSE mount left by a previous daemon
-                // that crashed or was killed without unmounting. The
-                // symptom: the directory inode exists but stat() fails
-                // with ENOTCONN ("Transport endpoint is not connected").
+                // Clean up a stale mount left by a previous daemon that
+                // crashed or was killed without unmounting. On Linux the
+                // symptom is ENOTCONN; on macOS the NFS client gets
+                // ESTALE or hangs until the TCP timeout.
                 cleanup_stale_mount(&config.mount_root);
 
                 let mount_path = config.mount_root.to_string_lossy().to_string();
                 match handle.bind(mount_path, Arc::clone(&root_fs) as Arc<dyn crate::vfs::JjKikiFs>).await {
-                    Ok((_transport, attachment)) => {
-                        info!(mount_root = %config.mount_root.display(), "RootFs FUSE mount bound");
+                    Ok((transport, attachment)) => {
+                        // On Linux (FUSE), the kernel mount was already
+                        // established by `mount_with_unprivileged` inside
+                        // `bind_fuse`. On macOS (NFS), `bind_nfs` only
+                        // starts the NFS TCP server — we need to attach
+                        // the kernel mount ourselves.
+                        #[cfg(target_os = "macos")]
+                        if let TransportInfo::Nfs { port } = transport {
+                            if let Err(e) = mount_nfs_at(&config.mount_root, port) {
+                                warn!(
+                                    error = %format!("{e:#}"),
+                                    port,
+                                    mount_root = %config.mount_root.display(),
+                                    "NFS mount_nfs failed; the NFS server is running \
+                                     on port {port} but the kernel mount could not be \
+                                     attached. Try manually:\n  \
+                                     mount_nfs -o port={port},mountport={port},nolocks,vers=3,actimeo=0 \
+                                     localhost:/ {}",
+                                    config.mount_root.display(),
+                                );
+                                // Keep the attachment alive so the NFS
+                                // server stays running — the user (or
+                                // `kiki kk doctor`) can mount manually.
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = &transport;
+
+                        info!(mount_root = %config.mount_root.display(), "RootFs mount bound");
                         Some(attachment)
                     }
                     Err(e) => {
                         warn!(
                             error = %format!("{e:#}"),
                             mount_root = %config.mount_root.display(),
-                            "failed to bind RootFs FUSE mount; managed workspaces \
+                            "failed to bind RootFs mount; managed workspaces \
                              accessible via gRPC only"
                         );
                         None
@@ -246,7 +335,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
             None
         }
     } else {
-        info!("disable_mount=true: skipping RootFs FUSE mount");
+        info!("disable_mount=true: skipping RootFs mount");
         None
     };
     svc.set_root_fs(root_fs, config.mount_root.clone(), mount_attachment);
@@ -347,6 +436,16 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
         }
     };
 
+    // Cleanup: unmount the managed namespace on macOS. On Linux,
+    // dropping the FUSE MountHandle (inside the service) triggers
+    // fusermount3 -u automatically. On macOS the NFS kernel mount
+    // persists independently of the NFS server task, so we detach
+    // it explicitly before the server is torn down.
+    #[cfg(target_os = "macos")]
+    if !config.disable_mount {
+        unmount_nfs(&config.mount_root);
+    }
+
     // Cleanup: remove socket and PID file.
     if let Err(e) = std::fs::remove_file(&config.socket_path)
         && e.kind() != std::io::ErrorKind::NotFound
@@ -364,7 +463,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
 }
 
 /// Reconstruct the [`RootFs`] from persisted `repos.toml` and per-workspace
-/// `workspace.toml` files. Does not bind a FUSE mount — the caller does
+/// `workspace.toml` files. Does not bind the VFS mount — the caller does
 /// that. Safe to call on first run (no `repos.toml` → empty `RootFs`).
 ///
 /// Failures for individual repos/workspaces are logged and skipped so that

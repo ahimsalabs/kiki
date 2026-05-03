@@ -43,7 +43,8 @@ pub struct VfsManagerConfig {
 pub enum TransportInfo {
     /// FUSE mount succeeded daemon-side; CLI has nothing to do.
     Fuse,
-    /// NFS server bound on `port`; CLI shells out to `mount_nfs`.
+    /// NFS server bound on `port`. For managed workspaces, the daemon
+    /// attaches the kernel mount; for ad-hoc mounts, the CLI does.
     Nfs { port: u16 },
 }
 

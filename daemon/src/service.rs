@@ -397,9 +397,9 @@ pub struct JujutsuService {
     /// Mount root path (e.g. `/mnt/kiki`). Used by `resolve_workspace`
     /// and by RPC handlers to construct workspace paths.
     mount_root: Option<PathBuf>,
-    /// Keeps the single FUSE mount alive for the daemon's lifetime.
-    /// Dropped on daemon shutdown, which unmounts. Also used by
-    /// `require_mount_active()` to gate RPCs that need VFS access.
+    /// Keeps the single VFS mount (FUSE/NFS) alive for the daemon's
+    /// lifetime. Dropped on daemon shutdown, which unmounts. Also used
+    /// by `require_mount_active()` to gate RPCs that need VFS access.
     _mount_attachment: Option<MountAttachment>,
 }
 
@@ -434,7 +434,7 @@ impl JujutsuService {
     /// Set the `RootFs` for managed workspaces (M12). Called during
     /// daemon startup after constructing the service but before
     /// accepting connections. The `mount_attachment` keeps the single
-    /// FUSE mount alive.
+    /// VFS mount (FUSE on Linux, NFS on macOS) alive.
     pub fn set_root_fs(
         &mut self,
         root_fs: Arc<RootFs>,
@@ -698,13 +698,17 @@ impl JujutsuService {
             .as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(not configured)".into());
+        #[cfg(target_os = "macos")]
+        let unmount_hint = format!("umount -f {mount_root}");
+        #[cfg(not(target_os = "macos"))]
+        let unmount_hint = format!("fusermount3 -u {mount_root}");
         Err(Status::failed_precondition(format!(
             "the workspace mount is not active at {mount_root}.\n\n\
              If this is a stale mount, unmount it first:\n  \
-             fusermount3 -u {mount_root}\n\n\
+             {unmount_hint}\n\n\
              Then restart the daemon:\n  \
              kiki kk daemon stop\n\n\
-             Or run `kiki kk setup` to check prerequisites."
+             Or run `kiki kk doctor` to diagnose."
         )))
     }
 
