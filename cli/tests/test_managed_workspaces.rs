@@ -817,3 +817,67 @@ fn git_clone_content_persists_across_restart() {
         "git clone content should survive daemon restart (initial_tree_id persisted)"
     );
 }
+
+/// `git commit` inside a kiki mount should be visible in `kiki log`
+/// via the git import dispatch hook (colocated workflow).
+#[test]
+fn git_commit_visible_in_kiki_log() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let git_remote = create_git_repo_with_content();
+    let git_url = format!("file://{}", git_remote.path().join("repo.git").display());
+
+    let env = ManagedTestEnvironment::new();
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &git_url, "--name", "coloc"],
+    );
+    let ws_path = env.mount_root().join("coloc/default");
+
+    // Establish the HEAD export baseline: any kiki command that triggers a
+    // snapshot will call WriteCommit → export_head, seeding
+    // `last_exported_head`. The clone already does this, but run an
+    // explicit `jj log` to be sure the import hook has run at least once.
+    env.kiki_cmd_ok(&ws_path, &["log", "--no-graph", "--limit", "1"]);
+
+    // Write a file and commit it via stock git (not jj/kiki).
+    // The FUSE mount has different ownership, so git's safe.directory
+    // check must be relaxed.
+    std::fs::write(ws_path.join("colocated.txt"), "git was here\n").unwrap();
+
+    let git_add = std::process::Command::new("git")
+        .args(["-c", "safe.directory=*", "add", "colocated.txt"])
+        .current_dir(&ws_path)
+        .output()
+        .expect("git add");
+    assert!(
+        git_add.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&git_add.stderr)
+    );
+
+    let git_commit = std::process::Command::new("git")
+        .args([
+            "-c", "safe.directory=*",
+            "-c", "user.name=Test User",
+            "-c", "user.email=test@test.com",
+            "commit", "-m", "colocated commit",
+        ])
+        .current_dir(&ws_path)
+        .output()
+        .expect("git commit");
+    assert!(
+        git_commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&git_commit.stderr)
+    );
+
+    // Now `kiki log` should see the commit via the import hook.
+    let (stdout, _) = env.kiki_cmd_ok(&ws_path, &["log", "--no-graph"]);
+    assert!(
+        stdout.contains("colocated commit"),
+        "kiki log should show the git commit; got: {stdout}"
+    );
+}

@@ -15,7 +15,7 @@
 //!   atomic-write-via-temp-then-rename pattern for index segments,
 //!   opheads, and refs; without rename, `jj kk init` fails halfway.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
@@ -70,6 +70,13 @@ fn name_to_string(name: &filename3) -> Result<String, nfsstat3> {
         .map_err(|_| nfsstat3::NFS3ERR_INVAL)
 }
 
+/// uid/gid of the daemon process, captured once at first use.
+/// Single-user mount: every file is owned by the user running the daemon.
+static DAEMON_IDS: LazyLock<(u32, u32)> = LazyLock::new(|| {
+    // SAFETY: getuid/getgid are always safe — no arguments, no failure mode.
+    unsafe { (libc::getuid(), libc::getgid()) }
+});
+
 fn to_fattr3(a: Attr) -> fattr3 {
     let (ftype, mode) = match a.kind {
         FileKind::Regular => (
@@ -84,10 +91,9 @@ fn to_fattr3(a: Attr) -> fattr3 {
         mode,
         // Single hard link — jj's WC isn't multi-rooted.
         nlink: 1,
-        // Owner is whoever is running the daemon. Real uid/gid mapping
-        // arrives whenever multi-user write is on the table; not before.
-        uid: 0,
-        gid: 0,
+        // Owner is the user running the daemon (single-user mount).
+        uid: DAEMON_IDS.0,
+        gid: DAEMON_IDS.1,
         size: a.size,
         used: a.size,
         rdev: specdata3::default(),

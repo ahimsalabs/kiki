@@ -24,7 +24,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -49,6 +49,13 @@ impl FuseAdapter {
         Self { inner }
     }
 }
+
+/// uid/gid of the daemon process, captured once at first use.
+/// Single-user mount: every file is owned by the user running the daemon.
+static DAEMON_IDS: LazyLock<(u32, u32)> = LazyLock::new(|| {
+    // SAFETY: getuid/getgid are always safe — no arguments, no failure mode.
+    unsafe { (libc::getuid(), libc::getgid()) }
+});
 
 /// Cache TTL for entry/attr replies. Set to zero so the kernel
 /// revalidates every `getattr`/`lookup` over the FUSE channel. The
@@ -121,10 +128,9 @@ fn to_file_attr(a: Attr) -> FileAttr {
         kind: file_kind_to_fuse(a.kind),
         perm,
         nlink: 1,
-        // Owner is whoever runs the daemon. Real uid/gid mapping is on
-        // the table only for multi-user setups, which kiki isn't.
-        uid: 0,
-        gid: 0,
+        // Owner is the user running the daemon (single-user mount).
+        uid: DAEMON_IDS.0,
+        gid: DAEMON_IDS.1,
         rdev: 0,
         blksize: 4096,
     }
