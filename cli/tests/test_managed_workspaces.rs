@@ -430,7 +430,7 @@ fn workspace_list_after_clone() {
 
     // Run workspace list from inside the workspace (is_kiki_backend check).
     let ws_path = env.mount_root().join("myrepo/default");
-    let (stdout, _) = env.kiki_cmd_ok(&ws_path, &["workspace", "list"]);
+    let (stdout, _) = env.kiki_cmd_ok(&ws_path, &["kk", "workspace", "list"]);
     assert!(stdout.contains("default"), "workspace list should show 'default'");
 }
 
@@ -453,7 +453,7 @@ fn workspace_create_and_list() {
     let default_path = env.mount_root().join("myrepo/default");
     let (stdout, stderr) = env.kiki_cmd_ok(
         &default_path,
-        &["workspace", "add", "myrepo/feature"],
+        &["kk", "workspace", "create", "myrepo/feature"],
     );
     let combined = format!("{stdout}{stderr}");
     assert!(
@@ -468,7 +468,7 @@ fn workspace_create_and_list() {
     assert!(feature_path.join(".jj").exists());
 
     // List should show both.
-    let (stdout, _) = env.kiki_cmd_ok(&default_path, &["workspace", "list"]);
+    let (stdout, _) = env.kiki_cmd_ok(&default_path, &["kk", "workspace", "list"]);
     assert!(stdout.contains("default"));
     assert!(stdout.contains("feature"));
 }
@@ -490,13 +490,13 @@ fn workspace_delete() {
     let default_path = env.mount_root().join("myrepo/default");
     env.kiki_cmd_ok(
         &default_path,
-        &["workspace", "add", "myrepo/ephemeral"],
+        &["kk", "workspace", "create", "myrepo/ephemeral"],
     );
 
     // Delete the workspace.
     env.kiki_cmd_ok(
         &default_path,
-        &["workspace", "forget", "myrepo/ephemeral"],
+        &["kk", "workspace", "delete", "myrepo/ephemeral"],
     );
 
     // Should no longer appear in FUSE namespace.
@@ -504,7 +504,7 @@ fn workspace_delete() {
     assert!(!ws_path.exists(), "deleted workspace should disappear from FUSE");
 
     // Should not appear in list.
-    let (stdout, _) = env.kiki_cmd_ok(&default_path, &["workspace", "list"]);
+    let (stdout, _) = env.kiki_cmd_ok(&default_path, &["kk", "workspace", "list"]);
     assert!(!stdout.contains("ephemeral"));
     assert!(stdout.contains("default"));
 }
@@ -526,7 +526,7 @@ fn workspace_files_independent() {
     let default_path = env.mount_root().join("myrepo/default");
     env.kiki_cmd_ok(
         &default_path,
-        &["workspace", "add", "myrepo/branch-a"],
+        &["kk", "workspace", "create", "myrepo/branch-a"],
     );
 
     let branch_a_path = env.mount_root().join("myrepo/branch-a");
@@ -621,7 +621,7 @@ fn shared_store_across_workspaces() {
     let default_path = env.mount_root().join("myrepo/default");
     env.kiki_cmd_ok(
         &default_path,
-        &["workspace", "add", "myrepo/ws2"],
+        &["kk", "workspace", "create", "myrepo/ws2"],
     );
 
     // Write and commit a file in the default workspace.
@@ -655,7 +655,7 @@ fn daemon_restart_preserves_state() {
     let ws_path = env.mount_root().join("myrepo/default");
     env.kiki_cmd_ok(
         &ws_path,
-        &["workspace", "add", "myrepo/persist-test"],
+        &["kk", "workspace", "create", "myrepo/persist-test"],
     );
     // Restart daemon.
     env.stop_daemon();

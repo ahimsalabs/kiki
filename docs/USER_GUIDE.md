@@ -22,8 +22,9 @@ graph LR
 - **kiki** (`kiki`): A jj superset binary that talks to the local daemon over
   a Unix domain socket. Stores no persistent data itself. All standard jj
   commands (`kiki log`, `kiki new`, `kiki describe`, `kiki diff`, etc.) work
-  normally. Top-level commands handle repo and workspace lifecycle (`kiki clone`,
-  `kiki workspace`). The `kk` subcommand provides other kiki-specific operations.
+  normally. Top-level commands handle repo lifecycle (`kiki clone`,
+  `kiki remote`). The `kk` subcommand provides kiki-specific operations
+  (`kk workspace`, `kk status`, `kk daemon`).
 - **Daemon**: Long-lived process on the local machine, auto-started on first
   command. Serves a single VFS mount (FUSE on Linux, NFS on macOS) at `~/kiki/`
   containing all repos and workspaces. Manages per-repo git stores (shared
@@ -197,29 +198,35 @@ only track their own checkout pointer and dirty state. Creating a workspace
 is instant.
 
 ```bash
-kiki workspace create <repo>/<workspace> [--revision <rev>]
+kiki kk workspace create <repo>/<workspace>
 ```
 
 Examples:
 
 ```bash
 # Create a workspace for a feature branch
-kiki workspace create myproject/fix-auth
+kiki kk workspace create myproject/fix-auth
 cd ~/kiki/myproject/fix-auth
 
-# Create a workspace at a specific revision
-kiki workspace create myproject/review --revision @--
+# Create a workspace (bare name infers repo from cwd)
+cd ~/kiki/myproject/default
+kiki kk workspace create review
 
 # List workspaces
-kiki workspace list myproject
+kiki kk workspace list myproject
 
 # Delete a workspace
-kiki workspace delete myproject/fix-auth
+kiki kk workspace delete myproject/fix-auth
 ```
 
 The default checkout target is the parents of the source workspace's
-working-copy commit (matching `jj workspace add` behavior). Use
-`--revision` to override.
+working-copy commit (matching `jj workspace add` behavior).
+
+> **Note:** Standard `jj workspace add/forget/list` commands are blocked
+> inside kiki-managed repos and will direct you to use `kiki kk workspace`
+> instead. This is because kiki workspaces go through the daemon and use
+> `repo/workspace` naming, which is incompatible with jj's path-based
+> workspace model.
 
 ### Ad-hoc mounts
 

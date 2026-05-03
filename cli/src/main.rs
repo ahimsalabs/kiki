@@ -69,6 +69,8 @@ enum KikiCommands {
     Daemon(daemon_cmd::DaemonArgs),
     /// Diagnose and repair managed workspace state
     Doctor(DoctorArgs),
+    /// Manage workspaces (create, list, delete)
+    Workspace(WorkspaceCommandArgs),
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -603,10 +605,9 @@ async fn kiki_git_dispatch_hook(
     old_dispatch.call(ui, command_helper).await
 }
 
-/// Dispatch hook for `kiki workspace` — intercepts `jj workspace`
-/// subcommands and routes `create`/`list`/`delete` through the daemon's
-/// managed-workspace RPCs instead of jj's built-in workspace management.
-/// Mirrors the `kiki_git_dispatch_hook` pattern (§12.2 #7).
+/// Dispatch hook for `kiki workspace` — rejects jj's built-in workspace
+/// management commands on kiki-managed repos, directing users to
+/// `kiki kk workspace` instead.
 async fn kiki_workspace_dispatch_hook(
     ui: &mut Ui,
     command_helper: &CommandHelper,
@@ -616,8 +617,14 @@ async fn kiki_workspace_dispatch_hook(
         && is_kiki_backend(command_helper)
     {
         match ws_matches.subcommand_name() {
-            Some("create" | "add") | Some("list") | Some("delete" | "forget") => {
-                return dispatch_kiki_workspace(ui, command_helper).await;
+            Some("add") | Some("list") | Some("forget") => {
+                return Err(user_error(
+                    "jj workspace commands are not supported on kiki-managed repos.\n\n\
+                     Use kiki's workspace management instead:\n\n  \
+                     kiki kk workspace create [repo/]<name>\n  \
+                     kiki kk workspace list [<repo>]\n  \
+                     kiki kk workspace delete [repo/]<name>",
+                ));
             }
             _ => {
                 // Other workspace subcommands (e.g. `workspace root`) fall
@@ -628,61 +635,6 @@ async fn kiki_workspace_dispatch_hook(
     old_dispatch.call(ui, command_helper).await
 }
 
-/// Re-parse workspace args from the raw command line and dispatch to
-/// kiki's managed-workspace implementation.
-async fn dispatch_kiki_workspace(
-    ui: &mut Ui,
-    command_helper: &CommandHelper,
-) -> Result<(), CommandError> {
-    use clap::Parser as _;
-
-    let string_args = command_helper.string_args();
-    let ws_pos = string_args
-        .iter()
-        .position(|s| s == "workspace")
-        .ok_or_else(|| cli_error("internal: 'workspace' not found in command args"))?;
-    let ws_args = &string_args[ws_pos..];
-
-    // Map jj workspace subcommand names to kiki's naming:
-    // `jj workspace add` → `kiki workspace create`
-    // `jj workspace forget` → `kiki workspace delete`
-    let mapped: Vec<String> = ws_args
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            if i == 1 {
-                match s.as_str() {
-                    "add" => "create".to_owned(),
-                    "forget" => "delete".to_owned(),
-                    other => other.to_owned(),
-                }
-            } else {
-                s.clone()
-            }
-        })
-        .collect();
-
-    let parsed = KikiWorkspaceCli::try_parse_from(&mapped).map_err(|e| {
-        user_error(format!(
-            "on kiki-backend repos, workspace management goes through the daemon:\n\n  \
-             workspace create [repo/]<name>\n  \
-             workspace list [<repo>]\n  \
-             workspace delete [repo/]<name>\n\n\
-             {e}"
-        ))
-    })?;
-
-    run_workspace_command(ui, command_helper, WorkspaceCommandArgs { command: parsed.command })
-        .await
-}
-
-/// Top-level clap parser for re-parsing workspace args from raw strings.
-#[derive(clap::Parser, Debug)]
-#[command(name = "workspace")]
-struct KikiWorkspaceCli {
-    #[command(subcommand)]
-    command: WorkspaceCommands,
-}
 
 /// Re-parse git args and dispatch to kiki's daemon-backed implementation.
 async fn dispatch_kiki_git(
@@ -894,6 +846,9 @@ async fn run_kk_command(
             )?;
 
             Ok(())
+        }
+        KikiCommands::Workspace(ws_args) => {
+            run_workspace_command(ui, command_helper, &client, ws_args).await
         }
         KikiCommands::Daemon(_) | KikiCommands::Setup | KikiCommands::Doctor(_) => {
             // Handled above before daemon connection.
@@ -1688,24 +1643,22 @@ async fn run_remote_command(
     }
 }
 
-/// `kiki workspace create/list/delete`
+/// `kiki kk workspace create/list/delete`
 async fn run_workspace_command(
     ui: &mut Ui,
     command_helper: &CommandHelper,
+    client: &BlockingJujutsuInterfaceClient,
     args: WorkspaceCommandArgs,
 ) -> Result<(), CommandError> {
-    let client = daemon_client::connect_or_start(command_helper.settings())
-        .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
-
     match args.command {
         WorkspaceCommands::Create(create_args) => {
-            run_workspace_create(ui, command_helper, &client, create_args).await
+            run_workspace_create(ui, command_helper, client, create_args).await
         }
         WorkspaceCommands::List(list_args) => {
-            run_workspace_list(ui, command_helper, &client, list_args)
+            run_workspace_list(ui, command_helper, client, list_args)
         }
         WorkspaceCommands::Delete(delete_args) => {
-            run_workspace_delete(ui, command_helper, &client, delete_args)
+            run_workspace_delete(ui, command_helper, client, delete_args)
         }
     }
 }

@@ -38,20 +38,25 @@ kiki new -m "add feature"       # this is jj new
 kiki describe -m "fix auth bug" # this is jj describe
 ```
 
-Top-level kiki commands handle repo and workspace lifecycle:
+Top-level kiki commands handle repo and remote lifecycle:
 
 ```bash
-kiki clone git@github.com:org/repo.git  # clone into ~/kiki/repo/default
-kiki workspace create repo/fix  # new workspace at ~/kiki/repo/fix
-kiki workspace list repo        # list workspaces
-kiki workspace delete repo/fix  # remove a workspace
-kiki remote add s3://bucket/repo  # attach a kiki remote for team sync
-kiki remote show                  # show current kiki remote
+kiki clone git@github.com:org/repo.git     # clone into ~/kiki/repo/default
+kiki remote add s3://bucket/repo           # attach a kiki remote for team sync
+kiki remote show                           # show current kiki remote
 ```
 
-The `kk` subcommand handles other kiki-specific operations
-(`kk status`, `kk daemon`). `kk init` creates ad-hoc mounts
-outside the managed namespace.
+The `kk` subcommand handles kiki-specific operations:
+
+```bash
+kiki kk workspace create repo/fix  # new workspace at ~/kiki/repo/fix
+kiki kk workspace list repo        # list workspaces
+kiki kk workspace delete repo/fix  # remove a workspace
+kiki kk status                     # list mounted repos
+kiki kk daemon status              # daemon health
+```
+
+`kk init` creates ad-hoc mounts outside the managed namespace.
 
 ## Git-native storage
 
@@ -92,7 +97,7 @@ and workspaces. `kiki kk daemon status` shows what's running.
 sync, multi-machine sharing via `dir://` / `s3://` / `kiki+ssh://` / `kiki://`,
 git push and fetch to GitHub/GitLab, operation log sharing,
 `.gitignore`-aware VFS, daemon lifecycle, managed workspaces
-(`kiki clone`, `kiki workspace`, single RootFs mount at `~/kiki/`),
+(`kiki clone`, `kiki kk workspace`, single RootFs mount at `~/kiki/`),
 first-class git clone with immediate content materialization,
 colocated git support (`git commit` inside mounts visible in `kiki log`).
 
