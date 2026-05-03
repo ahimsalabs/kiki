@@ -143,10 +143,22 @@ pub(crate) mod inner {
         next_u64() % n == 0
     }
 
-    /// Reset thread-local RNG state. Call between proptest cases to ensure
-    /// each case starts with a fresh RNG derived from the global seed.
+    /// Re-derive this thread's RNG state from the current global seed,
+    /// keeping the same thread ID. Call between proptest cases to ensure
+    /// each case starts fresh. The thread ID is stable so that replaying
+    /// with the same global seed produces the same sequence.
     pub fn reset_thread_local() {
-        THREAD_ID.with(|tid| tid.set(0));
+        THREAD_ID.with(|tid| {
+            let id = tid.get();
+            if id != 0 {
+                // Re-derive RNG from current global seed + same thread ID.
+                let base = SEED.load(Ordering::Relaxed);
+                let s = base ^ id;
+                RNG_STATE.with(|st| st.set(if s == 0 { 1 } else { s }));
+            }
+            // id == 0 means the thread hasn't been seeded yet — the next
+            // should_fire call will trigger ensure_seeded. Nothing to reset.
+        });
     }
 }
 
@@ -191,13 +203,18 @@ pub fn init_from_env() {}
 mod tests {
     use super::inner;
 
-    // Note: these tests use global state (ENABLED, SEED) that may be
-    // modified by other tests running in parallel. Each test runs on a
-    // dedicated thread to isolate thread-local RNG state and controls
-    // enable/disable locally.
+    // These tests mutate global state (ENABLED, SEED). A mutex serializes
+    // them so parallel cargo test threads don't race. The closure still
+    // runs on a dedicated thread to isolate thread-local RNG state.
 
-    /// Run a closure on a dedicated thread to isolate FI state.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a closure on a dedicated thread, serialized against other fi
+    /// tests via `TEST_LOCK`. The lock is held by the calling test thread
+    /// while `.join()` blocks, preventing any other fi test from touching
+    /// ENABLED/SEED until this one finishes.
     fn isolated(f: impl FnOnce() + Send + 'static) {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::thread::spawn(f).join().expect("fi test panicked");
     }
 

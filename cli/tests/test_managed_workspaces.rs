@@ -27,6 +27,9 @@
 //! | `git_clone_imports_bookmarks` | bookmarks visible in `jj bookmark list` after git clone |
 //! | `git_clone_imports_multiple_bookmarks` | all remote branches imported after git clone |
 //! | `git_clone_wc_parented_at_default_branch` | WC `@` parented at default branch, not root |
+//! | `sigkill_daemon_recovery` | SIGKILL crash recovery with stale FUSE mount cleanup |
+//! | `graceful_shutdown_under_load` | SIGTERM with active readers; clean unmount |
+//! | `crash_during_write_preserves_snapshot` | SIGKILL during write; snapshotted data intact |
 
 use std::path::{Path, PathBuf};
 
@@ -244,6 +247,44 @@ impl ManagedTestEnvironment {
         // Explicitly unmount all FUSE mounts under env_root — killing the
         // daemon leaves stale mounts (both the RootFs mount at mount_root
         // and any per-repo mounts from Initialize RPCs).
+        self.cleanup_stale_mounts();
+        // Wait for mount_root to be cleaned up (restart tests need this).
+        for _ in 0..50 {
+            if !is_mountpoint(&self.mount_root) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// SIGKILL the daemon without cleaning up mounts — simulates a hard
+    /// crash. Leaves stale FUSE mounts in place so the next daemon
+    /// startup exercises `cleanup_stale_mount`.
+    pub fn crash_daemon(&mut self) {
+        let _ = self.daemon_child.kill(); // SIGKILL
+        let _ = self.daemon_child.wait();
+        // Deliberately do NOT unmount — the stale mount is the test fixture.
+    }
+
+    /// Send SIGTERM for graceful shutdown and wait for exit. The daemon
+    /// should unmount cleanly on its own.
+    #[cfg(unix)]
+    pub fn graceful_stop_daemon(&mut self) {
+        send_signal(&self.daemon_child, libc::SIGTERM);
+        // Wait for the daemon to exit gracefully (up to 10 s).
+        for _ in 0..100 {
+            match self.daemon_child.try_wait() {
+                Ok(Some(_)) => return,
+                _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+        // Timed out — force kill.
+        let _ = self.daemon_child.kill();
+        let _ = self.daemon_child.wait();
+    }
+
+    /// Unmount all FUSE mounts under env_root via /proc/self/mountinfo.
+    fn cleanup_stale_mounts(&self) {
         let prefix = self.env_root.to_str().unwrap();
         if let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") {
             for line in info.lines() {
@@ -254,13 +295,6 @@ impl ManagedTestEnvironment {
                         .status();
                 }
             }
-        }
-        // Wait for mount_root to be cleaned up (restart tests need this).
-        for _ in 0..50 {
-            if !is_mountpoint(&self.mount_root) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
@@ -314,6 +348,14 @@ impl ManagedTestEnvironment {
                 format!("$TEST_ENV{}", caps[1].replace('\\', "/"))
             })
             .to_string()
+    }
+}
+
+/// Send a specific signal to the daemon process without waiting.
+#[cfg(unix)]
+fn send_signal(child: &std::process::Child, sig: i32) {
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, sig);
     }
 }
 
@@ -1176,5 +1218,222 @@ fn git_clone_wc_parented_at_default_branch() {
     assert!(
         log_out.contains("main"),
         "jj log should show 'main' bookmark label; got:\n{log_out}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Mount lifecycle tests
+// ──────────────────────────────────────────────────────────────────────
+
+/// SIGKILL the daemon (simulating a crash or OOM kill) while it has an
+/// active FUSE mount with committed data. Verify:
+///   1. The stale FUSE mount (ENOTCONN) is left behind after kill.
+///   2. A new daemon starts successfully — `cleanup_stale_mount` handles
+///      the stale mountpoint.
+///   3. The workspace reappears with committed data intact.
+#[test]
+fn sigkill_daemon_recovery() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let mut env = ManagedTestEnvironment::new();
+    let remote = create_dir_remote();
+    let remote_url = format!("dir://{}", remote.path().canonicalize().unwrap().display());
+
+    // Clone and commit a file so there's data to recover.
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &remote_url, "--name", "crash-test"],
+    );
+    let ws_path = env.mount_root().join("crash-test/default");
+    std::fs::write(ws_path.join("important.txt"), "do not lose me\n").unwrap();
+    env.kiki_cmd_ok(&ws_path, &["new"]);
+
+    // Verify the file exists before the crash.
+    let content = std::fs::read_to_string(ws_path.join("important.txt")).unwrap();
+    assert_eq!(content, "do not lose me\n");
+
+    // ── Crash: SIGKILL without cleanup ──
+    env.crash_daemon();
+
+    // The mount_root should now be a stale FUSE mount. On Linux, stat()
+    // returns ENOTCONN, so metadata() fails but the inode exists.
+    assert!(
+        !is_mountpoint(&env.mount_root()),
+        "after SIGKILL, stat() on stale FUSE mount should fail \
+         (ENOTCONN), so is_mountpoint returns false"
+    );
+
+    // Attempting to read from the stale mount should fail.
+    assert!(
+        std::fs::read_dir(&env.mount_root()).is_err(),
+        "read_dir on stale FUSE mount should return ENOTCONN"
+    );
+
+    // ── Recovery: start a new daemon ──
+    // Remove stale socket so the new daemon can bind.
+    let _ = std::fs::remove_file(env.env_root().join("daemon.sock"));
+    env.start_daemon();
+
+    // The workspace should reappear with data intact.
+    let ws_path = env.mount_root().join("crash-test/default");
+    assert!(ws_path.exists(), "workspace should reappear after crash recovery");
+    let content = std::fs::read_to_string(ws_path.join("important.txt")).unwrap();
+    assert_eq!(
+        content, "do not lose me\n",
+        "committed data should survive SIGKILL + daemon restart"
+    );
+}
+
+/// SIGTERM the daemon (graceful shutdown) while background threads are
+/// reading files from the FUSE mount. Verify:
+///   1. The daemon shuts down cleanly (explicit fusermount3 -u in
+///      shutdown path).
+///   2. No stale mount is left behind.
+///   3. A new daemon starts and data is intact.
+///
+/// This tests the shutdown path in `run_daemon` (lib.rs lines 510-524)
+/// where explicit unmount runs before tokio runtime teardown.
+#[test]
+fn graceful_shutdown_under_load() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let mut env = ManagedTestEnvironment::new();
+    let remote = create_dir_remote();
+    let remote_url = format!("dir://{}", remote.path().canonicalize().unwrap().display());
+
+    // Clone, write files, and commit.
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &remote_url, "--name", "shutdown-test"],
+    );
+    let ws_path = env.mount_root().join("shutdown-test/default");
+    for i in 0..5 {
+        std::fs::write(
+            ws_path.join(format!("file_{i}.txt")),
+            format!("content {i}\n"),
+        )
+        .unwrap();
+    }
+    env.kiki_cmd_ok(&ws_path, &["new"]);
+
+    // Start background readers that continuously read files from the
+    // mount while we send SIGTERM. Each thread loops until the mount
+    // becomes inaccessible (which is expected during shutdown).
+    let mount_root = env.mount_root().to_path_buf();
+    let readers: Vec<_> = (0..3)
+        .map(|i| {
+            let ws = mount_root.join("shutdown-test/default");
+            std::thread::spawn(move || {
+                let path = ws.join(format!("file_{i}.txt"));
+                let mut reads = 0u64;
+                loop {
+                    match std::fs::read_to_string(&path) {
+                        Ok(_) => reads += 1,
+                        Err(_) => break, // Mount gone — shutdown happened.
+                    }
+                    // Small sleep to avoid spinning too hard.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                reads
+            })
+        })
+        .collect();
+
+    // Give readers a moment to start.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // ── Graceful shutdown: SIGTERM ──
+    env.graceful_stop_daemon();
+
+    // Wait for reader threads to notice the mount is gone.
+    for handle in readers {
+        let reads = handle.join().expect("reader thread panicked");
+        assert!(reads > 0, "reader should have completed at least one read before shutdown");
+    }
+
+    // After graceful shutdown, the mount should be cleanly unmounted.
+    // Give the kernel a moment to process the unmount.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !is_mountpoint(&env.mount_root()),
+        "mount should be cleanly unmounted after graceful SIGTERM shutdown"
+    );
+
+    // ── Recovery: start a new daemon ──
+    let _ = std::fs::remove_file(env.env_root().join("daemon.sock"));
+    env.start_daemon();
+
+    let ws_path = env.mount_root().join("shutdown-test/default");
+    assert!(ws_path.exists(), "workspace should reappear after graceful restart");
+    for i in 0..5 {
+        let content =
+            std::fs::read_to_string(ws_path.join(format!("file_{i}.txt"))).unwrap();
+        assert_eq!(
+            content,
+            format!("content {i}\n"),
+            "file_{i}.txt should survive graceful shutdown + restart"
+        );
+    }
+}
+
+/// Verify that a hard crash (SIGKILL) during an active write doesn't
+/// corrupt persisted state. Uncommitted writes may be lost (expected),
+/// but previously snapshotted data must survive.
+#[test]
+fn crash_during_write_preserves_snapshot() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let mut env = ManagedTestEnvironment::new();
+    let remote = create_dir_remote();
+    let remote_url = format!("dir://{}", remote.path().canonicalize().unwrap().display());
+
+    // Clone and commit a baseline file.
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &remote_url, "--name", "write-crash"],
+    );
+    let ws_path = env.mount_root().join("write-crash/default");
+    std::fs::write(ws_path.join("committed.txt"), "safe\n").unwrap();
+    env.kiki_cmd_ok(&ws_path, &["new"]); // Triggers snapshot.
+
+    // Write another file WITHOUT committing — this is the "in-flight" write.
+    std::fs::write(ws_path.join("uncommitted.txt"), "might lose this\n").unwrap();
+
+    // ── Crash ──
+    env.crash_daemon();
+
+    // ── Recovery ──
+    let _ = std::fs::remove_file(env.env_root().join("daemon.sock"));
+    env.start_daemon();
+
+    let ws_path = env.mount_root().join("write-crash/default");
+    assert!(ws_path.exists(), "workspace should reappear after crash");
+
+    // The committed file must survive.
+    let content = std::fs::read_to_string(ws_path.join("committed.txt")).unwrap();
+    assert_eq!(
+        content, "safe\n",
+        "snapshotted file must survive crash"
+    );
+
+    // The uncommitted file may or may not survive — the crash model
+    // doesn't guarantee in-flight writes. We only assert no corruption:
+    // reading the filesystem doesn't panic or return garbage for known files.
+    let entries: Vec<String> = std::fs::read_dir(&ws_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".jj")
+        .collect();
+    // committed.txt must be present; uncommitted.txt presence is undefined.
+    assert!(
+        entries.contains(&"committed.txt".to_string()),
+        "committed.txt must appear in directory listing; got: {entries:?}"
     );
 }

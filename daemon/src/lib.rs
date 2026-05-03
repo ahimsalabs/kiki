@@ -82,16 +82,24 @@ impl DaemonConfig {
 /// the directory inode exists but the VFS connection is dead — on Linux
 /// FUSE returns ENOTCONN, on macOS NFS returns ESTALE or hangs on the
 /// dead TCP endpoint.
+///
+/// Platform-specific strategy:
+/// - **Linux**: `stat()` on a stale FUSE mount returns `ENOTCONN`
+///   immediately, so `path.exists()` is a safe fast-path to skip cleanup
+///   when the mount is live or the path is a plain directory.
+/// - **macOS**: `stat()` on a dead NFS mount hangs until the TCP
+///   connection times out (30–60 s), so we must NOT call `path.exists()`.
+///   Instead, always attempt `umount -f` — it's fast and harmless when
+///   the path isn't a mountpoint.
 fn cleanup_stale_mount(path: &std::path::Path) {
-    // Quick check: if stat succeeds, the mount is either live or it's a
-    // plain directory — either way, nothing to clean up.
-    if path.exists() {
-        return;
-    }
-    // The inode exists (create_dir_all returned AlreadyExists) but stat
-    // failed — likely a stale mount. Try platform-appropriate unmount.
     #[cfg(target_os = "linux")]
     {
+        // On Linux, stat() returns ENOTCONN immediately for a stale FUSE
+        // mount. If exists() returns true the mount is healthy or it's a
+        // plain directory — either way, nothing to clean up.
+        if path.exists() {
+            return;
+        }
         match std::process::Command::new("fusermount3")
             .args(["-u", &path.to_string_lossy()])
             .output()
@@ -121,7 +129,8 @@ fn cleanup_stale_mount(path: &std::path::Path) {
     }
     #[cfg(target_os = "macos")]
     {
-        // Force-unmount to avoid hanging on a dead NFS server.
+        // DO NOT call path.exists() here — stat() on a dead NFS mount
+        // hangs until TCP timeout. Force-unmount is idempotent and fast.
         match std::process::Command::new("umount")
             .args(["-f", &path.to_string_lossy()])
             .output()
@@ -132,7 +141,7 @@ fn cleanup_stale_mount(path: &std::path::Path) {
                     "cleaned up stale NFS mount"
                 );
             }
-            _ => {} // Best-effort on macOS.
+            _ => {} // Not a mountpoint, or umount failed — best-effort.
         }
     }
 }
