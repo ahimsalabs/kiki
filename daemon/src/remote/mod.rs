@@ -10,7 +10,7 @@
 //!
 //! Backends ship in [`fs`] (filesystem, `dir://` scheme), [`grpc`]
 //! (peer daemon, `kiki://` / `grpc://` scheme), and [`ssh`]
-//! (SSH transport, `ssh://` scheme) — see PLAN.md §13.3.
+//! (SSH transport, `kiki+ssh://` scheme) — see PLAN.md §13.3.
 
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ mod sync_sim_tests;
 /// - `dir:///abs/path` → filesystem-backed remote.
 /// - `kiki://host:port` or `grpc://host:port` → peer daemon gRPC.
 ///
-/// `ssh://` and `s3://` URLs are NOT handled here — they require async
+/// `kiki+ssh://` and `s3://` URLs are NOT handled here — they require async
 /// setup. Use [`establish_ssh_remote()`] for SSH remotes and
 /// [`establish_s3_remote()`] for S3 remotes. This function returns
 /// `Err` for both to prevent accidental misuse.
@@ -46,7 +46,7 @@ pub fn parse(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
     let (scheme, rest) = remote
         .split_once("://")
         .ok_or_else(|| anyhow!(
-            "remote {remote:?} has no scheme; expected dir://…, s3://…, ssh://…, kiki://…, or grpc://…"
+            "remote {remote:?} has no scheme; expected dir://…, s3://…, kiki+ssh://…, kiki://…, or grpc://…"
         ))?;
     match scheme {
         "dir" => {
@@ -67,9 +67,9 @@ pub fn parse(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
             Ok(Some(Arc::new(grpc::GrpcRemoteStore::new(rest)?)
                 as Arc<dyn RemoteStore>))
         }
-        "ssh" => {
+        "kiki+ssh" => {
             Err(anyhow!(
-                "ssh:// remotes require async tunnel establishment; \
+                "kiki+ssh:// remotes require async tunnel establishment; \
                  use establish_ssh_remote() instead of parse()"
             ))
         }
@@ -83,34 +83,34 @@ pub fn parse(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
     }
 }
 
-/// Parse an `ssh://` URL into its (user, host, path) components.
+/// Parse a `kiki+ssh://` URL into its (user, host, path) components.
 ///
-/// Returns `None` if the URL is not an `ssh://` URL.
-/// Returns `Err` for malformed `ssh://` URLs.
-pub fn parse_ssh_url(remote: &str) -> Result<Option<(String, String, String)>> {
-    let Some(rest) = remote.strip_prefix("ssh://") else {
+/// Returns `None` if the URL is not a `kiki+ssh://` URL.
+/// Returns `Err` for malformed `kiki+ssh://` URLs.
+pub fn parse_kiki_ssh_url(remote: &str) -> Result<Option<(String, String, String)>> {
+    let Some(rest) = remote.strip_prefix("kiki+ssh://") else {
         return Ok(None);
     };
     let (authority, path) = rest.split_once('/').ok_or_else(|| {
-        anyhow!("ssh:// remote requires host/path (got ssh://{rest})")
+        anyhow!("kiki+ssh:// remote requires host/path (got kiki+ssh://{rest})")
     })?;
     let path = format!("/{path}");
     if authority.is_empty() {
-        return Err(anyhow!("ssh:// remote requires host (got empty authority)"));
+        return Err(anyhow!("kiki+ssh:// remote requires host (got empty authority)"));
     }
     let (user, host) = match authority.split_once('@') {
         Some((u, h)) => (u.to_owned(), h.to_owned()),
         None => (String::new(), authority.to_owned()),
     };
     if host.is_empty() {
-        return Err(anyhow!("ssh:// remote requires non-empty host"));
+        return Err(anyhow!("kiki+ssh:// remote requires non-empty host"));
     }
     Ok(Some((user, host, path)))
 }
 
 /// Establish an SSH tunnel and return a `RemoteStore` connected through it.
 ///
-/// This is the async counterpart to `parse()` for `ssh://` URLs. It:
+/// This is the async counterpart to `parse()` for `kiki+ssh://` URLs. It:
 /// 1. Parses the URL into (user, host, path).
 /// 2. Establishes a persistent SSH tunnel to the remote daemon.
 /// 3. Connects a `GrpcRemoteStore` to the forwarded local socket.
@@ -123,8 +123,8 @@ pub async fn establish_ssh_remote(
     remote: &str,
     tunnels_dir: &std::path::Path,
 ) -> Result<(Arc<dyn RemoteStore>, tunnel::SshTunnel)> {
-    let (user, host, path) = parse_ssh_url(remote)?
-        .ok_or_else(|| anyhow!("not an ssh:// URL: {remote:?}"))?;
+    let (user, host, path) = parse_kiki_ssh_url(remote)?
+        .ok_or_else(|| anyhow!("not a kiki+ssh:// URL: {remote:?}"))?;
 
     let tun = tunnel::SshTunnel::establish(&user, &host, &path, tunnels_dir).await?;
 
@@ -230,50 +230,51 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_ssh_scheme() {
-        // ssh:// is handled by the async establish_ssh_remote() path,
+    fn parse_rejects_kiki_ssh_scheme() {
+        // kiki+ssh:// is handled by the async establish_ssh_remote() path,
         // not the synchronous parse(). parse() must reject it.
-        let err = parse("ssh://cbro@myserver.com/data/store").unwrap_err();
+        let err = parse("kiki+ssh://cbro@myserver.com/data/store").unwrap_err();
         assert!(err.to_string().contains("establish_ssh_remote"), "got: {err}");
     }
 
     #[test]
-    fn parse_ssh_url_with_user() {
-        let (user, host, path) = parse_ssh_url("ssh://cbro@myserver.com/data/kiki-store")
+    fn parse_kiki_ssh_url_with_user() {
+        let (user, host, path) = parse_kiki_ssh_url("kiki+ssh://cbro@myserver.com/data/kiki-store")
             .unwrap()
-            .expect("ssh:// returns Some");
+            .expect("kiki+ssh:// returns Some");
         assert_eq!(user, "cbro");
         assert_eq!(host, "myserver.com");
         assert_eq!(path, "/data/kiki-store");
     }
 
     #[test]
-    fn parse_ssh_url_without_user() {
-        let (user, host, path) = parse_ssh_url("ssh://myserver/data/store")
+    fn parse_kiki_ssh_url_without_user() {
+        let (user, host, path) = parse_kiki_ssh_url("kiki+ssh://myserver/data/store")
             .unwrap()
-            .expect("ssh:// without user returns Some");
+            .expect("kiki+ssh:// without user returns Some");
         assert_eq!(user, "");
         assert_eq!(host, "myserver");
         assert_eq!(path, "/data/store");
     }
 
     #[test]
-    fn parse_ssh_url_no_path_rejected() {
-        let err = parse_ssh_url("ssh://user@host").unwrap_err();
+    fn parse_kiki_ssh_url_no_path_rejected() {
+        let err = parse_kiki_ssh_url("kiki+ssh://user@host").unwrap_err();
         assert!(err.to_string().contains("host/path"), "got: {err}");
     }
 
     #[test]
-    fn parse_ssh_url_empty_authority_rejected() {
-        let err = parse_ssh_url("ssh:///path").unwrap_err();
+    fn parse_kiki_ssh_url_empty_authority_rejected() {
+        let err = parse_kiki_ssh_url("kiki+ssh:///path").unwrap_err();
         assert!(err.to_string().contains("host"), "got: {err}");
     }
 
     #[test]
-    fn parse_ssh_url_returns_none_for_non_ssh() {
-        assert!(parse_ssh_url("grpc://host:1234").unwrap().is_none());
-        assert!(parse_ssh_url("dir:///path").unwrap().is_none());
-        assert!(parse_ssh_url("").unwrap().is_none());
+    fn parse_kiki_ssh_url_returns_none_for_non_kiki_ssh() {
+        assert!(parse_kiki_ssh_url("grpc://host:1234").unwrap().is_none());
+        assert!(parse_kiki_ssh_url("dir:///path").unwrap().is_none());
+        assert!(parse_kiki_ssh_url("ssh://host/path").unwrap().is_none());
+        assert!(parse_kiki_ssh_url("").unwrap().is_none());
     }
 
     #[test]
@@ -296,7 +297,7 @@ mod tests {
         assert!(is_s3_url("s3://bucket/prefix"));
         assert!(is_s3_url("s3://bucket"));
         assert!(!is_s3_url("dir:///path"));
-        assert!(!is_s3_url("ssh://host/path"));
+        assert!(!is_s3_url("kiki+ssh://host/path"));
         assert!(!is_s3_url(""));
     }
 }

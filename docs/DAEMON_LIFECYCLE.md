@@ -232,14 +232,14 @@ When `KIKI_SOCKET_PATH` is set, the CLI:
 - Skips auto-start (the user owns the daemon lifecycle).
 - Errors clearly if the socket is not connectable.
 
-## SSH remote access (`ssh://`)
+## SSH remote access (`kiki+ssh://`)
 
 ### Goal
 
 Match git's SSH UX: a single URL, no manual tunnels, no port config.
 
 ```bash
-kiki kk init ssh://user@my-server/myproject ~/work/myproject
+kiki kk init kiki+ssh://user@my-server/myproject ~/work/myproject
 ```
 
 The user never thinks about ports, sockets, or tunnels.
@@ -250,7 +250,7 @@ OpenSSH 6.7+ supports Unix socket forwarding (`-L local.sock:remote.sock`).
 The CLI uses this to bridge to the remote daemon's UDS — no TCP port
 needed on either end.
 
-Full flow when the CLI sees an `ssh://` URL:
+Full flow when the CLI sees an `kiki+ssh://` URL:
 
 ```
 1. ssh user@host kiki kk daemon socket-path
@@ -305,7 +305,7 @@ CLI invocations reconnect to the existing tunnel.
 
 ### Comparison with git
 
-| | git | kiki (ssh://) |
+| | git | kiki (kiki+ssh://) |
 |---|---|---|
 | Remote process | `git-upload-pack` (stdin/stdout) | daemon (UDS, auto-started) |
 | Port required | No | No |
@@ -337,13 +337,13 @@ having shell access.
 - The daemon listens on a single port for SSH connections
 - SSH keys map to kiki identities (ties into [`AUTH.md`](./AUTH.md))
 - The SSH server only speaks the kiki protocol — no shell, no exec
-- `ssh://` URLs connect to the built-in server instead of OpenSSH
+- `kiki+ssh://` URLs connect to the built-in server instead of OpenSSH
 - Same port can serve git smart HTTP (post-convergence) and the
   kiki gRPC protocol — one port, three protocols, discriminated
   by the initial bytes
 
 **What stays the same:**
-- The `ssh://` URL scheme and CLI UX
+- The `kiki+ssh://` URL scheme and CLI UX
 - SSH key-based auth
 - The daemon's internal architecture (the SSH server is just another
   listener feeding into the same gRPC service)

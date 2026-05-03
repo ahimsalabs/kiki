@@ -335,6 +335,17 @@ impl BlockingJujutsuInterfaceClient {
         rt.block_on(client.git_detect_head_change(request))
     }
 
+    // ---- M13: first-class git clone ------------------------------------
+
+    pub fn git_clone(
+        &self,
+        request: impl tonic::IntoRequest<GitCloneReq>,
+    ) -> Result<tonic::Response<GitCloneReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.git_clone(request))
+    }
+
     // ---- M12: managed-workspace RPCs ---------------------------------
 
     /// Calls the proto `Clone` RPC. Named `clone_repo` to avoid

@@ -13,7 +13,7 @@ backed by a daemon that handles storage, caching, and remote synchronization.
 ```mermaid
 graph LR
     CLI["kiki<br/>(jj superset)"] -- "gRPC (UDS)" --> Daemon
-    Daemon -- "dir:// / s3:// / ssh:// / kiki://" --> Remote["Remote Store"]
+    Daemon -- "dir:// / s3:// / kiki+ssh:// / kiki://" --> Remote["Remote Store"]
     Daemon -- "single FUSE mount" --> VFS["/mnt/kiki/<br/>repo/workspace/"]
 ```
 
@@ -27,9 +27,9 @@ graph LR
   workspaces. Manages per-repo git stores (shared across workspaces), a durable
   redb database, and optionally syncs blobs and operation state to a remote.
   No manual configuration needed.
-- **Remote** (`dir://`, `s3://`, `ssh://`, or `kiki://`): Content-addressed
+- **Remote** (`dir://`, `s3://`, `kiki+ssh://`, or `kiki://`): Content-addressed
   blob store with compare-and-swap mutable refs. `s3://` remotes use the AWS
-  SDK default credential chain. `ssh://` remotes need only the `kiki` binary on
+  SDK default credential chain. `kiki+ssh://` remotes need only the `kiki` binary on
   the server — the local daemon manages a persistent SSH tunnel to the remote
   daemon. `kiki://` remotes connect to a running daemon on another machine
   (e.g., over Tailscale).
@@ -118,22 +118,43 @@ A single FUSE mount at `/mnt/kiki/` serves all repos and workspaces.
 kiki clone <url> [--name <name>]
 ```
 
-**`<url>`** is the remote store URL. Supported schemes:
+**`<url>`** can be a git remote or a kiki-native remote:
 
-| Scheme    | Example                          | Description |
-|-----------|----------------------------------|-------------|
-| `dir://`  | `dir:///tmp/kiki-remote`         | Filesystem-backed remote. Good for local testing and single-machine use. |
-| `s3://`   | `s3://my-bucket/repos/project`   | S3-backed remote. Uses AWS SDK credentials and bucket permissions. |
-| `ssh://`  | `ssh://user@host/data/store`     | SSH transport. Needs only the `kiki` binary on the server. The local daemon manages a persistent SSH tunnel. |
-| `kiki://` | `kiki://myserver:12000`          | Another kiki daemon's gRPC endpoint. Enables peer-to-peer sync (e.g., over Tailscale). |
-| `grpc://` | `grpc://[::1]:12000`             | Alias for `kiki://`. |
+**Git remotes** (fetched via `git fetch`, explicit push/pull):
+
+| Scheme          | Example                                  | Description |
+|-----------------|------------------------------------------|-------------|
+| `https://`      | `https://github.com/org/repo.git`        | Git over HTTPS. |
+| `ssh://`        | `ssh://git@github.com/org/repo.git`      | Git over SSH. |
+| SCP-style       | `git@github.com:org/repo.git`            | Git over SSH (shorthand). |
+
+**Kiki-native remotes** (real-time sync, full-fidelity):
+
+| Scheme          | Example                                  | Description |
+|-----------------|------------------------------------------|-------------|
+| `dir://`        | `dir:///tmp/kiki-remote`                 | Filesystem-backed remote. Good for local testing and single-machine use. |
+| `s3://`         | `s3://my-bucket/repos/project`           | S3-backed remote. Uses AWS SDK credentials and bucket permissions. |
+| `kiki+ssh://`   | `kiki+ssh://user@host/data/store`        | SSH transport to another kiki daemon. The local daemon manages a persistent SSH tunnel. |
+| `kiki://`       | `kiki://myserver:12000`                  | Another kiki daemon's gRPC endpoint. Enables peer-to-peer sync (e.g., over Tailscale). |
+| `grpc://`       | `grpc://[::1]:12000`                     | Alias for `kiki://`. |
 
 **`--name`** overrides the repo name (default: derived from the URL's last
 path component). The repo name becomes a directory under `/mnt/kiki/`.
 
+**`--remote`** (git clones only) attaches a kiki-native remote for real-time
+sync alongside the git origin.
+
 Examples:
 
 ```bash
+# Clone from GitHub
+kiki clone git@github.com:myorg/my-project.git
+cd /mnt/kiki/my-project/default
+
+# Clone from GitHub with a kiki remote for team sync
+kiki clone git@github.com:myorg/my-project.git --remote s3://team-bucket/my-project
+cd /mnt/kiki/my-project/default
+
 # Clone from a filesystem remote
 kiki clone "dir:///shared/kiki-store"
 cd /mnt/kiki/kiki-store/default
@@ -142,12 +163,12 @@ cd /mnt/kiki/kiki-store/default
 kiki clone "s3://my-bucket/repos/my-project"
 cd /mnt/kiki/my-project/default
 
-# Clone over SSH
-kiki clone "ssh://user@myserver/data/myproject"
+# Clone over kiki+ssh
+kiki clone "kiki+ssh://user@myserver/data/myproject"
 cd /mnt/kiki/myproject/default
 
 # Clone with a custom name
-kiki clone "ssh://user@myserver/data/myproject" --name mp
+kiki clone "kiki+ssh://user@myserver/data/myproject" --name mp
 cd /mnt/kiki/mp/default
 
 # Clone from another daemon (e.g., over Tailscale)
@@ -266,7 +287,7 @@ kiki kk status
 ## Multi-user / multi-machine sync
 
 When two CLIs point at the same remote (e.g., an `s3://` bucket prefix, a shared
-`ssh://` server, a `dir://` path, or a `kiki://` peer), kiki serializes
+`kiki+ssh://` server, a `dir://` path, or a `kiki://` peer), kiki serializes
 operation-log advances via compare-and-swap on the remote's mutable ref catalog.
 This means:
 
@@ -310,18 +331,18 @@ kiki kk init "s3://my-bucket/repos/project" project
 # Both machines see each other's commits and operations
 ```
 
-### Example: two machines sharing an ssh:// remote
+### Example: two machines sharing a kiki+ssh:// remote
 
 No daemon needed on the server. Each machine SSHes to the server and
 reads/writes the shared store directory directly:
 
 ```bash
 # Machine A
-kiki clone "ssh://user@server/data/myproject"
+kiki clone "kiki+ssh://user@server/data/myproject"
 cd /mnt/kiki/myproject/default
 
 # Machine B
-kiki clone "ssh://user@server/data/myproject"
+kiki clone "kiki+ssh://user@server/data/myproject"
 cd /mnt/kiki/myproject/default
 
 # Both machines see each other's commits and operations
@@ -344,31 +365,24 @@ cd /mnt/kiki/project/default
 
 ## Working with GitHub
 
-After git convergence (in progress), kiki repos store content as git
-objects. You can add GitHub as a git remote and push/fetch using
-standard git protocol.
-
-### Setup
+Clone directly from GitHub:
 
 ```bash
-# Clone a local repo (no kiki remote)
-kiki clone "dir:///tmp/my-project-store" --name my-project
+kiki clone git@github.com:yourorg/my-project.git
 cd /mnt/kiki/my-project/default
-
-# Create a GitHub repo (or use an existing one)
-# Then add it as a remote:
-kiki git remote add origin git@github.com:yourorg/my-project.git
 ```
+
+This creates the repo with `origin` pointing at GitHub. No intermediate
+kiki remote needed.
 
 ### Push to GitHub
 
 ```bash
 # Work normally
-kiki new -m "add feature"
 mkdir src && echo 'fn main() {}' > src/main.rs
 kiki describe -m "initial commit"
 
-# Push to GitHub
+# Push to GitHub (uses your SSH keys / credentials)
 kiki git push --remote origin --bookmark main
 ```
 
@@ -381,6 +395,29 @@ kiki git fetch --remote origin
 # See what came in
 kiki log
 ```
+
+### Team setup with a kiki remote
+
+For real-time sync between team members, combine a git origin with a
+kiki remote:
+
+```bash
+# First developer sets up the project
+kiki clone git@github.com:yourorg/my-project.git \
+    --remote kiki://team-server:12000
+cd /mnt/kiki/my-project/default
+
+# Other developers clone from the kiki remote — git origin is
+# inherited automatically
+kiki clone kiki://team-server:12000 --name my-project
+cd /mnt/kiki/my-project/default
+kiki git remote list
+#   origin  git@github.com:yourorg/my-project.git
+```
+
+The kiki remote carries the full jj operation log, change-ids, and
+commit evolution history. The git remote is a lossy publication channel
+for the wider git ecosystem.
 
 ### Collaborating with non-kiki users
 
@@ -396,11 +433,11 @@ You fetch their work into your kiki workspace with `kiki git fetch`.
 
 ## Syncing over SSH
 
-Use an `ssh://` URL to sync with a remote machine. Only the `kiki` binary
+Use a `kiki+ssh://` URL to sync with a remote machine. Only the `kiki` binary
 needs to be on the server.
 
 ```bash
-kiki clone ssh://user@my-server/data/myproject
+kiki clone kiki+ssh://user@my-server/data/myproject
 cd /mnt/kiki/myproject/default
 
 # Work normally — syncs to the server over SSH
@@ -413,7 +450,7 @@ through the shared store on the server.
 
 ### How it works
 
-On `kiki clone ssh://...`, the local daemon:
+On `kiki clone kiki+ssh://...`, the local daemon:
 
 1. **Discovers** the remote socket: `ssh user@host kiki kk daemon socket-path`
 2. **Starts** the remote daemon if not running: `ssh user@host kiki kk daemon run --managed`
@@ -442,7 +479,7 @@ daemons sharing the same remote serialize ref updates via compare-and-swap.
 - **No auth or TLS on kiki:// (gRPC).** The daemon listens on localhost only
   by default. For `kiki://` remotes on a LAN or Tailscale, the network
   provides the trust boundary. Don't expose the gRPC port to untrusted
-  networks. `ssh://` remotes inherit SSH's authentication and encryption.
+  networks. `kiki+ssh://` remotes inherit SSH's authentication and encryption.
 - **S3-compatible backend requirements.** `s3://` remotes rely on conditional
   object writes/deletes for ref compare-and-swap. AWS S3 supports this; S3-like
   services must support `If-Match` / `If-None-Match` on object writes and
@@ -495,7 +532,7 @@ kiki kk daemon logs -f
 ```
 
 **SSH tunnel issues**
-If an `ssh://` remote fails to connect:
+If a `kiki+ssh://` remote fails to connect:
 ```bash
 # Test SSH connectivity manually
 ssh user@host kiki kk daemon socket-path

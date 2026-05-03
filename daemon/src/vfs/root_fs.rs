@@ -989,7 +989,7 @@ mod tests {
         let store = test_store();
         fs.register_repo(
             "monorepo".into(),
-            "ssh://server/mono".into(),
+            "kiki+ssh://server/mono".into(),
             store,
             None,
         );

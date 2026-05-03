@@ -4,7 +4,7 @@ A virtual filesystem for your repos. Built on
 [jj](https://jj-vcs.github.io/jj/latest/), stored as git.
 
 ```bash
-kiki clone ssh://devbox/repos/myproject
+kiki clone git@github.com:myorg/myproject.git
 cd /mnt/kiki/myproject/default
 vim src/main.rs       # files appear on read, sync on write
 ```
@@ -41,7 +41,7 @@ kiki describe -m "fix auth bug" # this is jj describe
 Top-level kiki commands handle repo and workspace lifecycle:
 
 ```bash
-kiki clone ssh://server/repo    # clone into /mnt/kiki/repo/default
+kiki clone git@github.com:org/repo.git  # clone into /mnt/kiki/repo/default
 kiki workspace create repo/fix  # new workspace at /mnt/kiki/repo/fix
 kiki workspace list repo        # list workspaces
 kiki workspace delete repo/fix  # remove a workspace
@@ -60,7 +60,7 @@ format and no translation layer.
 This means:
 - `kiki git push` sends objects to GitHub with zero conversion
 - Teammates without kiki just `git clone`
-- Every remote type (`dir://`, `s3://`, `ssh://`, `kiki://`, git forges)
+- Every remote type (`dir://`, `s3://`, `kiki+ssh://`, `kiki://`, git forges)
   stores identical bytes — same objects, different transport
 - Stock git tools (`git log`, `git blame`) work against mounts
   via a synthesized `.git` pointer
@@ -74,7 +74,7 @@ kiki (CLI)
 daemon
   ├─ RootFs        /mnt/kiki/<repo>/<workspace>/ namespace
   ├─ GitBackend    bare git repo (content store, shared per repo)
-  ├─ RemoteStore   dir:// · s3:// · ssh:// · kiki:// (grpc)
+  ├─ RemoteStore   dir:// · s3:// · kiki+ssh:// · kiki:// (grpc)
   └─ VFS           FUSE (Linux) · NFS (macOS)
 ```
 
@@ -85,7 +85,7 @@ and workspaces. `kiki kk daemon status` shows what's running.
 ## Status
 
 **Working:** read/write/snapshot, FUSE and NFS mounts, background
-sync, multi-machine sharing via `dir://` / `s3://` / `ssh://` / `kiki://`,
+sync, multi-machine sharing via `dir://` / `s3://` / `kiki+ssh://` / `kiki://`,
 git push and fetch to GitHub/GitLab, operation log sharing,
 `.gitignore`-aware VFS, daemon lifecycle.
 

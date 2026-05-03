@@ -99,7 +99,7 @@ Out (deferred):
 2. **Each named remote is one repo.** A remote entry in config
    points to a single repo, not a server with many repos. The remote
    name becomes the top-level directory in the namespace:
-   `[repos.monorepo] url = "ssh://server/repos/monorepo"` →
+   `[repos.monorepo] url = "kiki+ssh://server/repos/monorepo"` →
    `/mnt/kiki/monorepo/`. Multi-repo server discovery would add a
    nesting level (`/<server>/<repo>/`) that can land later without
    breaking the two-level `/<repo>/<workspace>/` shape.
@@ -326,7 +326,7 @@ avoid holding a lock across I/O:
    `store.redb` for `LocalRefs` (if not already cached on the
    `RepoEntry`). Call `KikiFs::new(store,
    root_tree_id, remote, scratch_dir)`. This may involve I/O
-   (redb open, and for `ssh://` repos a network round-trip to
+   (redb open, and for `kiki+ssh://` repos a network round-trip to
    fetch the root tree if it isn't cached locally).
 3. **Phase 3 (re-acquire lock):** check `live[slot]` again — a
    concurrent hydration may have raced and won. If still absent,
@@ -340,7 +340,7 @@ and 3 are fast map operations under the lock; phase 2 is
 arbitrarily slow but lock-free.
 
 The latency of first access depends on the tree — a local
-`dir://` repo hydrates in microseconds; an `ssh://` repo may
+`dir://` repo hydrates in microseconds; an `kiki+ssh://` repo may
 take a network round-trip. This blocks the FUSE syscall (e.g.,
 `stat` or `readdir`) for the calling process, which is
 acceptable for a one-time cost on interactive `cd`.
@@ -407,7 +407,7 @@ shared.
 # leading dots, no reserved names).
 
 [repos.monorepo]
-url = "ssh://server/repos/monorepo"
+url = "kiki+ssh://server/repos/monorepo"
 
 [repos.dotfiles]
 url = "dir:///home/cbro/repos/dotfiles"
@@ -421,7 +421,7 @@ Replaces `mount.toml`. Same shape as `MountMetadata` minus the
 
 ```toml
 slot = 1
-remote = "ssh://server/repos/monorepo"
+remote = "kiki+ssh://server/repos/monorepo"
 op_id = "abcdef..."
 workspace_id = "64656661756c74"
 root_tree_id = "ff..."
@@ -438,7 +438,7 @@ The allocator state is persisted in `repos.toml`:
 next_slot = 3
 
 [repos.monorepo]
-url = "ssh://server/repos/monorepo"
+url = "kiki+ssh://server/repos/monorepo"
 # ...
 ```
 
@@ -703,7 +703,7 @@ replacing the current per-`Initialize` binding pattern.
 3. Create `repos/<name>/` directory.
 4. Open shared `GitContentStore` at `repos/<name>/git_store/` and
    shared `store.redb` at `repos/<name>/store.redb`.
-5. Establish remote connection (SSH tunnel if `ssh://`, etc.).
+5. Establish remote connection (SSH tunnel if `kiki+ssh://`, etc.).
 6. Fetch initial content from remote if reachable (root tree).
 7. Allocate workspace slot for `default`.
 8. Create `repos/<name>/workspaces/default/` with `workspace.toml`.

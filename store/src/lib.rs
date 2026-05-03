@@ -164,7 +164,7 @@ pub trait RemoteStore: Send + Sync + std::fmt::Debug {
 /// Parse a remote URL into an optional [`RemoteStore`] handle.
 ///
 /// This is the daemon-side parser. The `store` crate provides
-/// `FsRemoteStore` directly; other schemes (`grpc://`, `ssh://`,
+/// `FsRemoteStore` directly; other schemes (`grpc://`, `kiki+ssh://`,
 /// `kiki://`) are handled by the daemon's extended `parse()`.
 pub fn parse_dir(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
     if remote.is_empty() {
@@ -172,7 +172,7 @@ pub fn parse_dir(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
     }
     let (scheme, rest) = remote
         .split_once("://")
-        .ok_or_else(|| anyhow!("remote {remote:?} has no scheme; expected dir://…, s3://…, ssh://…, or kiki://…"))?;
+        .ok_or_else(|| anyhow!("remote {remote:?} has no scheme; expected dir://…, s3://…, kiki+ssh://…, or kiki://…"))?;
     match scheme {
         "dir" => {
             if !rest.starts_with('/') {

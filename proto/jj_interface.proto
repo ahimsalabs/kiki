@@ -221,6 +221,11 @@ service JujutsuInterface {
   rpc GitPush(GitPushReq) returns (GitPushReply) {}
   rpc GitFetch(GitFetchReq) returns (GitFetchReply) {}
 
+  // M13 — first-class git clone (§M13-GIT-CLONE.md). Clones from a git
+  // remote (https://, ssh://, git@host:path) by running `git fetch`.
+  // Optionally attaches a kiki remote for real-time sync.
+  rpc GitClone(GitCloneReq) returns (GitCloneReply) {}
+
   // Detect external git HEAD changes. Returns the current HEAD from
   // the bare git repo if it differs from the last daemon-exported HEAD.
   // Used by the CLI to import `git commit` results before snapshot.
@@ -598,7 +603,7 @@ message GitBookmarkChange {
 // ── M12 — managed workspaces (§12.8) ───────────────────────────────
 
 message CloneReq {
-  // Remote URL (ssh://server/repo, dir:///path, s3://bucket/prefix).
+  // Kiki remote URL (kiki+ssh://server/repo, dir:///path, s3://bucket/prefix).
   string url = 1;
   // Repo name in the managed namespace. Empty = derive from URL
   // (last path component, stripped of .git suffix).
@@ -658,3 +663,24 @@ message WorkspaceDeleteReq {
   string workspace = 2;
 }
 message WorkspaceDeleteReply {}
+
+// ── M13 — first-class git clone ───────────────────────────────────
+
+message GitCloneReq {
+  // Git remote URL (https://..., ssh://..., git@host:path).
+  // Becomes the "origin" git remote on the bare repo.
+  string git_url = 1;
+  // Repo name in the managed namespace. Empty = derive from URL.
+  string name = 2;
+  // Optional kiki remote URL for real-time sync (s3://..., kiki://...,
+  // kiki+ssh://..., dir://...). Empty = no kiki remote (local-only).
+  string kiki_remote = 3;
+}
+message GitCloneReply {
+  // Full path to the default workspace.
+  string workspace_path = 1;
+  // Bookmarks imported from the git remote after fetch.
+  repeated GitFetchedBookmark bookmarks = 2;
+  // Default branch name (e.g. "main", "master").
+  string default_branch = 3;
+}

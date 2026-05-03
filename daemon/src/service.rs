@@ -342,7 +342,7 @@ struct Mount {
     /// (`SetCheckoutState`, `CheckOut`, `Snapshot`) re-write this file
     /// so a daemon restart sees current state.
     meta_path: Option<PathBuf>,
-    /// SSH tunnel for `ssh://` remotes. Kept alive for the mount's
+    /// SSH tunnel for `kiki+ssh://` remotes. Kept alive for the mount's
     /// lifetime — dropping it kills the SSH process and removes the
     /// forwarded socket. `None` for non-SSH remotes.
     #[allow(dead_code)] // dropped on Mount drop, never read directly
@@ -503,9 +503,9 @@ impl JujutsuService {
         // is skipped by `rehydrate`) rather than panicking, so the
         // operator can prune the broken mount dir.
         //
-        // Async schemes (ssh://, s3://) need their own establishment
+        // Async schemes (kiki+ssh://, s3://) need their own establishment
         // path; the previous daemon's state is dead, so we re-establish.
-        let (remote_store, ssh_tunnel) = if remote::parse_ssh_url(&meta.remote)
+        let (remote_store, ssh_tunnel) = if remote::parse_kiki_ssh_url(&meta.remote)
             .with_context(|| format!("parsing remote URL {:?}", meta.remote))?
             .is_some()
         {
@@ -518,7 +518,7 @@ impl JujutsuService {
                     ))?;
                 (Some(store), Some(tunnel))
             } else {
-                // Test mode (no tunnels_dir) — ssh:// will fail here,
+                // Test mode (no tunnels_dir) — kiki+ssh:// will fail here,
                 // which is correct since tests can't establish SSH tunnels.
                 let store = remote::parse(&meta.remote)
                     .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
@@ -796,24 +796,36 @@ fn mountpoint_status(e: MountpointError) -> Status {
 
 /// Derive a repo name from a URL by taking the last path segment and
 /// stripping a `.git` suffix. Returns `None` if the URL has no usable
-/// path component (e.g. `ssh://server/` has only a host, no repo path).
+/// path component (e.g. `kiki+ssh://server/` has only a host, no repo path).
 ///
 /// Examples:
-/// - `ssh://server/repos/monorepo` → `"monorepo"`
+/// - `kiki+ssh://server/repos/monorepo` → `"monorepo"`
 /// - `dir:///home/cbro/dotfiles` → `"dotfiles"`
-/// - `ssh://server/repos/mono.git` → `"mono"`
+/// - `kiki+ssh://server/repos/mono.git` → `"mono"`
 /// - `s3://bucket/prefix/repo` → `"repo"`
+/// - `git@github.com:org/repo.git` → `"repo"`
+/// - `https://github.com/org/repo` → `"repo"`
 fn derive_repo_name(url: &str) -> Option<String> {
+    // Handle SCP-style git URLs (git@host:org/repo.git) — no "://" present.
+    if !url.contains("://")
+        && let Some((_authority, path)) = url.split_once(':')
+    {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let last = segments.last()?;
+        let name = last.strip_suffix(".git").unwrap_or(last);
+        return if name.is_empty() { None } else { Some(name.to_owned()) };
+    }
+
     // Strip scheme, then separate host from path.
     let after_scheme = url.rsplit_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    // For `ssh://server/repos/mono`, after_scheme = `server/repos/mono`.
+    // For `kiki+ssh://server/repos/mono`, after_scheme = `server/repos/mono`.
     // The first segment is the host; we need at least two segments for a
     // meaningful repo name.
     // For `dir:///path/to/repo`, after_scheme = `/path/to/repo` — starts
     // with `/`, so the host is empty and every segment is path.
     let segments: Vec<&str> = after_scheme.split('/').filter(|s| !s.is_empty()).collect();
     // dir:// URLs have no host (empty between :// and first /), so every
-    // segment is a path component. ssh:// and s3:// URLs have a host as
+    // segment is a path component. kiki+ssh:// and s3:// URLs have a host as
     // the first segment — we need at least 2 segments to have a path.
     let has_host = !after_scheme.starts_with('/');
     let min_segments = if has_host { 2 } else { 1 };
@@ -1185,10 +1197,10 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // than a generic internal error or — worse — a silent drop into
         // "no remote configured". Empty string is still `Ok(None)`.
         //
-        // Async schemes (ssh://, s3://) need their own establishment
+        // Async schemes (kiki+ssh://, s3://) need their own establishment
         // path; synchronous ones (dir://, kiki://, grpc://) go through
         // `remote::parse()`.
-        let (remote_store, ssh_tunnel) = if remote::parse_ssh_url(&req.remote)
+        let (remote_store, ssh_tunnel) = if remote::parse_kiki_ssh_url(&req.remote)
             .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?
             .is_some()
         {
@@ -2276,7 +2288,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
         // Parse remote (SSH tunnel, dir://, s3://, etc.).
         let (remote_store, _ssh_tunnel) =
-            if remote::parse_ssh_url(&req.url)
+            if remote::parse_kiki_ssh_url(&req.url)
                 .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?
                 .is_some()
             {
@@ -2358,6 +2370,191 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let workspace_path = self.workspace_path(&name, "default")?;
         info!(repo = %name, url = %req.url, path = %workspace_path, "cloned repo");
         Ok(Response::new(CloneReply { workspace_path }))
+    }
+
+    // ── M13 — first-class git clone ──────────────────────────────────
+
+    #[tracing::instrument(skip(self))]
+    async fn git_clone(
+        &self,
+        request: Request<GitCloneReq>,
+    ) -> Result<Response<GitCloneReply>, Status> {
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        // Derive repo name from git URL if not provided.
+        let name = if req.name.is_empty() {
+            derive_repo_name(&req.git_url).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "cannot derive repo name from URL {:?}; pass --name explicitly",
+                    req.git_url
+                ))
+            })?
+        } else {
+            req.name.clone()
+        };
+        crate::repo_meta::validate_name(&name)
+            .map_err(|e| Status::invalid_argument(format!("invalid repo name: {e:#}")))?;
+
+        // Check for duplicate repo.
+        if root_fs.repo_store(&name).is_some() {
+            return Err(Status::already_exists(format!(
+                "repo {name:?} already registered"
+            )));
+        }
+
+        let storage_dir = match &self.storage {
+            StorageConfig::OnDisk { root } => root.clone(),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "GitClone requires on-disk storage",
+                ))
+            }
+        };
+
+        // Create shared git store + redb at repo level.
+        let git_store_path = crate::repo_meta::repo_git_store_path(&storage_dir, &name);
+        let redb_path = crate::repo_meta::repo_redb_path(&storage_dir, &name);
+        let settings = default_user_settings();
+        let store = Arc::new(
+            if git_store_path.join("git").exists() {
+                GitContentStore::load(&settings, &git_store_path, &redb_path)
+            } else {
+                GitContentStore::init(&settings, &git_store_path, &redb_path)
+            }
+            .map_err(store_status("opening repo store"))?,
+        );
+
+        // Add the git remote ("origin") and fetch.
+        let git_path = store.git_repo_path().to_path_buf();
+        let git_url = req.git_url.clone();
+        let (bookmarks, default_branch) = tokio::task::spawn_blocking(move || {
+            crate::git_ops::remote_add(&git_path, "origin", &git_url)?;
+            let bookmarks = crate::git_ops::fetch(&git_path, "origin")?;
+            let default_branch =
+                crate::git_ops::detect_default_branch(&git_path, "origin")?;
+            Ok::<_, anyhow::Error>((bookmarks, default_branch))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+        .map_err(|e| Status::internal(format!("git clone: {e:#}")))?;
+
+        // Optionally attach a kiki remote for real-time sync.
+        let kiki_remote_url = if req.kiki_remote.is_empty() {
+            String::new()
+        } else {
+            req.kiki_remote.clone()
+        };
+        let remote_store = if !kiki_remote_url.is_empty() {
+            if remote::parse_kiki_ssh_url(&kiki_remote_url)
+                .map_err(|e| Status::invalid_argument(format!("kiki remote: {e:#}")))?
+                .is_some()
+            {
+                let tunnels_dir = self.tunnels_dir.as_deref().ok_or_else(|| {
+                    Status::internal("SSH tunnels not available in test mode")
+                })?;
+                let (rs, _tunnel) =
+                    remote::establish_ssh_remote(&kiki_remote_url, tunnels_dir)
+                        .await
+                        .map_err(|e| Status::internal(format!("SSH tunnel: {e:#}")))?;
+                Some(rs)
+            } else if remote::is_s3_url(&kiki_remote_url) {
+                let rs = remote::establish_s3_remote(&kiki_remote_url)
+                    .await
+                    .map_err(|e| Status::internal(format!("S3 remote: {e:#}")))?;
+                Some(rs)
+            } else {
+                remote::parse(&kiki_remote_url)
+                    .map_err(|e| Status::invalid_argument(format!("kiki remote: {e:#}")))?
+            }
+        } else {
+            None
+        };
+
+        // Register repo with RootFs. Use the kiki remote URL (or empty)
+        // as the repo URL — the git origin is stored in the bare git
+        // repo's config.
+        root_fs.register_repo(
+            name.clone(),
+            kiki_remote_url.clone(),
+            Arc::clone(&store),
+            remote_store,
+        );
+
+        // Allocate default workspace slot.
+        let slot = root_fs.alloc_slot();
+        let empty_tree = store.empty_tree_id().as_bytes().to_vec();
+
+        // Create per-workspace directory + workspace.toml.
+        let ws_cfg = crate::repo_meta::WorkspaceConfig {
+            state: crate::repo_meta::WorkspaceState::Active,
+            slot,
+            op_id: Vec::new(),
+            workspace_id: Vec::new(),
+            root_tree_id: empty_tree.clone(),
+        };
+        let ws_cfg_path =
+            crate::repo_meta::workspace_config_path(&storage_dir, &name, "default");
+        ws_cfg
+            .write_to(&ws_cfg_path)
+            .map_err(metadata_status("persisting workspace.toml"))?;
+
+        // Create scratch dir.
+        let scratch = crate::repo_meta::workspace_scratch_dir(&storage_dir, &name, "default");
+        std::fs::create_dir_all(&scratch).map_err(|e| {
+            Status::internal(format!("creating scratch dir: {e}"))
+        })?;
+
+        // Register default workspace with RootFs.
+        root_fs
+            .register_workspace(
+                &name,
+                WorkspaceRegistration {
+                    name: "default".to_owned(),
+                    slot,
+                    state: RootFsWorkspaceState::Active,
+                    root_tree_id: empty_tree,
+                    op_id: Vec::new(),
+                    workspace_id: Vec::new(),
+                },
+            )
+            .map_err(|e| Status::internal(format!("registering workspace: {e}")))?;
+
+        // Persist repos.toml.
+        let repos_path = crate::repo_meta::repos_config_path(&storage_dir);
+        let mut repos_cfg = crate::repo_meta::ReposConfig::read_or_default(&repos_path)
+            .map_err(metadata_status("reading repos.toml"))?;
+        repos_cfg.repos.insert(
+            name.clone(),
+            crate::repo_meta::RepoEntry {
+                url: kiki_remote_url.clone(),
+            },
+        );
+        repos_cfg.next_slot = root_fs.next_slot();
+        repos_cfg
+            .write_to(&repos_path)
+            .map_err(metadata_status("persisting repos.toml"))?;
+
+        let workspace_path = self.workspace_path(&name, "default")?;
+        let reply_bookmarks = bookmarks
+            .into_iter()
+            .map(|(bm_name, commit_id)| GitFetchedBookmark {
+                name: bm_name,
+                commit_id,
+            })
+            .collect();
+        info!(
+            repo = %name,
+            git_url = %req.git_url,
+            kiki_remote = %kiki_remote_url,
+            path = %workspace_path,
+            "git-cloned repo"
+        );
+        Ok(Response::new(GitCloneReply {
+            workspace_path,
+            bookmarks: reply_bookmarks,
+            default_branch: default_branch.unwrap_or_default(),
+        }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -4551,7 +4748,7 @@ mod tests {
     #[test]
     fn derive_repo_name_from_urls() {
         assert_eq!(
-            super::derive_repo_name("ssh://server/repos/monorepo"),
+            super::derive_repo_name("kiki+ssh://server/repos/monorepo"),
             Some("monorepo".to_owned())
         );
         assert_eq!(
@@ -4559,7 +4756,7 @@ mod tests {
             Some("dotfiles".to_owned())
         );
         assert_eq!(
-            super::derive_repo_name("ssh://server/repos/mono.git"),
+            super::derive_repo_name("kiki+ssh://server/repos/mono.git"),
             Some("mono".to_owned())
         );
         assert_eq!(
@@ -4567,10 +4764,23 @@ mod tests {
             Some("repo".to_owned())
         );
         assert_eq!(
-            super::derive_repo_name("ssh://server/repos/mono.git/"),
+            super::derive_repo_name("kiki+ssh://server/repos/mono.git/"),
             Some("mono".to_owned())
         );
-        assert_eq!(super::derive_repo_name("ssh://server/"), None);
+        assert_eq!(super::derive_repo_name("kiki+ssh://server/"), None);
+        // Git URLs
+        assert_eq!(
+            super::derive_repo_name("git@github.com:org/repo.git"),
+            Some("repo".to_owned())
+        );
+        assert_eq!(
+            super::derive_repo_name("https://github.com/org/my-project"),
+            Some("my-project".to_owned())
+        );
+        assert_eq!(
+            super::derive_repo_name("https://github.com/org/my-project.git"),
+            Some("my-project".to_owned())
+        );
     }
 
     #[test]

@@ -58,7 +58,7 @@ impl Default for ReposConfig {
 /// A single repo entry in `repos.toml`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RepoEntry {
-    /// Remote URL (e.g. `ssh://server/repo`, `dir:///path`).
+    /// Remote URL (e.g. `kiki+ssh://server/repo`, `dir:///path`).
     pub url: String,
 }
 
@@ -358,7 +358,7 @@ mod tests {
         cfg.repos.insert(
             "myrepo".into(),
             RepoEntry {
-                url: "ssh://server/myrepo".into(),
+                url: "kiki+ssh://server/myrepo".into(),
             },
         );
         cfg.write_to(&path).unwrap();

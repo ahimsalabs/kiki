@@ -1,4 +1,4 @@
-//! SSH tunnel management for `ssh://` remotes.
+//! SSH tunnel management for `kiki+ssh://` remotes.
 //!
 //! Instead of the old per-connection stdin/stdout framing protocol, this
 //! module establishes a persistent
@@ -62,7 +62,7 @@ impl SshTunnel {
     ///
     /// - `user`: SSH user (empty string means SSH default).
     /// - `host`: remote hostname.
-    /// - `path`: remote storage path (the `/path` from `ssh://user@host/path`).
+    /// - `path`: remote storage path (the `/path` from `kiki+ssh://user@host/path`).
     /// - `tunnels_dir`: directory where local forwarded sockets are placed.
     ///
     /// This function:
@@ -338,7 +338,7 @@ async fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> Result<()
 /// (so rehydrate finds the same file) and collision-free.
 fn tunnel_socket_name(user: &str, host: &str, path: &str) -> String {
     use std::fmt::Write;
-    let input = format!("ssh://{user}@{host}{path}");
+    let input = format!("kiki+ssh://{user}@{host}{path}");
     let hash = blake3::hash(input.as_bytes());
     let mut s = String::with_capacity(3 + 16);
     s.push_str("tun-");

@@ -285,6 +285,53 @@ pub fn read_local_refs(git_repo_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(bookmarks)
 }
 
+/// Detect the default branch after a `git fetch`.
+///
+/// Checks `refs/remotes/<remote>/HEAD` (set by `git fetch` when the
+/// remote advertises HEAD). Falls back to `main`, then `master`, then
+/// the first remote-tracking branch alphabetically.
+pub fn detect_default_branch(git_repo_path: &Path, remote: &str) -> Result<Option<String>> {
+    let repo = gix::open(git_repo_path).context("opening git repo for default branch")?;
+    let prefix = format!("refs/remotes/{remote}/");
+
+    // Try refs/remotes/<remote>/HEAD (symbolic ref → refs/remotes/<remote>/<branch>).
+    let head_ref_name = format!("refs/remotes/{remote}/HEAD");
+    if let Ok(head_ref) = repo.find_reference(&head_ref_name) {
+        if let Some(target_name) = head_ref.inner.target.try_name() {
+            let target = target_name.as_bstr().to_string();
+            if let Some(branch) = target.strip_prefix(&prefix) {
+                return Ok(Some(branch.to_owned()));
+            }
+        }
+    }
+
+    // Fallback: check for well-known branch names in remote-tracking refs.
+    let mut branches = Vec::new();
+    if let Ok(refs) = repo.references() {
+        if let Ok(iter) = refs.prefixed(prefix.as_bytes()) {
+            for r in iter {
+                let Ok(r) = r else { continue };
+                let name = r.name().as_bstr().to_string();
+                if let Some(branch) = name.strip_prefix(&prefix) {
+                    if branch != "HEAD" {
+                        branches.push(branch.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    for preferred in ["main", "master"] {
+        if branches.iter().any(|b| b == preferred) {
+            return Ok(Some(preferred.to_owned()));
+        }
+    }
+
+    // Take the first one alphabetically.
+    branches.sort();
+    Ok(branches.into_iter().next())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

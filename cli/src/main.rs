@@ -137,7 +137,8 @@ enum KikiSubcommand {
 /// Clone a remote repo into the managed namespace (`/mnt/kiki/<name>/default`).
 #[derive(clap::Args, Clone, Debug)]
 struct CloneCommandArgs {
-    /// Remote URL (ssh://, dir://, s3://)
+    /// Clone source URL. Kiki remote (kiki+ssh://, dir://, s3://, kiki://)
+    /// or git remote (https://, ssh://, git@host:path).
     #[arg(value_hint = clap::ValueHint::Url)]
     url: String,
     /// Repo name override (default: derived from URL's last path segment)
@@ -150,6 +151,32 @@ struct CloneCommandArgs {
     /// reaching the daemon, so tools see the real VFS path.
     #[arg(long, value_hint = clap::ValueHint::DirPath)]
     link: Option<std::path::PathBuf>,
+    /// Kiki remote for real-time sync (e.g. s3://bucket/repo, kiki://server:12000).
+    /// Only valid when cloning from a git URL.
+    #[arg(long, value_hint = clap::ValueHint::Url)]
+    remote: Option<String>,
+}
+
+/// Classify a clone URL as a kiki-native remote or a git remote.
+enum CloneSource {
+    /// Kiki-native remote store. The URL is the kiki remote.
+    KikiRemote(String),
+    /// Git remote. The URL becomes the "origin" git remote.
+    Git(String),
+}
+
+fn classify_clone_url(url: &str) -> CloneSource {
+    // SCP-style: no "://" and contains ":" (e.g. git@github.com:org/repo)
+    if !url.contains("://") && url.contains(':') {
+        return CloneSource::Git(url.to_string());
+    }
+    match url.split("://").next().unwrap_or("") {
+        "dir" | "s3" | "kiki" | "grpc" | "kiki+ssh" => {
+            CloneSource::KikiRemote(url.to_string())
+        }
+        // Everything else is git: https, http, git, ssh, etc.
+        _ => CloneSource::Git(url.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -1185,7 +1212,7 @@ fn mount_nfs_localhost(_wc_path: &std::path::Path, _port: u32) -> Result<(), Com
 /// `kiki clone <url> [--name <name>]`
 ///
 /// Clones a remote repo into the managed namespace. Creates the repo
-/// entry + default workspace via the daemon's Clone RPC, then
+/// entry + default workspace via the daemon's Clone or GitClone RPC, then
 /// initializes the jj workspace at the returned path.
 async fn run_clone_command(
     ui: &mut Ui,
@@ -1195,22 +1222,94 @@ async fn run_clone_command(
     let client = daemon_client::connect_or_start(command_helper.settings())
         .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
 
-    writeln!(ui.status(), "Cloning {}...", args.url)?;
+    let workspace_path = match classify_clone_url(&args.url) {
+        CloneSource::KikiRemote(url) => {
+            if args.remote.is_some() {
+                return Err(user_error(
+                    "--remote is only valid when cloning from a git URL; \
+                     the clone URL is already a kiki remote",
+                ));
+            }
+            writeln!(ui.status(), "Cloning {}...", url)?;
+            let reply = client
+                .clone_repo(proto::jj_interface::CloneReq {
+                    url,
+                    name: args.name.clone().unwrap_or_default(),
+                })
+                .map_err(|e| user_error_with_message("Clone RPC failed", e))?
+                .into_inner();
+            reply.workspace_path
+        }
+        CloneSource::Git(git_url) => {
+            writeln!(ui.status(), "Cloning from git: {}...", git_url)?;
+            let reply = client
+                .git_clone(proto::jj_interface::GitCloneReq {
+                    git_url: git_url.clone(),
+                    name: args.name.clone().unwrap_or_default(),
+                    kiki_remote: args.remote.clone().unwrap_or_default(),
+                })
+                .map_err(|e| user_error_with_message("GitClone RPC failed", e))?
+                .into_inner();
+            if !reply.default_branch.is_empty() {
+                writeln!(
+                    ui.status(),
+                    "Fetched {} bookmark(s), default branch: {}",
+                    reply.bookmarks.len(),
+                    reply.default_branch,
+                )?;
+            }
+            reply.workspace_path
+        }
+    };
 
-    let reply = client
-        .clone_repo(proto::jj_interface::CloneReq {
-            url: args.url.clone(),
-            name: args.name.clone().unwrap_or_default(),
-        })
-        .map_err(|e| user_error_with_message("Clone RPC failed", e))?
-        .into_inner();
-
-    let wc_path = std::path::PathBuf::from(&reply.workspace_path);
-    let wc_path_str = &reply.workspace_path;
+    let wc_path = std::path::PathBuf::from(&workspace_path);
 
     // Initialize the jj workspace at the managed path. This is the same
     // flow as `kiki kk init` (§12.11): create the .jj/ metadata through
     // the VFS, using daemon-backed store factories.
+    init_jj_workspace(command_helper, &wc_path, &workspace_path).await?;
+
+    // Create symlink if --link was requested.
+    if let Some(link_path) = &args.link {
+        create_link(link_path, &wc_path)?;
+    }
+
+    let display_path = args
+        .link
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| workspace_path.clone());
+
+    writeln!(
+        ui.status(),
+        "Cloned into {} (workspace: default)",
+        workspace_path,
+    )?;
+    if args.link.is_some() {
+        writeln!(
+            ui.hint_default(),
+            "cd {} to start working (symlink -> {})",
+            display_path,
+            workspace_path,
+        )?;
+    } else {
+        writeln!(
+            ui.hint_default(),
+            "cd {} to start working",
+            display_path,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Initialize a jj workspace at a managed namespace path using
+/// daemon-backed store factories.
+async fn init_jj_workspace(
+    command_helper: &CommandHelper,
+    wc_path: &std::path::Path,
+    wc_path_str: &str,
+) -> Result<(), CommandError> {
     let wc_path_for_op_heads = wc_path_str.to_string();
     let kiki_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
                                          _store_path: &std::path::Path|
@@ -1250,7 +1349,7 @@ async fn run_clone_command(
 
     Workspace::init_with_factories(
         command_helper.settings(),
-        &wc_path,
+        wc_path,
         &|settings, store_path| {
             let backend = KikiBackend::new(settings, store_path)?;
             Ok(Box::new(backend))
@@ -1265,63 +1364,40 @@ async fn run_clone_command(
         WorkspaceName::DEFAULT.to_owned(),
     )
     .await?;
+    Ok(())
+}
 
-    // Create symlink if --link was requested.
-    if let Some(link_path) = &args.link {
-        if link_path.exists() {
-            return Err(user_error(format!(
-                "link target already exists: {}",
-                link_path.display()
-            )));
-        }
-        if let Some(parent) = link_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    user_error_with_message(
-                        format!("creating parent directory {}", parent.display()),
-                        e,
-                    )
-                })?;
-            }
-        }
-        std::os::unix::fs::symlink(&wc_path, link_path).map_err(|e| {
-            user_error_with_message(
-                format!(
-                    "creating symlink {} -> {}",
-                    link_path.display(),
-                    wc_path.display()
-                ),
-                e,
-            )
-        })?;
+/// Create a symlink from `link_path` to `target`.
+fn create_link(
+    link_path: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), CommandError> {
+    if link_path.exists() {
+        return Err(user_error(format!(
+            "link target already exists: {}",
+            link_path.display()
+        )));
     }
-
-    let display_path = args
-        .link
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| reply.workspace_path.clone());
-
-    writeln!(
-        ui.status(),
-        "Cloned into {} (workspace: default)",
-        reply.workspace_path,
-    )?;
-    if args.link.is_some() {
-        writeln!(
-            ui.hint_default(),
-            "cd {} to start working (symlink -> {})",
-            display_path,
-            reply.workspace_path,
-        )?;
-    } else {
-        writeln!(
-            ui.hint_default(),
-            "cd {} to start working",
-            display_path,
-        )?;
+    if let Some(parent) = link_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                user_error_with_message(
+                    format!("creating parent directory {}", parent.display()),
+                    e,
+                )
+            })?;
+        }
     }
-
+    std::os::unix::fs::symlink(target, link_path).map_err(|e| {
+        user_error_with_message(
+            format!(
+                "creating symlink {} -> {}",
+                link_path.display(),
+                target.display()
+            ),
+            e,
+        )
+    })?;
     Ok(())
 }
 

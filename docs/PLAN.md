@@ -4,7 +4,7 @@ Status: active. Transport architecture decided (§4.3 Path C). M1–M10.7
 done — see milestone index below for per-milestone detail. 330 tests
 (250 daemon + 17 CLI + 41 integration + 22 store) pass; `cargo clippy
 --workspace --all-targets -- -D warnings` is clean. SSH remote
-transport (`ssh://`) landed. **M10.7 (gitignore-aware VFS +
+transport (`kiki+ssh://`) landed. **M10.7 (gitignore-aware VFS +
 redirections) landed:** `.gitignore` rules loaded at checkout, new
 files tagged `ignored` at creation, `snapshot_node` skips ignored
 inodes. `.kiki-redirections` file redirects configured dirs
@@ -43,12 +43,13 @@ wasted effort. If it does, B and C are routine engineering.
 | **M1–M6** — Layer A foundation (daemon WC state, VFS trait, mount, checkout, write+snapshot) | ✅ done | [`PLAN-M1-6.md`](./PLAN-M1-6.md) |
 | **M7–M9** — `.jj/` separation, durable storage, remote blob CAS | ✅ done | [`PLAN-M7-9.md`](./PLAN-M7-9.md) |
 | **M10/M10.5/M10.6** — mutable pointers (CAS-arbitrated catalog), op-heads store, op-store contents, FUSE read-through | ✅ done | [`PLAN-M10.md`](./PLAN-M10.md) |
-| **SSH remote** — `ssh://` transport, `store` crate, `kiki kk serve`, `kiki://` scheme | ✅ done | — |
+| **SSH remote** — `kiki+ssh://` transport, `store` crate, `kiki kk serve`, `kiki://` scheme | ✅ done | — |
 | **M10.7** — gitignore-aware VFS + redirections | ✅ done | [`M10.7-GITIGNORE.md`](./M10.7-GITIGNORE.md) |
+| **Git convergence** — replace custom content store with jj-lib `GitBackend` | ✅ done | [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md) |
+| **Daemon lifecycle** — auto-start, launchd/systemd integration | ✅ done | [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md) |
 | **M11** — async push queue + offline resilience | active | [`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md) |
-| **Git convergence** — replace custom content store with jj-lib `GitBackend` | active | [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md) |
-| **Daemon lifecycle** — auto-start, launchd/systemd integration | active | [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md) |
 | **M12 — Workspaces** — single RootFs mount, managed namespace, multi-workspace orchestration | active | [`M12-WORKSPACES.md`](./M12-WORKSPACES.md), [`WORKSPACES.md`](./WORKSPACES.md) |
+| **M13 — Git clone & dual-remote model** — first-class git URLs, `kiki remote`, `kiki+ssh://` rename | active | [`M13-GIT-CLONE.md`](./M13-GIT-CLONE.md) |
 | **Linear history & segment index** — `linear` ref protection, O(1) ancestor queries | future | [`LINEAR_HISTORY.md`](./LINEAR_HISTORY.md) |
 | **Inode GC** — evict unused inodes from memory (critical for macOS NFS) | future | §10 |
 | **Graceful restart / takeover** — fd-passing so daemon upgrades don't unmount | future | §10 |
