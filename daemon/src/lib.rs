@@ -647,6 +647,7 @@ fn rehydrate_root_fs(config: &DaemonConfig) -> anyhow::Result<Arc<RootFs>> {
                     root_tree_id: ws_cfg.root_tree_id,
                     op_id: ws_cfg.op_id,
                     workspace_id: ws_cfg.workspace_id,
+                    commit_mtime_millis: ws_cfg.commit_mtime_millis,
                 },
             ) {
                 warn!(

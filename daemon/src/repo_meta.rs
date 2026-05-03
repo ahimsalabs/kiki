@@ -139,6 +139,10 @@ pub struct WorkspaceConfig {
     /// Currently checked-out root tree id.
     #[serde(default, with = "hex_bytes")]
     pub root_tree_id: Vec<u8>,
+    /// Committer timestamp (millis since epoch) of the currently checked-out
+    /// commit. Persisted so that file mtimes survive daemon restarts.
+    #[serde(default)]
+    pub commit_mtime_millis: i64,
 }
 
 impl WorkspaceConfig {
@@ -407,6 +411,7 @@ mod tests {
             op_id: vec![0xab, 0xcd],
             workspace_id: b"default".to_vec(),
             root_tree_id: vec![0xff; 20],
+            commit_mtime_millis: 1_700_000_000_000,
         }
     }
 
@@ -430,6 +435,7 @@ mod tests {
             op_id: Vec::new(),
             workspace_id: Vec::new(),
             root_tree_id: Vec::new(),
+            commit_mtime_millis: 0,
         };
         ws.write_to(&path).unwrap();
         let back = WorkspaceConfig::read_from(&path).unwrap();
@@ -578,6 +584,7 @@ mod proptests {
             workspace_id in prop::collection::vec(any::<u8>(), 0..32),
             root_tree_id in prop::collection::vec(any::<u8>(), 0..32),
             pending in any::<bool>(),
+            commit_mtime_millis in any::<i64>(),
         ) {
             let ws = WorkspaceConfig {
                 state: if pending { WorkspaceState::Pending } else { WorkspaceState::Active },
@@ -585,6 +592,7 @@ mod proptests {
                 op_id,
                 workspace_id,
                 root_tree_id,
+                commit_mtime_millis,
             };
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("workspace.toml");

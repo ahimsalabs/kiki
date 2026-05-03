@@ -101,6 +101,8 @@ struct WorkspaceEntry {
     root_tree_id: Vec<u8>,
     op_id: Vec<u8>,
     workspace_id: Vec<u8>,
+    /// Committer timestamp (millis since epoch) of the checked-out commit.
+    commit_mtime_millis: i64,
 }
 
 /// Workspace lifecycle state mirroring `repo_meta::WorkspaceState`.
@@ -148,6 +150,8 @@ pub struct WorkspaceRegistration {
     pub root_tree_id: Vec<u8>,
     pub op_id: Vec<u8>,
     pub workspace_id: Vec<u8>,
+    /// Committer timestamp (millis since epoch) of the checked-out commit.
+    pub commit_mtime_millis: i64,
 }
 
 // ── RootFs ──────────────────────────────────────────────────────────
@@ -169,6 +173,9 @@ struct RootFsInner {
     live: HashMap<u32, WorkspaceLive>,
     /// Next slot to allocate. Monotonic, never reused (§12.2 #3).
     next_slot: u32,
+    /// Creation time (seconds since epoch) used as mtime for synthetic
+    /// directories so they don't show as 1969 in `ls -l`.
+    boot_time_secs: i64,
 }
 
 /// The multi-workspace routing filesystem.
@@ -204,6 +211,11 @@ impl RootFs {
 
         let next_synthetic = ROOT_INODE + 1;
 
+        let boot_time_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
         RootFs {
             inner: Mutex::new(RootFsInner {
                 mount_root,
@@ -213,6 +225,7 @@ impl RootFs {
                 repos: HashMap::new(),
                 live: HashMap::new(),
                 next_slot,
+                boot_time_secs,
             }),
         }
     }
@@ -284,6 +297,7 @@ impl RootFs {
                     root_tree_id: reg.root_tree_id,
                     op_id: reg.op_id,
                     workspace_id: reg.workspace_id,
+                    commit_mtime_millis: reg.commit_mtime_millis,
                 },
             );
             repo_inode
@@ -418,6 +432,7 @@ impl RootFs {
             HydrationInfo {
                 slot: ws_entry.slot,
                 root_tree_id: ws_entry.root_tree_id.clone(),
+                commit_mtime_millis: ws_entry.commit_mtime_millis,
                 store: Arc::clone(&repo_entry.store),
                 remote_store: repo_entry.remote_store.clone(),
                 repo_name: repo.to_owned(),
@@ -490,6 +505,7 @@ impl RootFs {
             op_id: op_id.clone(),
             workspace_id: workspace_id.clone(),
             root_tree_id: ws_entry.root_tree_id.clone(),
+            commit_mtime_millis: ws_entry.commit_mtime_millis,
         };
         let path = crate::repo_meta::workspace_config_path(
             &storage_dir,
@@ -505,12 +521,15 @@ impl RootFs {
         Ok(())
     }
 
-    /// Update root_tree_id after CheckOut or Snapshot.
+    /// Update root_tree_id (and optionally commit mtime) after CheckOut or
+    /// Snapshot. Pass `commit_mtime_millis = 0` to leave the persisted mtime
+    /// unchanged (Snapshot produces trees, not commits, so has no timestamp).
     pub fn set_root_tree_id(
         &self,
         repo: &str,
         ws: &str,
         root_tree_id: Vec<u8>,
+        commit_mtime_millis: i64,
     ) -> Result<(), FsError> {
         let mut inner = self.inner.lock();
         // Extract storage_dir before taking a mutable borrow on repos.
@@ -520,6 +539,11 @@ impl RootFs {
             .workspaces
             .get_mut(ws)
             .ok_or(FsError::NotFound)?;
+        let persisted_mtime = if commit_mtime_millis != 0 {
+            commit_mtime_millis
+        } else {
+            ws_entry.commit_mtime_millis
+        };
         // Persist to workspace.toml BEFORE updating in-memory state,
         // so a write failure doesn't leave memory diverged from disk.
         let cfg = crate::repo_meta::WorkspaceConfig {
@@ -531,6 +555,7 @@ impl RootFs {
             op_id: ws_entry.op_id.clone(),
             workspace_id: ws_entry.workspace_id.clone(),
             root_tree_id: root_tree_id.clone(),
+            commit_mtime_millis: persisted_mtime,
         };
         let path = crate::repo_meta::workspace_config_path(
             &storage_dir,
@@ -542,6 +567,9 @@ impl RootFs {
         })?;
         // Persist succeeded — now update in-memory state.
         ws_entry.root_tree_id = root_tree_id;
+        if commit_mtime_millis != 0 {
+            ws_entry.commit_mtime_millis = commit_mtime_millis;
+        }
         Ok(())
     }
 
@@ -748,7 +776,7 @@ impl RootFs {
             info.remote_store.clone(),
             Some(scratch_dir),
             if wt_gitdir.exists() { Some(wt_gitdir) } else { None },
-            0, // mtime set on first check_out from jj
+            info.commit_mtime_millis / 1000,
         );
         let local_refs = LocalRefs::new(info.store.database());
 
@@ -782,6 +810,7 @@ impl RootFs {
                         found = Some(HydrationInfo {
                             slot,
                             root_tree_id: ws_entry.root_tree_id.clone(),
+                            commit_mtime_millis: ws_entry.commit_mtime_millis,
                             store: Arc::clone(&repo_entry.store),
                             remote_store: repo_entry.remote_store.clone(),
                             repo_name: repo_name.clone(),
@@ -844,7 +873,7 @@ impl RootFs {
                 kind: FileKind::Directory,
                 size: 0,
                 executable: false,
-                mtime_secs: 0,
+                mtime_secs: inner.boot_time_secs,
             })
         } else {
             Err(FsError::NotFound)
@@ -896,6 +925,7 @@ impl RootFs {
 struct HydrationInfo {
     slot: u32,
     root_tree_id: Vec<u8>,
+    commit_mtime_millis: i64,
     store: Arc<GitContentStore>,
     remote_store: Option<Arc<dyn RemoteStore>>,
     repo_name: String,
@@ -1752,6 +1782,7 @@ mod tests {
             root_tree_id,
             op_id: vec![],
             workspace_id,
+            commit_mtime_millis: 0,
         }
     }
 

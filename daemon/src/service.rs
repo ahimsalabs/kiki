@@ -2113,7 +2113,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         if let Some((ref repo, ref ws)) = managed {
             let root_fs = self.require_root_fs()?;
             root_fs
-                .set_root_tree_id(repo, ws, new_root.0.to_vec())
+                .set_root_tree_id(repo, ws, new_root.0.to_vec(), 0)
                 .map_err(|e| match e {
                     FsError::NotFound => {
                         Status::not_found(format!(
@@ -2218,7 +2218,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         if let Some((ref repo, ref ws)) = managed {
             let root_fs = self.require_root_fs()?;
             root_fs
-                .set_root_tree_id(repo, ws, req.new_tree_id)
+                .set_root_tree_id(repo, ws, req.new_tree_id, req.commit_timestamp_millis)
                 .map_err(|e| match e {
                     FsError::NotFound => {
                         Status::not_found(format!(
@@ -2600,6 +2600,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             op_id: Vec::new(),
             workspace_id: Vec::new(),
             root_tree_id: empty_tree.clone(),
+            commit_mtime_millis: 0,
         };
         let ws_cfg_path =
             crate::repo_meta::workspace_config_path(&storage_dir, &name, "default");
@@ -2630,6 +2631,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                     root_tree_id: empty_tree,
                     op_id: Vec::new(),
                     workspace_id: Vec::new(),
+                    commit_mtime_millis: 0,
                 },
             )
             .map_err(|e| Status::internal(format!("registering workspace: {e}")))?;
@@ -2814,6 +2816,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             op_id: Vec::new(),
             workspace_id: Vec::new(),
             root_tree_id: empty_tree.clone(),
+            commit_mtime_millis: 0,
         };
         let ws_cfg_path =
             crate::repo_meta::workspace_config_path(&storage_dir, &name, "default");
@@ -2847,6 +2850,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                     root_tree_id: empty_tree,
                     op_id: Vec::new(),
                     workspace_id: Vec::new(),
+                    commit_mtime_millis: 0,
                 },
             )
             .map_err(|e| Status::internal(format!("registering workspace: {e}")))?;
@@ -2895,7 +2899,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // and KikiFs so the FUSE mount shows content immediately (before
         // the CLI's CheckOut call persists it to workspace.toml).
         if !initial_tree_id.is_empty() && initial_tree_id != empty_tree_clone {
-            if let Err(e) = root_fs.set_root_tree_id(&name, "default", initial_tree_id.clone()) {
+            if let Err(e) = root_fs.set_root_tree_id(&name, "default", initial_tree_id.clone(), initial_commit_timestamp_millis) {
                 warn!(
                     error = %format!("{e:?}"),
                     "eager set_root_tree_id during git_clone (will be set by CheckOut)"
@@ -3155,6 +3159,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             op_id: Vec::new(),
             workspace_id: Vec::new(),
             root_tree_id: empty_tree.clone(),
+            commit_mtime_millis: 0,
         };
         let ws_cfg_path = crate::repo_meta::workspace_config_path(
             &storage_dir,
@@ -3197,6 +3202,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                     root_tree_id: empty_tree,
                     op_id: Vec::new(),
                     workspace_id: Vec::new(),
+                    commit_mtime_millis: 0,
                 },
             )
             .map_err(|e| match e {
