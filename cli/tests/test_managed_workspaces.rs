@@ -26,6 +26,7 @@
 //! | `workspace_create_shares_history` | new workspace sees same commit graph as source |
 //! | `git_clone_imports_bookmarks` | bookmarks visible in `jj bookmark list` after git clone |
 //! | `git_clone_imports_multiple_bookmarks` | all remote branches imported after git clone |
+//! | `git_clone_wc_parented_at_default_branch` | WC `@` parented at default branch, not root |
 
 use std::path::{Path, PathBuf};
 
@@ -1104,5 +1105,76 @@ fn git_clone_imports_multiple_bookmarks() {
     assert!(
         stdout.contains("@origin"),
         "remote-tracking bookmarks should exist; got: {stdout}"
+    );
+}
+
+/// After `kiki clone <git-url>`, the working-copy commit `@` should be
+/// parented at the default branch tip, not at the root commit.
+///
+/// Regression test: the clone flow called `init_jj_workspace` (which creates
+/// a WC commit parented at root with an empty tree) and imported bookmarks,
+/// but never re-parented the WC commit. The symptom was that `jj diff` showed
+/// every file as a new addition and `jj log` showed `@` disconnected from
+/// the cloned history.
+#[test]
+fn git_clone_wc_parented_at_default_branch() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let git_remote = create_git_repo_with_content();
+    let git_url = format!("file://{}", git_remote.path().join("repo.git").display());
+
+    let env = ManagedTestEnvironment::new();
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &git_url, "--name", "parenttest"],
+    );
+
+    let ws_path = env.mount_root().join("parenttest/default");
+    assert!(ws_path.exists(), "workspace should exist after clone");
+
+    // ── Assertion 1: @- should be `main`, not root ──
+    //
+    // If the WC commit is properly parented, @- is the default branch tip.
+    // If the bug is present, @- is the root commit (zzzzzzzz 00000000).
+    let (parent_id, _) = env.kiki_cmd_ok(
+        &ws_path,
+        &["log", "--no-graph", "-r", "@-", "-T", r#"commit_id"#],
+    );
+    let parent_id = parent_id.trim();
+    assert!(
+        parent_id != "0000000000000000000000000000000000000000",
+        "@- should be the default branch tip, not root commit; got: {parent_id}"
+    );
+
+    // The main bookmark should point at the same commit as @-.
+    let (main_id, _) = env.kiki_cmd_ok(
+        &ws_path,
+        &["log", "--no-graph", "-r", "main", "-T", r#"commit_id"#],
+    );
+    let main_id = main_id.trim();
+    assert_eq!(
+        parent_id, main_id,
+        "@- should equal main's commit id.\n\
+         @-:   {parent_id}\n\
+         main: {main_id}"
+    );
+
+    // ── Assertion 2: `jj diff` should be empty ──
+    //
+    // The WC commit has no local changes — its tree is inherited from @-.
+    // If the bug is present (parent = root), diff shows every file as added.
+    let (diff_out, _) = env.kiki_cmd_ok(&ws_path, &["diff"]);
+    assert!(
+        diff_out.trim().is_empty(),
+        "jj diff should be empty after fresh clone (WC has no changes); got:\n{diff_out}"
+    );
+
+    // ── Assertion 3: @ should show in log as child of main ──
+    let (log_out, _) = env.kiki_cmd_ok(&ws_path, &["log"]);
+    assert!(
+        log_out.contains("main"),
+        "jj log should show 'main' bookmark label; got:\n{log_out}"
     );
 }

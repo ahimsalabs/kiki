@@ -1357,7 +1357,7 @@ async fn run_clone_command(
     let client = daemon_client::connect_or_start(command_helper.settings())
         .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
 
-    let (workspace_path, initial_tree_id, initial_commit_ts, git_clone_bookmarks) =
+    let (workspace_path, initial_tree_id, initial_commit_ts, git_clone_bookmarks, default_branch) =
         match classify_clone_url(&args.url) {
             CloneSource::KikiRemote(url) => {
                 if args.remote.is_some() {
@@ -1379,6 +1379,7 @@ async fn run_clone_command(
                     reply.initial_tree_id,
                     reply.initial_commit_timestamp_millis,
                     Vec::new(),
+                    String::new(),
                 )
             }
             CloneSource::Git(git_url) => {
@@ -1404,6 +1405,7 @@ async fn run_clone_command(
                     reply.initial_tree_id,
                     reply.initial_commit_timestamp_millis,
                     reply.bookmarks,
+                    reply.default_branch,
                 )
             }
         };
@@ -1440,26 +1442,86 @@ async fn run_clone_command(
     // Import bookmarks from git clone into jj's view so that `jj log`
     // shows bookmark labels and `jj bookmark list` works immediately.
     // This also seeds `last_exported_bookmarks` via the WriteView RPC.
-    if !git_clone_bookmarks.is_empty() {
-        if let Err(e) =
-            import_git_clone_bookmarks(&mut workspace, &repo, &git_clone_bookmarks)
-                .await
+    let repo = if !git_clone_bookmarks.is_empty() {
+        match import_git_clone_bookmarks(&mut workspace, &repo, &git_clone_bookmarks)
+            .await
         {
-            if let Some(ref name) = repo_name {
-                let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
-                    name: name.clone(),
-                });
+            Ok(new_repo) => new_repo,
+            Err(e) => {
+                if let Some(ref name) = repo_name {
+                    let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
+                        name: name.clone(),
+                    });
+                }
+                return Err(e);
             }
-            return Err(e);
         }
-    }
+    } else {
+        repo
+    };
 
-    // If the clone resolved an initial tree (e.g. default branch tip for
-    // git clone), issue a CheckOut to materialize it and persist the
-    // root_tree_id to workspace.toml. Without this, the workspace starts
-    // with an empty tree until the user manually checks out a commit, and
-    // a daemon restart before that would lose any content reference.
-    if !initial_tree_id.is_empty() {
+    // Re-parent the WC commit from root to the default branch tip.
+    //
+    // init_jj_workspace creates a WC commit parented at the root commit
+    // (empty tree). Without re-parenting, `jj diff` shows every file as
+    // an addition. This mirrors workspace_create Step 4.
+    let default_branch_commit_id = git_clone_bookmarks
+        .iter()
+        .find(|b| b.name == default_branch)
+        .map(|b| jj_lib::backend::CommitId::new(b.commit_id.clone()));
+    if let Some(parent_id) = default_branch_commit_id {
+        let store = repo.store().clone();
+        let parent_commit = store.get_commit(&parent_id).map_err(|e| {
+            internal_error_with_message("failed to load default branch commit", e)
+        })?;
+        let tree = jj_lib::rewrite::merge_commit_trees(repo.as_ref(), &[parent_commit])
+            .await
+            .map_err(|e| {
+                internal_error_with_message("failed to merge parent trees", e)
+            })?;
+
+        let mut tx = repo.start_transaction();
+        let new_wc_commit = tx
+            .repo_mut()
+            .new_commit(vec![parent_id], tree)
+            .write()
+            .await
+            .map_err(|e| {
+                internal_error_with_message("failed to create clone WC commit", e)
+            })?;
+        tx.repo_mut()
+            .edit(WorkspaceName::DEFAULT.to_owned(), &new_wc_commit)
+            .await
+            .map_err(|e| {
+                internal_error_with_message("failed to edit clone WC commit", e)
+            })?;
+        tx.repo_mut().rebase_descendants().await.map_err(|e| {
+            internal_error_with_message("failed to rebase descendants", e)
+        })?;
+        let new_repo = tx
+            .commit("re-parent working-copy to default branch")
+            .await
+            .map_err(|e| {
+                internal_error_with_message("failed to commit WC re-parent transaction", e)
+            })?;
+
+        // Check out the parent tree via the working copy so the daemon's
+        // VFS serves the correct files immediately.
+        let mut locked_wc = workspace.working_copy().start_mutation().map_err(|e| {
+            internal_error_with_message("locking working copy for checkout", e)
+        })?;
+        locked_wc.check_out(&new_wc_commit).await.map_err(|e| {
+            internal_error_with_message("failed to check out default branch tree", e)
+        })?;
+        locked_wc
+            .finish(new_repo.operation().id().clone())
+            .await
+            .map_err(|e| {
+                internal_error_with_message("finishing working copy mutation", e)
+            })?;
+    } else if !initial_tree_id.is_empty() {
+        // Fallback for kiki-native clones or when default branch is unknown:
+        // issue a CheckOut RPC to materialize content on the FUSE mount.
         if let Err(e) = client
             .check_out(proto::jj_interface::CheckOutReq {
                 working_copy_path: workspace_path.clone(),
@@ -1467,7 +1529,6 @@ async fn run_clone_command(
                 commit_timestamp_millis: initial_commit_ts,
             })
         {
-            // Rollback on CheckOut failure too.
             if let Some(ref name) = repo_name {
                 let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
                     name: name.clone(),
@@ -1589,7 +1650,7 @@ async fn import_git_clone_bookmarks(
     workspace: &mut Workspace,
     repo: &std::sync::Arc<ReadonlyRepo>,
     bookmarks: &[proto::jj_interface::GitFetchedBookmark],
-) -> Result<(), CommandError> {
+) -> Result<std::sync::Arc<ReadonlyRepo>, CommandError> {
     use jj_lib::backend::CommitId;
     use jj_lib::op_store::{RemoteRef, RemoteRefState, RefTarget};
     use jj_lib::ref_name::{RefName, RemoteName};
@@ -1655,7 +1716,7 @@ async fn import_git_clone_bookmarks(
         .await
         .map_err(|e| internal_error_with_message("updating working copy operation", e))?;
 
-    Ok(())
+    Ok(new_repo)
 }
 
 /// Create a symlink from `link_path` to `target`.
