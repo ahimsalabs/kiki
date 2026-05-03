@@ -45,6 +45,9 @@ pub struct DaemonConfig {
     pub nfs_max_port: u16,
     /// Skip VFS mount (test mode).
     pub disable_mount: bool,
+    /// Mount root for the managed workspace namespace (M12).
+    /// Default: `/mnt/kiki` on Linux.
+    pub mount_root: PathBuf,
     /// PID file path.
     pub pid_path: PathBuf,
     /// Log file path (used when `managed` is true).
@@ -63,6 +66,7 @@ impl DaemonConfig {
             nfs_min_port: 12000,
             nfs_max_port: 12100,
             disable_mount: false,
+            mount_root: store::paths::default_mount_root(),
             pid_path: store::paths::pid_path(),
             log_path: store::paths::log_path(),
             managed: false,

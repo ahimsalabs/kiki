@@ -67,6 +67,9 @@ pub struct KikiConfig {
     pub grpc_addr: Option<String>,
     /// Override storage directory.
     pub storage_dir: Option<PathBuf>,
+    /// Mount root for the managed workspace namespace (M12).
+    /// Default: `/mnt/kiki` on Linux, `~/kiki` on macOS.
+    pub mount_root: Option<PathBuf>,
     /// Skip VFS mount (test/debug mode).
     #[serde(default)]
     pub disable_mount: bool,
@@ -79,6 +82,24 @@ pub struct KikiConfig {
 pub struct NfsConfigToml {
     pub min_port: Option<u16>,
     pub max_port: Option<u16>,
+}
+
+/// Read the configured `mount_root` from `config.toml`, falling back to
+/// the platform default. Used by CLI commands that need to construct or
+/// display managed workspace paths.
+#[allow(dead_code)]
+pub fn configured_mount_root() -> std::path::PathBuf {
+    let config_path = store::paths::config_path();
+    if config_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&config_path) {
+            if let Ok(cfg) = toml::from_str::<KikiConfig>(&contents) {
+                if let Some(root) = cfg.mount_root {
+                    return root;
+                }
+            }
+        }
+    }
+    store::paths::default_mount_root()
 }
 
 /// Execute a daemon subcommand. Returns Ok(true) if the command was handled
@@ -102,6 +123,9 @@ fn apply_file_config(config: &mut kiki_daemon::DaemonConfig, file_config: KikiCo
     }
     if let Some(dir) = file_config.storage_dir {
         config.storage_dir = dir;
+    }
+    if let Some(root) = file_config.mount_root {
+        config.mount_root = root;
     }
     if file_config.disable_mount {
         config.disable_mount = true;

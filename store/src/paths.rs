@@ -92,3 +92,22 @@ pub fn config_path() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME must be set");
     PathBuf::from(home).join(".config/kiki/config.toml")
 }
+
+/// Default mount root for the managed workspace namespace (M12).
+///
+/// - Linux: `/mnt/kiki`
+/// - macOS: `~/kiki` (no FUSE RootFs on macOS yet; placeholder)
+///
+/// Overridable via `mount_root` in `config.toml`.
+pub fn default_mount_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        PathBuf::from(home).join("kiki")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from("/mnt/kiki")
+    }
+}

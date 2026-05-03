@@ -334,4 +334,66 @@ impl BlockingJujutsuInterfaceClient {
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.git_detect_head_change(request))
     }
+
+    // ---- M12: managed-workspace RPCs ---------------------------------
+
+    /// Calls the proto `Clone` RPC. Named `clone_repo` to avoid
+    /// collision with the `Clone` trait method.
+    pub fn clone_repo(
+        &self,
+        request: impl tonic::IntoRequest<CloneReq>,
+    ) -> Result<tonic::Response<CloneReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        // The generated tonic method is `clone(&mut self, ...)` which
+        // shadows `Clone::clone` on the MutexGuard. Explicitly deref
+        // to the concrete type so the inherent method wins.
+        let c: &mut JujutsuInterfaceClient<tonic::transport::Channel> = &mut client;
+        rt.block_on(c.clone(request))
+    }
+
+    pub fn repo_list(
+        &self,
+        request: impl tonic::IntoRequest<RepoListReq>,
+    ) -> Result<tonic::Response<RepoListReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.repo_list(request))
+    }
+
+    pub fn workspace_create(
+        &self,
+        request: impl tonic::IntoRequest<WorkspaceCreateReq>,
+    ) -> Result<tonic::Response<WorkspaceCreateReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.workspace_create(request))
+    }
+
+    pub fn workspace_finalize(
+        &self,
+        request: impl tonic::IntoRequest<WorkspaceFinalizeReq>,
+    ) -> Result<tonic::Response<WorkspaceFinalizeReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.workspace_finalize(request))
+    }
+
+    pub fn workspace_list(
+        &self,
+        request: impl tonic::IntoRequest<WorkspaceListReq>,
+    ) -> Result<tonic::Response<WorkspaceListReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.workspace_list(request))
+    }
+
+    pub fn workspace_delete(
+        &self,
+        request: impl tonic::IntoRequest<WorkspaceDeleteReq>,
+    ) -> Result<tonic::Response<WorkspaceDeleteReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.workspace_delete(request))
+    }
 }

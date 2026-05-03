@@ -130,6 +130,60 @@ struct KikiArgs {
 enum KikiSubcommand {
     /// Commands for working with the kiki daemon
     Kk(KikiArgs),
+    /// Clone a remote repo into the managed workspace namespace
+    Clone(CloneCommandArgs),
+    /// Manage workspaces within a cloned repo
+    Workspace(WorkspaceCommandArgs),
+}
+
+/// Clone a remote repo into the managed namespace (`/mnt/kiki/<name>/default`).
+#[derive(clap::Args, Clone, Debug)]
+struct CloneCommandArgs {
+    /// Remote URL (ssh://, dir://, s3://)
+    #[arg(value_hint = clap::ValueHint::Url)]
+    url: String,
+    /// Repo name override (default: derived from URL's last path segment)
+    #[arg(long)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct WorkspaceCommandArgs {
+    #[command(subcommand)]
+    command: WorkspaceCommands,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum WorkspaceCommands {
+    /// Create a new workspace in a repo
+    Create(WorkspaceCreateArgs),
+    /// List workspaces in a repo
+    List(WorkspaceListArgs),
+    /// Delete a workspace from a repo
+    Delete(WorkspaceDeleteArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct WorkspaceCreateArgs {
+    /// Repo name
+    repo: String,
+    /// Workspace name
+    workspace: String,
+    // TODO(M12): --revision flag for checkout target override
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct WorkspaceListArgs {
+    /// Repo name (omit to list all repos and their workspaces)
+    repo: Option<String>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct WorkspaceDeleteArgs {
+    /// Repo name
+    repo: String,
+    /// Workspace name
+    workspace: String,
 }
 
 fn create_store_factories() -> StoreFactories {
@@ -511,7 +565,19 @@ async fn run_kk_command(
     command_helper: &CommandHelper,
     command: KikiSubcommand,
 ) -> Result<(), CommandError> {
-    let KikiSubcommand::Kk(KikiArgs { command }) = command;
+    match command {
+        KikiSubcommand::Clone(args) => {
+            return run_clone_command(ui, command_helper, args).await;
+        }
+        KikiSubcommand::Workspace(args) => {
+            return run_workspace_command(ui, command_helper, args).await;
+        }
+        KikiSubcommand::Kk(_) => {} // fall through to existing dispatch below
+    }
+
+    let KikiSubcommand::Kk(KikiArgs { command }) = command else {
+        unreachable!()
+    };
 
     // daemon subcommands run standalone — they manage the daemon lifecycle.
     if let KikiCommands::Daemon(ref args) = command {
@@ -975,6 +1041,323 @@ fn mount_nfs_localhost(_wc_path: &std::path::Path, _port: u32) -> Result<(), Com
             "NFS transport on non-macOS",
         ),
     ))
+}
+
+// ── M12: managed-workspace CLI commands ──────────────────────────────
+
+/// `kiki clone <url> [--name <name>]`
+///
+/// Clones a remote repo into the managed namespace. Creates the repo
+/// entry + default workspace via the daemon's Clone RPC, then
+/// initializes the jj workspace at the returned path.
+async fn run_clone_command(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    args: CloneCommandArgs,
+) -> Result<(), CommandError> {
+    let client = daemon_client::connect_or_start(command_helper.settings())
+        .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
+
+    writeln!(ui.status(), "Cloning {}...", args.url)?;
+
+    let reply = client
+        .clone_repo(proto::jj_interface::CloneReq {
+            url: args.url.clone(),
+            name: args.name.clone().unwrap_or_default(),
+        })
+        .map_err(|e| user_error_with_message("Clone RPC failed", e))?
+        .into_inner();
+
+    let wc_path = std::path::PathBuf::from(&reply.workspace_path);
+    let wc_path_str = &reply.workspace_path;
+
+    // Initialize the jj workspace at the managed path. This is the same
+    // flow as `kiki kk init` (§12.11): create the .jj/ metadata through
+    // the VFS, using daemon-backed store factories.
+    let wc_path_for_op_heads = wc_path_str.to_string();
+    let kiki_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
+                                         _store_path: &std::path::Path|
+          -> Result<
+        Box<dyn jj_lib::op_heads_store::OpHeadsStore>,
+        jj_lib::backend::BackendInitError,
+    > {
+        let client = connect_daemon(settings).map_err(|e| {
+            jj_lib::backend::BackendInitError(e.to_string().into())
+        })?;
+        Ok(Box::new(KikiOpHeadsStore::new(
+            client,
+            wc_path_for_op_heads.clone(),
+        )))
+    };
+
+    let wc_path_for_op_store = wc_path_str.to_string();
+    let kiki_op_store_initializer = move |settings: &jj_lib::settings::UserSettings,
+                                         store_path: &std::path::Path,
+                                         root_data: jj_lib::op_store::RootOperationData|
+          -> Result<
+        Box<dyn jj_lib::op_store::OpStore>,
+        jj_lib::backend::BackendInitError,
+    > {
+        let client = connect_daemon(settings).map_err(|e| {
+            jj_lib::backend::BackendInitError(e.to_string().into())
+        })?;
+        let store = op_store::KikiOpStore::init(
+            store_path,
+            root_data,
+            client,
+            wc_path_for_op_store.clone(),
+        )
+        .map_err(|e| jj_lib::backend::BackendInitError(e.into()))?;
+        Ok(Box::new(store))
+    };
+
+    Workspace::init_with_factories(
+        command_helper.settings(),
+        &wc_path,
+        &|settings, store_path| {
+            let backend = KikiBackend::new(settings, store_path)?;
+            Ok(Box::new(backend))
+        },
+        Signer::from_settings(command_helper.settings())
+            .map_err(WorkspaceInitError::SignInit)?,
+        &kiki_op_store_initializer,
+        &kiki_op_heads_initializer,
+        ReadonlyRepo::default_index_store_initializer(),
+        ReadonlyRepo::default_submodule_store_initializer(),
+        &KikiWorkingCopyFactory {},
+        WorkspaceName::DEFAULT.to_owned(),
+    )
+    .await?;
+
+    let repo_name = args
+        .name
+        .as_deref()
+        .unwrap_or_else(|| {
+            // Best-effort: extract from the path the daemon returned.
+            wc_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("repo")
+        });
+
+    writeln!(
+        ui.status(),
+        "Cloned into {} (workspace: default)",
+        reply.workspace_path,
+    )?;
+    writeln!(
+        ui.hint_default(),
+        "cd {} to start working",
+        reply.workspace_path,
+    )?;
+
+    // Suppress unused variable warning — repo_name is used for the hint
+    // in future commits (e.g. `kiki workspace create {repo_name}/<name>`).
+    let _ = repo_name;
+
+    Ok(())
+}
+
+/// `kiki workspace create/list/delete`
+async fn run_workspace_command(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    args: WorkspaceCommandArgs,
+) -> Result<(), CommandError> {
+    let client = daemon_client::connect_or_start(command_helper.settings())
+        .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
+
+    match args.command {
+        WorkspaceCommands::Create(create_args) => {
+            run_workspace_create(ui, command_helper, &client, create_args).await
+        }
+        WorkspaceCommands::List(list_args) => {
+            run_workspace_list(ui, &client, list_args)
+        }
+        WorkspaceCommands::Delete(delete_args) => {
+            run_workspace_delete(ui, &client, delete_args)
+        }
+    }
+}
+
+/// `kiki workspace create <repo> <workspace>`
+///
+/// 1. WorkspaceCreate RPC (daemon allocates slot, pending state)
+/// 2. jj workspace init at the returned path
+/// 3. WorkspaceFinalize RPC (transition to active)
+async fn run_workspace_create(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    client: &BlockingJujutsuInterfaceClient,
+    args: WorkspaceCreateArgs,
+) -> Result<(), CommandError> {
+    // Step 1: WorkspaceCreate RPC (pending state).
+    let reply = client
+        .workspace_create(proto::jj_interface::WorkspaceCreateReq {
+            repo: args.repo.clone(),
+            workspace: args.workspace.clone(),
+        })
+        .map_err(|e| user_error_with_message("WorkspaceCreate RPC failed", e))?
+        .into_inner();
+
+    let wc_path = std::path::PathBuf::from(&reply.workspace_path);
+    let wc_path_str = &reply.workspace_path;
+
+    // Step 2: jj workspace init at the managed path.
+    // Same factory setup as clone, but using a workspace-specific name.
+    let wc_path_for_op_heads = wc_path_str.to_string();
+    let kiki_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
+                                         _store_path: &std::path::Path|
+          -> Result<
+        Box<dyn jj_lib::op_heads_store::OpHeadsStore>,
+        jj_lib::backend::BackendInitError,
+    > {
+        let client = connect_daemon(settings).map_err(|e| {
+            jj_lib::backend::BackendInitError(e.to_string().into())
+        })?;
+        Ok(Box::new(KikiOpHeadsStore::new(
+            client,
+            wc_path_for_op_heads.clone(),
+        )))
+    };
+
+    let wc_path_for_op_store = wc_path_str.to_string();
+    let kiki_op_store_initializer = move |settings: &jj_lib::settings::UserSettings,
+                                         store_path: &std::path::Path,
+                                         root_data: jj_lib::op_store::RootOperationData|
+          -> Result<
+        Box<dyn jj_lib::op_store::OpStore>,
+        jj_lib::backend::BackendInitError,
+    > {
+        let client = connect_daemon(settings).map_err(|e| {
+            jj_lib::backend::BackendInitError(e.to_string().into())
+        })?;
+        let store = op_store::KikiOpStore::init(
+            store_path,
+            root_data,
+            client,
+            wc_path_for_op_store.clone(),
+        )
+        .map_err(|e| jj_lib::backend::BackendInitError(e.into()))?;
+        Ok(Box::new(store))
+    };
+
+    let ws_name = WorkspaceName::new(&args.workspace);
+
+    let init_result = Workspace::init_with_factories(
+        command_helper.settings(),
+        &wc_path,
+        &|settings, store_path| {
+            let backend = KikiBackend::new(settings, store_path)?;
+            Ok(Box::new(backend))
+        },
+        Signer::from_settings(command_helper.settings())
+            .map_err(WorkspaceInitError::SignInit)?,
+        &kiki_op_store_initializer,
+        &kiki_op_heads_initializer,
+        ReadonlyRepo::default_index_store_initializer(),
+        ReadonlyRepo::default_submodule_store_initializer(),
+        &KikiWorkingCopyFactory {},
+        ws_name.to_owned(),
+    )
+    .await;
+
+    // If jj init fails, the workspace stays in pending state. The daemon
+    // will clean it up on restart or the user can `kiki workspace delete`.
+    if let Err(e) = init_result {
+        // Best-effort cleanup: delete the pending workspace.
+        let _ = client.workspace_delete(proto::jj_interface::WorkspaceDeleteReq {
+            repo: args.repo.clone(),
+            workspace: args.workspace.clone(),
+        });
+        return Err(e.into());
+    }
+
+    // Step 3: Finalize — transition from pending to active.
+    client
+        .workspace_finalize(proto::jj_interface::WorkspaceFinalizeReq {
+            repo: args.repo.clone(),
+            workspace: args.workspace.clone(),
+        })
+        .map_err(|e| user_error_with_message("WorkspaceFinalize RPC failed", e))?;
+
+    writeln!(
+        ui.status(),
+        "Created workspace {}/{} at {}",
+        args.repo,
+        args.workspace,
+        reply.workspace_path,
+    )?;
+
+    Ok(())
+}
+
+/// `kiki workspace list [<repo>]`
+fn run_workspace_list(
+    ui: &mut Ui,
+    client: &BlockingJujutsuInterfaceClient,
+    args: WorkspaceListArgs,
+) -> Result<(), CommandError> {
+    if let Some(repo) = args.repo {
+        // List workspaces in a specific repo.
+        let reply = client
+            .workspace_list(proto::jj_interface::WorkspaceListReq {
+                repo: repo.clone(),
+            })
+            .map_err(|e| user_error_with_message("WorkspaceList RPC failed", e))?
+            .into_inner();
+
+        if reply.workspaces.is_empty() {
+            writeln!(ui.status(), "No workspaces in repo {repo:?}")?;
+        } else {
+            let mut formatter = ui.stdout_formatter();
+            for ws in &reply.workspaces {
+                writeln!(formatter, "{}\t{}", ws.name, ws.path)?;
+            }
+        }
+    } else {
+        // List all repos and their workspaces.
+        let reply = client
+            .repo_list(proto::jj_interface::RepoListReq {})
+            .map_err(|e| user_error_with_message("RepoList RPC failed", e))?
+            .into_inner();
+
+        if reply.repos.is_empty() {
+            writeln!(ui.status(), "No repos registered. Use `kiki clone` to add one.")?;
+        } else {
+            let mut formatter = ui.stdout_formatter();
+            for repo in &reply.repos {
+                writeln!(formatter, "{} ({})", repo.name, repo.url)?;
+                for ws in &repo.workspaces {
+                    writeln!(formatter, "  {ws}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `kiki workspace delete <repo> <workspace>`
+fn run_workspace_delete(
+    ui: &mut Ui,
+    client: &BlockingJujutsuInterfaceClient,
+    args: WorkspaceDeleteArgs,
+) -> Result<(), CommandError> {
+    client
+        .workspace_delete(proto::jj_interface::WorkspaceDeleteReq {
+            repo: args.repo.clone(),
+            workspace: args.workspace.clone(),
+        })
+        .map_err(|e| user_error_with_message("WorkspaceDelete RPC failed", e))?;
+
+    writeln!(
+        ui.status(),
+        "Deleted workspace {}/{}",
+        args.repo,
+        args.workspace,
+    )?;
+    Ok(())
 }
 
 fn main() -> std::process::ExitCode {
