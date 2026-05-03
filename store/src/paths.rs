@@ -95,19 +95,15 @@ pub fn config_path() -> PathBuf {
 
 /// Default mount root for the managed workspace namespace (M12).
 ///
-/// - Linux: `/mnt/kiki`
-/// - macOS: `~/kiki` (no FUSE RootFs on macOS yet; placeholder)
+/// All platforms: `~/kiki`. Overridable via `mount_root` in `config.toml`.
 ///
-/// Overridable via `mount_root` in `config.toml`.
+/// Power users who prefer a traditional mount point (e.g. `/mnt/kiki`) can
+/// set `mount_root` in `~/.config/kiki/config.toml` and create it with:
+///
+/// ```text
+/// sudo mkdir -p /mnt/kiki && sudo chown $USER /mnt/kiki
+/// ```
 pub fn default_mount_root() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").expect("HOME must be set");
-        PathBuf::from(home).join("kiki")
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        PathBuf::from("/mnt/kiki")
-    }
+    let home = std::env::var("HOME").expect("HOME must be set");
+    PathBuf::from(home).join("kiki")
 }

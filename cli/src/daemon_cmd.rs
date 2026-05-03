@@ -68,7 +68,7 @@ pub struct KikiConfig {
     /// Override storage directory.
     pub storage_dir: Option<PathBuf>,
     /// Mount root for the managed workspace namespace (M12).
-    /// Default: `/mnt/kiki` on Linux, `~/kiki` on macOS.
+    /// Default: `~/kiki`.
     pub mount_root: Option<PathBuf>,
     /// Skip VFS mount (test/debug mode).
     #[serde(default)]

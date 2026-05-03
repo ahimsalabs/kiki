@@ -46,6 +46,8 @@ pub(crate) struct InitArgs {
 enum KikiCommands {
     Init(InitArgs),
     Status,
+    /// Check prerequisites and set up the workspace mount root
+    Setup,
     /// Daemon lifecycle management
     Daemon(daemon_cmd::DaemonArgs),
 }
@@ -721,6 +723,11 @@ async fn run_kk_command(
         unreachable!()
     };
 
+    // setup runs standalone — no daemon needed.
+    if let KikiCommands::Setup = command {
+        return run_setup(ui);
+    }
+
     // daemon subcommands run standalone — they manage the daemon lifecycle.
     if let KikiCommands::Daemon(ref args) = command {
         daemon_cmd::dispatch_daemon(args)?;
@@ -864,7 +871,7 @@ async fn run_kk_command(
 
             Ok(())
         }
-        KikiCommands::Daemon(_) => {
+        KikiCommands::Daemon(_) | KikiCommands::Setup => {
             // Handled above before daemon connection.
             unreachable!()
         }
@@ -1233,6 +1240,104 @@ fn mount_nfs_localhost(_wc_path: &std::path::Path, _port: u32) -> Result<(), Com
 }
 
 // ── M12: managed-workspace CLI commands ──────────────────────────────
+
+/// `kiki kk setup`
+///
+/// Check prerequisites and create the workspace mount root directory.
+/// Runs without a daemon connection — safe to call before anything else.
+fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
+    let mount_root = daemon_cmd::configured_mount_root();
+
+    writeln!(ui.status(), "kiki setup")?;
+    writeln!(ui.status())?;
+
+    // ── 1. Check fusermount3 (Linux only) ──────────────────────────
+    #[cfg(target_os = "linux")]
+    {
+        write!(ui.status(), "  fusermount3 ... ")?;
+        match std::process::Command::new("which")
+            .arg("fusermount3")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let path = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_string();
+                writeln!(ui.status(), "ok ({})", path)?;
+            }
+            _ => {
+                writeln!(ui.status(), "MISSING")?;
+                writeln!(
+                    ui.warning_default(),
+                    "fusermount3 not found. Install the fuse3 package:\n  \
+                     sudo apt install fuse3   # Debian/Ubuntu\n  \
+                     sudo dnf install fuse3   # Fedora\n  \
+                     sudo pacman -S fuse3     # Arch",
+                )?;
+            }
+        }
+    }
+
+    // ── 2. Create mount root ───────────────────────────────────────
+    write!(ui.status(), "  mount root ({}) ... ", mount_root.display())?;
+    if mount_root.exists() {
+        // Check we can write to it.
+        let probe = mount_root.join(".kiki-setup-probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                writeln!(ui.status(), "ok")?;
+            }
+            Err(e) => {
+                writeln!(ui.status(), "NOT WRITABLE")?;
+                writeln!(
+                    ui.warning_default(),
+                    "Mount root exists but is not writable: {e}\n  \
+                     Fix with: sudo chown $USER {}",
+                    mount_root.display(),
+                )?;
+            }
+        }
+    } else {
+        // Try to create it directly.
+        match std::fs::create_dir_all(&mount_root) {
+            Ok(()) => {
+                writeln!(ui.status(), "created")?;
+            }
+            Err(e) => {
+                writeln!(ui.status(), "FAILED")?;
+                writeln!(
+                    ui.warning_default(),
+                    "Cannot create {}: {e}\n  \
+                     Create it manually:\n    \
+                     sudo mkdir -p {} && sudo chown $USER {}",
+                    mount_root.display(),
+                    mount_root.display(),
+                    mount_root.display(),
+                )?;
+            }
+        }
+    }
+
+    // ── 3. Summary ─────────────────────────────────────────────────
+    writeln!(ui.status())?;
+    if mount_root.exists() {
+        writeln!(
+            ui.status(),
+            "Ready. Clone a repo to get started:\n\n  \
+             kiki clone <url>\n  \
+             cd {}/{{repo}}/default",
+            mount_root.display(),
+        )?;
+    } else {
+        writeln!(
+            ui.status(),
+            "Fix the issues above, then run `kiki kk setup` again."
+        )?;
+    }
+
+    Ok(())
+}
 
 /// `kiki clone <url> [--name <name>]`
 ///

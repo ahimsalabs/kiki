@@ -398,8 +398,8 @@ pub struct JujutsuService {
     /// and by RPC handlers to construct workspace paths.
     mount_root: Option<PathBuf>,
     /// Keeps the single FUSE mount alive for the daemon's lifetime.
-    /// Dropped on daemon shutdown, which unmounts.
-    #[allow(dead_code)]
+    /// Dropped on daemon shutdown, which unmounts. Also used by
+    /// `require_mount_active()` to gate RPCs that need VFS access.
     _mount_attachment: Option<MountAttachment>,
 }
 
@@ -677,6 +677,33 @@ impl JujutsuService {
         self.root_fs.as_ref().ok_or_else(|| {
             Status::failed_precondition("managed workspaces not configured")
         })
+    }
+
+    /// Verify the VFS mount is active (FUSE/NFS bound and serving).
+    ///
+    /// Returns `Ok(())` in test mode (no `vfs_handle`) or when the mount
+    /// attachment is present. Returns a descriptive error when the daemon
+    /// skipped the mount (e.g. mount root didn't exist at startup).
+    #[allow(clippy::result_large_err)]
+    fn require_mount_active(&self) -> Result<(), Status> {
+        // Test mode: no VFS handle, mount not expected.
+        if self.vfs_handle.is_none() {
+            return Ok(());
+        }
+        if self._mount_attachment.is_some() {
+            return Ok(());
+        }
+        let mount_root = self
+            .mount_root
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(not configured)".into());
+        Err(Status::failed_precondition(format!(
+            "the workspace mount is not active at {mount_root}. \
+             Run `kiki kk setup` to configure the mount root, or create it manually:\n\n  \
+             mkdir -p {mount_root}\n\n\
+             Then restart the daemon: `kiki kk daemon stop` and retry."
+        )))
     }
 
     /// Construct the full workspace path: `<mount_root>/<repo>/<workspace>`.
@@ -2419,6 +2446,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<CloneReq>,
     ) -> Result<Response<CloneReply>, Status> {
         let req = request.into_inner();
+        self.require_mount_active()?;
         let root_fs = self.require_root_fs()?;
 
         // Derive repo name from URL if not provided.
@@ -2605,6 +2633,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitCloneReq>,
     ) -> Result<Response<GitCloneReply>, Status> {
         let req = request.into_inner();
+        self.require_mount_active()?;
         let root_fs = self.require_root_fs()?;
 
         // Derive repo name from git URL if not provided.
@@ -3043,6 +3072,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WorkspaceCreateReq>,
     ) -> Result<Response<WorkspaceCreateReply>, Status> {
         let req = request.into_inner();
+        self.require_mount_active()?;
         let root_fs = self.require_root_fs()?;
 
         crate::repo_meta::validate_name(&req.workspace)

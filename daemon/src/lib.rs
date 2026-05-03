@@ -48,7 +48,7 @@ pub struct DaemonConfig {
     /// Skip VFS mount (test mode).
     pub disable_mount: bool,
     /// Mount root for the managed workspace namespace (M12).
-    /// Default: `/mnt/kiki` on Linux.
+    /// Default: `~/kiki`.
     pub mount_root: PathBuf,
     /// PID file path.
     pub pid_path: PathBuf,
