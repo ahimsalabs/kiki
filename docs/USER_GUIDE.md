@@ -506,6 +506,48 @@ When someone else clones from your kiki remote, they inherit the git remote
 configuration — so `kiki git remote list` shows the same origins without
 manual setup.
 
+## Removing a repo
+
+Two-phase removal keeps accidental data loss hard:
+
+### Forget (safe, reversible)
+
+Deregisters the repo from the daemon namespace. The repo disappears from
+`~/kiki/` and `kiki kk status`, but all on-disk data (git store, redb,
+workspace metadata) is preserved under `~/.local/share/kiki/repos/<name>/`.
+Re-clone from the same remote to re-register.
+
+```bash
+# From inside a managed workspace
+cd ~/kiki/myproject/default
+kiki kk repo forget
+
+# Or pass the repo name explicitly
+kiki kk repo forget myproject
+```
+
+### Purge (destructive, irreversible)
+
+Deregisters the repo **and** deletes all on-disk data (git store, redb
+database, workspace metadata). This is permanent.
+
+To guard against accidental invocation (by agents, scripts, or typos),
+`purge` requires either interactive TTY confirmation or the
+`--confirm-data-loss` flag:
+
+```bash
+# Interactive (prompts you to type the repo name)
+kiki kk repo purge myproject
+# This will permanently delete all local data for 'myproject'.
+# Type the repo name to confirm: myproject
+
+# Non-interactive (for scripts — agents should NOT use this)
+kiki kk repo purge myproject --confirm-data-loss
+```
+
+Without `--confirm-data-loss`, the command refuses to run if stdin is not a
+terminal — so piped or agent-driven invocations fail safely.
+
 ## Syncing over SSH
 
 Use a `kiki+ssh://` URL to sync with a remote machine. Only the `kiki` binary

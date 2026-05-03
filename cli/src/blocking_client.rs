@@ -448,4 +448,13 @@ impl BlockingJujutsuInterfaceClient {
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.repo_delete(request))
     }
+
+    pub fn repo_forget(
+        &self,
+        request: impl tonic::IntoRequest<RepoForgetReq>,
+    ) -> Result<tonic::Response<RepoForgetReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.repo_forget(request))
+    }
 }

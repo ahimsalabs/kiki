@@ -3401,6 +3401,45 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         info!(repo = %req.name, "deleted repo");
         Ok(Response::new(RepoDeleteReply {}))
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn repo_forget(
+        &self,
+        request: Request<RepoForgetReq>,
+    ) -> Result<Response<RepoForgetReply>, Status> {
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        // Remove from RootFs (drops all workspace KikiFs instances).
+        let retired = root_fs.remove_repo(&req.name).map_err(|e| match e {
+            FsError::NotFound => {
+                Status::not_found(format!("repo {:?} not found", req.name))
+            }
+            _ => Status::internal(format!("removing repo: {e}")),
+        })?;
+
+        // Remove the repos.toml entry but preserve on-disk data.
+        if let StorageConfig::OnDisk { root } = &self.storage {
+            let repos_path = crate::repo_meta::repos_config_path(root);
+            match crate::repo_meta::ReposConfig::read_or_default(&repos_path) {
+                Ok(mut repos_cfg) => {
+                    repos_cfg.repos.remove(&req.name);
+                    repos_cfg.next_slot = root_fs.next_slot();
+                    if let Err(e) = repos_cfg.write_to(&repos_path) {
+                        warn!(error = %format!("{e:#}"), "failed to update repos.toml after repo forget");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "failed to read repos.toml for cleanup");
+                }
+            }
+        }
+
+        info!(repo = %req.name, workspaces = retired.len(), "forgot repo");
+        Ok(Response::new(RepoForgetReply {
+            workspaces_removed: retired.len() as u32,
+        }))
+    }
 }
 
 #[cfg(test)]

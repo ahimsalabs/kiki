@@ -146,6 +146,11 @@ service JujutsuInterface {
   // Remove an entire repo: deregister all workspaces, remove from RootFs
   // and repos.toml, delete on-disk state. Used for clone rollback.
   rpc RepoDelete(RepoDeleteReq) returns (RepoDeleteReply) {}
+  // Deregister a repo from the namespace without deleting on-disk data.
+  // Removes from RootFs and repos.toml but preserves the git store, redb,
+  // and workspace metadata under <storage_dir>/repos/<name>/. The repo
+  // can be re-registered by cloning from the same remote.
+  rpc RepoForget(RepoForgetReq) returns (RepoForgetReply) {}
 
   // M10.5 — catalog (mutable refs) on the per-mount level. Same shape
   // as the daemon-to-daemon `service RemoteStore` ref RPCs (§10.4) but
@@ -693,6 +698,15 @@ message RepoDeleteReq {
   string name = 1;
 }
 message RepoDeleteReply {}
+
+message RepoForgetReq {
+  // Repo name to deregister.
+  string name = 1;
+}
+message RepoForgetReply {
+  // Number of workspaces that were deregistered.
+  uint32 workspaces_removed = 1;
+}
 
 // ── M13 — first-class git clone ───────────────────────────────────
 

@@ -71,6 +71,8 @@ enum KikiCommands {
     Doctor(DoctorArgs),
     /// Manage workspaces (create, list, delete)
     Workspace(WorkspaceCommandArgs),
+    /// Manage repos (forget, purge)
+    Repo(RepoCommandArgs),
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -268,6 +270,45 @@ struct WorkspaceDeleteArgs {
     /// If a bare name like `fix-auth` is given, the repo is inferred
     /// from the current directory.
     name: String,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct RepoCommandArgs {
+    #[command(subcommand)]
+    command: RepoCommands,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum RepoCommands {
+    /// Deregister a repo from the namespace without deleting data.
+    ///
+    /// The repo disappears from ~/kiki/ and `kiki kk status`, but all
+    /// on-disk data (git store, redb, workspace metadata) is preserved
+    /// under the storage directory. Re-clone from the same remote to
+    /// re-register.
+    Forget(RepoForgetArgs),
+    /// Delete all local data for a repo (irreversible).
+    ///
+    /// Deregisters the repo and removes the git store, redb database,
+    /// and all workspace metadata from disk. Requires interactive
+    /// confirmation or --confirm-data-loss.
+    Purge(RepoPurgeArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct RepoForgetArgs {
+    /// Repo name, or omit to infer from cwd.
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct RepoPurgeArgs {
+    /// Repo name, or omit to infer from cwd.
+    name: Option<String>,
+    /// Bypass interactive confirmation. Required for non-interactive use
+    /// (scripts, CI, agents).
+    #[arg(long)]
+    confirm_data_loss: bool,
 }
 
 fn create_store_factories() -> StoreFactories {
@@ -849,6 +890,9 @@ async fn run_kk_command(
         }
         KikiCommands::Workspace(ws_args) => {
             run_workspace_command(ui, command_helper, &client, ws_args).await
+        }
+        KikiCommands::Repo(repo_args) => {
+            run_repo_command(ui, command_helper, &client, repo_args)
         }
         KikiCommands::Daemon(_) | KikiCommands::Setup | KikiCommands::Doctor(_) => {
             // Handled above before daemon connection.
@@ -1819,6 +1863,125 @@ async fn run_remote_command(
             Ok(())
         }
     }
+}
+
+// ── Repo commands ──────────────────────────────────────────────────
+
+/// `kiki kk repo forget/purge`
+fn run_repo_command(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    client: &BlockingJujutsuInterfaceClient,
+    args: RepoCommandArgs,
+) -> Result<(), CommandError> {
+    match args.command {
+        RepoCommands::Forget(forget_args) => {
+            run_repo_forget(ui, command_helper, client, forget_args)
+        }
+        RepoCommands::Purge(purge_args) => {
+            run_repo_purge(ui, command_helper, client, purge_args)
+        }
+    }
+}
+
+/// Resolve the repo name from an explicit argument or infer from cwd.
+fn resolve_repo_name(
+    name: Option<&str>,
+    command_helper: &CommandHelper,
+) -> Result<String, CommandError> {
+    if let Some(n) = name {
+        return Ok(n.to_owned());
+    }
+    infer_repo_from_cwd(command_helper).ok_or_else(|| {
+        user_error(
+            "could not infer repo name from current directory.\n\
+             Run from inside a managed workspace (~/kiki/<repo>/<workspace>/)\n\
+             or pass the repo name explicitly.",
+        )
+    })
+}
+
+/// `kiki kk repo forget <name>`
+fn run_repo_forget(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    client: &BlockingJujutsuInterfaceClient,
+    args: RepoForgetArgs,
+) -> Result<(), CommandError> {
+    let name = resolve_repo_name(args.name.as_deref(), command_helper)?;
+
+    let reply = client
+        .repo_forget(proto::jj_interface::RepoForgetReq {
+            name: name.clone(),
+        })
+        .map_err(|e| rpc_error("Failed to forget repo", e))?
+        .into_inner();
+
+    writeln!(
+        ui.status(),
+        "Forgot repo '{}' ({} workspace(s) deregistered). On-disk data preserved.",
+        name,
+        reply.workspaces_removed,
+    )?;
+    Ok(())
+}
+
+/// `kiki kk repo purge <name>`
+fn run_repo_purge(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    client: &BlockingJujutsuInterfaceClient,
+    args: RepoPurgeArgs,
+) -> Result<(), CommandError> {
+    let name = resolve_repo_name(args.name.as_deref(), command_helper)?;
+
+    // Safety gate: require either interactive TTY confirmation or
+    // --confirm-data-loss. This protects against accidental invocation
+    // by agents, scripts, or typos.
+    if !args.confirm_data_loss {
+        use std::io::{BufRead, IsTerminal, Write};
+        let stdin = std::io::stdin();
+        let mut stderr = std::io::stderr();
+        if !stdin.is_terminal() {
+            return Err(user_error(
+                "refusing to purge without confirmation.\n\
+                 Pass --confirm-data-loss for non-interactive use.",
+            ));
+        }
+        write!(
+            stderr,
+            "This will permanently delete all local data for '{}'.\n\
+             Type the repo name to confirm: ",
+            name,
+        )
+        .map_err(|e| user_error_with_message("failed to write prompt", e))?;
+        stderr
+            .flush()
+            .map_err(|e| user_error_with_message("failed to flush prompt", e))?;
+
+        let mut input = String::new();
+        stdin
+            .lock()
+            .read_line(&mut input)
+            .map_err(|e| user_error_with_message("failed to read confirmation", e))?;
+        if input.trim() != name {
+            return Err(user_error("confirmation did not match. Aborting."));
+        }
+    }
+
+    // RepoDelete is the existing RPC that deregisters + deletes on-disk data.
+    client
+        .repo_delete(proto::jj_interface::RepoDeleteReq {
+            name: name.clone(),
+        })
+        .map_err(|e| rpc_error("Failed to purge repo", e))?;
+
+    writeln!(
+        ui.status(),
+        "Purged repo '{}'. All local data has been deleted.",
+        name,
+    )?;
+    Ok(())
 }
 
 /// `kiki kk workspace create/list/delete`
