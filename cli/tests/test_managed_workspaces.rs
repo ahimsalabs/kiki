@@ -23,6 +23,7 @@
 //! | `jj_commands_in_workspace` | `jj new`, `jj describe` work normally |
 //! | `shared_store_across_workspaces` | committed blob visible from sibling workspace |
 //! | `daemon_restart_preserves_state` | repos/workspaces survive daemon restart |
+//! | `workspace_create_shares_history` | new workspace sees same commit graph as source |
 //! | `git_clone_imports_bookmarks` | bookmarks visible in `jj bookmark list` after git clone |
 //! | `git_clone_imports_multiple_bookmarks` | all remote branches imported after git clone |
 
@@ -890,6 +891,109 @@ fn git_commit_visible_in_kiki_log() {
     assert!(
         stdout.contains("colocated commit"),
         "kiki log should show the git commit; got: {stdout}"
+    );
+}
+
+/// A newly created workspace should share the same commit history as the
+/// source workspace. This is the key behavioral contract: `kiki workspace
+/// create` should be analogous to `jj workspace add`, not `jj init`.
+///
+/// Regression test: the original implementation called
+/// `Workspace::init_with_factories` (which creates an independent repo with
+/// its own empty commit graph) instead of
+/// `Workspace::init_workspace_with_existing_repo` (which shares the existing
+/// repo's stores). The symptom was that the new workspace's working-copy
+/// commit was parented at the root commit (`zzzzzzzz 00000000`) with an
+/// empty tree, instead of being a sibling of the source workspace's `@`
+/// (parented at `@-`, matching `jj workspace add` behavior).
+#[test]
+fn workspace_create_shares_history() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let git_remote = create_git_repo_with_content();
+    let git_url = format!("file://{}", git_remote.path().join("repo.git").display());
+
+    let env = ManagedTestEnvironment::new();
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &git_url, "--name", "myrepo"],
+    );
+    let default_path = env.mount_root().join("myrepo/default");
+
+    // Commit a file in the default workspace so there's non-trivial history
+    // beyond the initial git clone.
+    std::fs::write(default_path.join("extra.txt"), "from default\n").unwrap();
+    env.kiki_cmd_ok(&default_path, &["new"]);
+    env.kiki_cmd_ok(&default_path, &["describe", "@-", "-m", "add extra file"]);
+
+    // Capture default's @- commit ID — this is the parent the new workspace
+    // should also land on (sibling relationship).
+    let (default_parent_id, _) = env.kiki_cmd_ok(
+        &default_path,
+        &["log", "--no-graph", "-r", "@-", "-T", r#"commit_id"#],
+    );
+    let default_parent_id = default_parent_id.trim();
+    assert!(
+        !default_parent_id.is_empty() && default_parent_id != "0000000000000000000000000000000000000000",
+        "sanity: default's @- should be a real commit, not root; got: {default_parent_id}"
+    );
+
+    // Create a second workspace.
+    env.kiki_cmd_ok(
+        &default_path,
+        &["kk", "workspace", "create", "myrepo/feature"],
+    );
+    let feature_path = env.mount_root().join("myrepo/feature");
+
+    // ── Assertion 1: sibling relationship ──
+    //
+    // Like `jj workspace add`, the new workspace's @ should be parented at
+    // the same commit as default's @ — they should be siblings:
+    //
+    //   feature@  (new WC)
+    //   │ default@  (original WC)
+    //   ├─╯
+    //   ○  <shared parent = default's @->
+    //
+    // If instead @- is the root commit (zzzzzzzz 00000000), that means
+    // init_with_factories created an independent repo.
+    let (feature_parent_id, _) = env.kiki_cmd_ok(
+        &feature_path,
+        &["log", "--no-graph", "-r", "@-", "-T", r#"commit_id"#],
+    );
+    let feature_parent_id = feature_parent_id.trim();
+    assert_eq!(
+        feature_parent_id, default_parent_id,
+        "feature's @- should equal default's @- (sibling relationship).\n\
+         Expected (default's @-): {default_parent_id}\n\
+         Got (feature's @-):      {feature_parent_id}"
+    );
+
+    // ── Assertion 2: feature workspace should see commits from default ──
+    let (feature_log_text, _) = env.kiki_cmd_ok(
+        &feature_path,
+        &["log", "--no-graph"],
+    );
+    assert!(
+        feature_log_text.contains("add extra file"),
+        "feature workspace should see 'add extra file' commit; got: {feature_log_text}"
+    );
+    assert!(
+        feature_log_text.contains("initial"),
+        "feature workspace should see 'initial' commit from git clone; got: {feature_log_text}"
+    );
+
+    // ── Assertion 3: feature workspace should have files from history ──
+    //
+    // Since feature's @- is the "add extra file" commit (which has both
+    // README.md from git clone and extra.txt), those files should be
+    // materialized in the feature workspace's working copy.
+    assert!(
+        feature_path.join("README.md").exists(),
+        "feature workspace should contain README.md from shared history \
+         (new workspace should start from source's @- tree, not empty root)"
     );
 }
 
