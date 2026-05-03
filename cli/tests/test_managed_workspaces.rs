@@ -23,6 +23,8 @@
 //! | `jj_commands_in_workspace` | `jj new`, `jj describe` work normally |
 //! | `shared_store_across_workspaces` | committed blob visible from sibling workspace |
 //! | `daemon_restart_preserves_state` | repos/workspaces survive daemon restart |
+//! | `git_clone_imports_bookmarks` | bookmarks visible in `jj bookmark list` after git clone |
+//! | `git_clone_imports_multiple_bookmarks` | all remote branches imported after git clone |
 
 use std::path::{Path, PathBuf};
 
@@ -888,5 +890,115 @@ fn git_commit_visible_in_kiki_log() {
     assert!(
         stdout.contains("colocated commit"),
         "kiki log should show the git commit; got: {stdout}"
+    );
+}
+
+/// `kiki clone <git-url>` should import bookmarks so `jj bookmark list`
+/// shows them immediately (both local and remote-tracking).
+#[test]
+fn git_clone_imports_bookmarks() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let git_remote = create_git_repo_with_content();
+    let git_url = format!("file://{}", git_remote.path().join("repo.git").display());
+
+    let env = ManagedTestEnvironment::new();
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &git_url, "--name", "bm-test"],
+    );
+
+    let ws_path = env.mount_root().join("bm-test/default");
+    assert!(ws_path.exists(), "workspace should exist after clone");
+
+    // `jj bookmark list --all` should show both the local bookmark and the
+    // remote-tracking ref.
+    let (stdout, _) = env.kiki_cmd_ok(&ws_path, &["bookmark", "list", "--all"]);
+    assert!(
+        stdout.contains("main"),
+        "local bookmark 'main' should exist after git clone; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("@origin"),
+        "remote-tracking bookmark 'main@origin' should exist after git clone; got: {stdout}"
+    );
+}
+
+/// `kiki clone <git-url>` should import all bookmarks when the remote has
+/// multiple branches, not just the default branch.
+#[test]
+fn git_clone_imports_multiple_bookmarks() {
+    if !fuse_available() {
+        eprintln!("skipping: FUSE not available");
+        return;
+    }
+    let tmp = tempfile::TempDir::with_prefix("kiki-git-multi").unwrap();
+    let repo_path = tmp.path().join("repo.git");
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+
+    let run = |args: &[&str], dir: &Path| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git command");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run(&["init", "--bare", repo_path.to_str().unwrap()], tmp.path());
+    run(
+        &["clone", repo_path.to_str().unwrap(), work_dir.to_str().unwrap()],
+        tmp.path(),
+    );
+    std::fs::write(work_dir.join("README.md"), "# Multi-branch test\n").unwrap();
+    run(&["add", "README.md"], &work_dir);
+    run(
+        &["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "-m", "initial"],
+        &work_dir,
+    );
+    run(&["push", "origin", "main"], &work_dir);
+
+    // Create a second branch.
+    run(&["checkout", "-b", "feature"], &work_dir);
+    std::fs::write(work_dir.join("feature.txt"), "feature work\n").unwrap();
+    run(&["add", "feature.txt"], &work_dir);
+    run(
+        &["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "-m", "add feature"],
+        &work_dir,
+    );
+    run(&["push", "origin", "feature"], &work_dir);
+
+    let git_url = format!("file://{}", repo_path.display());
+    let env = ManagedTestEnvironment::new();
+    env.kiki_cmd_ok(
+        env.env_root(),
+        &["clone", &git_url, "--name", "multi"],
+    );
+
+    let ws_path = env.mount_root().join("multi/default");
+    assert!(ws_path.exists(), "workspace should exist after clone");
+
+    let (stdout, _) = env.kiki_cmd_ok(&ws_path, &["bookmark", "list", "--all"]);
+    assert!(
+        stdout.contains("main"),
+        "local bookmark 'main' should exist; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("feature"),
+        "local bookmark 'feature' should exist; got: {stdout}"
+    );
+    // Both should have remote-tracking refs (jj shows "@origin" on a
+    // separate indented line under each local bookmark).
+    assert!(
+        stdout.contains("@origin"),
+        "remote-tracking bookmarks should exist; got: {stdout}"
     );
 }

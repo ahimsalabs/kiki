@@ -1357,7 +1357,7 @@ async fn run_clone_command(
     let client = daemon_client::connect_or_start(command_helper.settings())
         .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
 
-    let (workspace_path, initial_tree_id, initial_commit_ts) =
+    let (workspace_path, initial_tree_id, initial_commit_ts, git_clone_bookmarks) =
         match classify_clone_url(&args.url) {
             CloneSource::KikiRemote(url) => {
                 if args.remote.is_some() {
@@ -1378,6 +1378,7 @@ async fn run_clone_command(
                     reply.workspace_path,
                     reply.initial_tree_id,
                     reply.initial_commit_timestamp_millis,
+                    Vec::new(),
                 )
             }
             CloneSource::Git(git_url) => {
@@ -1402,6 +1403,7 @@ async fn run_clone_command(
                     reply.workspace_path,
                     reply.initial_tree_id,
                     reply.initial_commit_timestamp_millis,
+                    reply.bookmarks,
                 )
             }
         };
@@ -1419,15 +1421,37 @@ async fn run_clone_command(
     // Initialize the jj workspace at the managed path. This is the same
     // flow as `kiki kk init` (§12.11): create the .jj/ metadata through
     // the VFS, using daemon-backed store factories.
-    if let Err(e) = init_jj_workspace(command_helper, &wc_path, &workspace_path).await {
-        // Rollback: delete the partially-created repo so we don't leave
-        // a zombie (registered, files visible, but no jj metadata).
-        if let Some(ref name) = repo_name {
-            let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
-                name: name.clone(),
-            });
+    let (mut workspace, repo) =
+        match init_jj_workspace(command_helper, &wc_path, &workspace_path).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Rollback: delete the partially-created repo so we don't
+                // leave a zombie (registered, files visible, but no jj
+                // metadata).
+                if let Some(ref name) = repo_name {
+                    let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
+                        name: name.clone(),
+                    });
+                }
+                return Err(e);
+            }
+        };
+
+    // Import bookmarks from git clone into jj's view so that `jj log`
+    // shows bookmark labels and `jj bookmark list` works immediately.
+    // This also seeds `last_exported_bookmarks` via the WriteView RPC.
+    if !git_clone_bookmarks.is_empty() {
+        if let Err(e) =
+            import_git_clone_bookmarks(&mut workspace, &repo, &git_clone_bookmarks)
+                .await
+        {
+            if let Some(ref name) = repo_name {
+                let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
+                    name: name.clone(),
+                });
+            }
+            return Err(e);
         }
-        return Err(e);
     }
 
     // If the clone resolved an initial tree (e.g. default branch tip for
@@ -1493,7 +1517,7 @@ async fn init_jj_workspace(
     command_helper: &CommandHelper,
     wc_path: &std::path::Path,
     wc_path_str: &str,
-) -> Result<(), CommandError> {
+) -> Result<(Workspace, std::sync::Arc<ReadonlyRepo>), CommandError> {
     let wc_path_for_op_heads = wc_path_str.to_string();
     let kiki_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
                                          _store_path: &std::path::Path|
@@ -1531,7 +1555,7 @@ async fn init_jj_workspace(
         Ok(Box::new(store))
     };
 
-    Workspace::init_with_factories(
+    let result = Workspace::init_with_factories(
         command_helper.settings(),
         wc_path,
         &|settings, store_path| {
@@ -1548,6 +1572,89 @@ async fn init_jj_workspace(
         WorkspaceName::DEFAULT.to_owned(),
     )
     .await?;
+    Ok(result)
+}
+
+/// Import bookmarks fetched during git clone into jj's view.
+///
+/// After `init_jj_workspace`, the jj view is empty (no bookmarks). This
+/// mirrors the bookmark import logic from `kiki git fetch` to populate
+/// remote-tracking bookmarks (e.g. `main@origin`) and local bookmarks
+/// (e.g. `main`) so `jj log` and `jj bookmark list` work immediately.
+///
+/// Committing this transaction also seeds `last_exported_bookmarks` via
+/// the `WriteView` RPC, enabling the git import hook to detect external
+/// bookmark changes on subsequent commands.
+async fn import_git_clone_bookmarks(
+    workspace: &mut Workspace,
+    repo: &std::sync::Arc<ReadonlyRepo>,
+    bookmarks: &[proto::jj_interface::GitFetchedBookmark],
+) -> Result<(), CommandError> {
+    use jj_lib::backend::CommitId;
+    use jj_lib::op_store::{RemoteRef, RemoteRefState, RefTarget};
+    use jj_lib::ref_name::{RefName, RemoteName};
+
+    let mut tx = repo.start_transaction();
+    tx.set_workspace_name(WorkspaceName::DEFAULT);
+    let store = tx.repo().store().clone();
+
+    // Index the fetched commits so jj's DAG includes them.
+    for b in bookmarks {
+        let commit_id = CommitId::new(b.commit_id.clone());
+        let commit = store.get_commit(&commit_id).map_err(|e| {
+            internal_error_with_message(
+                format!("cloned commit for '{}' not readable", b.name),
+                e,
+            )
+        })?;
+        tx.repo_mut().add_head(&commit).await.map_err(|e| {
+            internal_error_with_message(
+                format!("failed to index cloned commit for '{}'", b.name),
+                e,
+            )
+        })?;
+    }
+
+    // Set remote-tracking bookmarks (e.g. main@origin).
+    let remote_name = RemoteName::new("origin");
+    for b in bookmarks {
+        let bookmark_name = RefName::new(&b.name);
+        let commit_id = CommitId::new(b.commit_id.clone());
+        let remote_ref = RemoteRef {
+            target: RefTarget::normal(commit_id),
+            state: RemoteRefState::Tracked,
+        };
+        tx.repo_mut().set_remote_bookmark(
+            bookmark_name.to_remote_symbol(remote_name),
+            remote_ref,
+        );
+    }
+
+    // Set local bookmarks (e.g. main).
+    for b in bookmarks {
+        let bookmark_name = RefName::new(&b.name);
+        let commit_id = CommitId::new(b.commit_id.clone());
+        tx.repo_mut()
+            .set_local_bookmark_target(bookmark_name, RefTarget::normal(commit_id));
+    }
+
+    let new_repo = tx
+        .commit("import bookmarks from git clone")
+        .await
+        .map_err(|e| {
+            internal_error_with_message("failed to commit bookmark import transaction", e)
+        })?;
+
+    // Advance the working copy's recorded operation so subsequent
+    // commands don't see a stale working copy.
+    let locked_ws = workspace.start_working_copy_mutation().map_err(|e| {
+        internal_error_with_message("locking working copy for operation update", e)
+    })?;
+    locked_ws
+        .finish(new_repo.op_id().clone())
+        .await
+        .map_err(|e| internal_error_with_message("updating working copy operation", e))?;
+
     Ok(())
 }
 
