@@ -19,7 +19,8 @@ use crate::mount_meta::{self, MountMetadata};
 use crate::remote::fetch::{self, FetchError};
 use crate::remote::{self, BlobKind, RemoteStore};
 use crate::ty;
-use crate::vfs::{FsError, JjKikiFs, KikiFs};
+use crate::vfs::{FsError, JjKikiFs, KikiFs, RootFs};
+use crate::vfs::root_fs::{WorkspaceRegistration, WorkspaceState as RootFsWorkspaceState};
 use crate::vfs_mgr::{BindError, MountAttachment, TransportInfo, VfsManagerHandle};
 
 /// Where per-mount redb files live. Production runs are always
@@ -376,6 +377,9 @@ pub struct JujutsuService {
     /// Per-mount state, keyed by `working_copy_path`. Use `tokio::Mutex`
     /// because the RPC handlers are async; contention is minimal (one
     /// per-mount entry, mostly small reads/writes).
+    ///
+    /// Used by ad-hoc `Initialize` (backward compat). M12 managed
+    /// workspaces use `root_fs` instead.
     mounts: Arc<Mutex<HashMap<String, Mount>>>,
     /// `None` only in `bare()` test mode. Production `Initialize`
     /// requires it.
@@ -385,6 +389,18 @@ pub struct JujutsuService {
     /// Directory for SSH tunnel forwarded sockets. Lives in the runtime
     /// dir alongside daemon.sock/pid/log. `None` in test mode.
     tunnels_dir: Option<PathBuf>,
+
+    // ── M12 managed workspaces ──────────────────────────────────
+    /// The single RootFs for managed workspaces. `None` when running
+    /// in bare/test mode or when managed workspaces are not enabled.
+    root_fs: Option<Arc<RootFs>>,
+    /// Mount root path (e.g. `/mnt/kiki`). Used by `resolve_workspace`
+    /// and by RPC handlers to construct workspace paths.
+    mount_root: Option<PathBuf>,
+    /// Keeps the single FUSE mount alive for the daemon's lifetime.
+    /// Dropped on daemon shutdown, which unmounts.
+    #[allow(dead_code)]
+    _mount_attachment: Option<MountAttachment>,
 }
 
 impl JujutsuService {
@@ -409,7 +425,25 @@ impl JujutsuService {
             vfs_handle,
             storage,
             tunnels_dir,
+            root_fs: None,
+            mount_root: None,
+            _mount_attachment: None,
         }
+    }
+
+    /// Set the `RootFs` for managed workspaces (M12). Called during
+    /// daemon startup after constructing the service but before
+    /// accepting connections. The `mount_attachment` keeps the single
+    /// FUSE mount alive.
+    pub fn set_root_fs(
+        &mut self,
+        root_fs: Arc<RootFs>,
+        mount_root: PathBuf,
+        mount_attachment: Option<MountAttachment>,
+    ) {
+        self.root_fs = Some(root_fs);
+        self.mount_root = Some(mount_root);
+        self._mount_attachment = mount_attachment;
     }
 
     /// Wrap the service in the tonic-generated server type. Consumes
@@ -579,6 +613,9 @@ impl JujutsuService {
             vfs_handle: None,
             storage: StorageConfig::InMemory,
             tunnels_dir: None,
+            root_fs: None,
+            mount_root: None,
+            _mount_attachment: None,
         }
     }
 
@@ -590,6 +627,55 @@ impl JujutsuService {
     pub(crate) async fn fs_for_test(&self, path: &str) -> Option<Arc<dyn JjKikiFs>> {
         let mounts = self.mounts.lock().await;
         mounts.get(path).map(|m| m.fs.clone())
+    }
+
+    // ── M12 managed-workspace helpers ───────────────────────────────
+
+    /// Resolve a `working_copy_path` (e.g. `/mnt/kiki/repo/ws/src/main.rs`)
+    /// to `(repo_name, workspace_name)` by stripping `mount_root` and
+    /// taking the first two components. Returns `Err(Status)` if the path
+    /// doesn't live under `mount_root` or is missing components.
+    ///
+    /// Used by existing RPCs once they route through RootFs (next commit)
+    /// and by tests now.
+    #[allow(dead_code)]
+    fn resolve_workspace(&self, working_copy_path: &str) -> Result<(String, String), Status> {
+        let mount_root = self.mount_root.as_ref().ok_or_else(|| {
+            Status::failed_precondition("managed workspaces not configured")
+        })?;
+        let wc = Path::new(working_copy_path);
+        let rel = wc.strip_prefix(mount_root).map_err(|_| {
+            Status::not_found(format!(
+                "path {working_copy_path} is not under mount root {}",
+                mount_root.display()
+            ))
+        })?;
+        let mut components = rel.components();
+        let repo = components
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .ok_or_else(|| Status::invalid_argument("missing repo component"))?;
+        let ws = components
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .ok_or_else(|| Status::invalid_argument("missing workspace component"))?;
+        // Trailing components ignored — the first two identify the workspace.
+        Ok((repo.to_string(), ws.to_string()))
+    }
+
+    /// Get the `RootFs` or return an error.
+    fn require_root_fs(&self) -> Result<&Arc<RootFs>, Status> {
+        self.root_fs.as_ref().ok_or_else(|| {
+            Status::failed_precondition("managed workspaces not configured")
+        })
+    }
+
+    /// Construct the full workspace path: `<mount_root>/<repo>/<workspace>`.
+    fn workspace_path(&self, repo: &str, ws: &str) -> Result<String, Status> {
+        let mount_root = self.mount_root.as_ref().ok_or_else(|| {
+            Status::failed_precondition("managed workspaces not configured")
+        })?;
+        Ok(mount_root.join(repo).join(ws).to_string_lossy().into_owned())
     }
 }
 
@@ -698,6 +784,41 @@ fn force_unmount(path: &str) -> anyhow::Result<()> {
 
 fn mountpoint_status(e: MountpointError) -> Status {
     Status::failed_precondition(e.to_string())
+}
+
+/// Derive a repo name from a URL by taking the last path segment and
+/// stripping a `.git` suffix. Returns `None` if the URL has no usable
+/// path component (e.g. `ssh://server/` has only a host, no repo path).
+///
+/// Examples:
+/// - `ssh://server/repos/monorepo` → `"monorepo"`
+/// - `dir:///home/cbro/dotfiles` → `"dotfiles"`
+/// - `ssh://server/repos/mono.git` → `"mono"`
+/// - `s3://bucket/prefix/repo` → `"repo"`
+fn derive_repo_name(url: &str) -> Option<String> {
+    // Strip scheme, then separate host from path.
+    let after_scheme = url.rsplit_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    // For `ssh://server/repos/mono`, after_scheme = `server/repos/mono`.
+    // The first segment is the host; we need at least two segments for a
+    // meaningful repo name.
+    // For `dir:///path/to/repo`, after_scheme = `/path/to/repo` — starts
+    // with `/`, so the host is empty and every segment is path.
+    let segments: Vec<&str> = after_scheme.split('/').filter(|s| !s.is_empty()).collect();
+    // dir:// URLs have no host (empty between :// and first /), so every
+    // segment is a path component. ssh:// and s3:// URLs have a host as
+    // the first segment — we need at least 2 segments to have a path.
+    let has_host = !after_scheme.starts_with('/');
+    let min_segments = if has_host { 2 } else { 1 };
+    if segments.len() < min_segments {
+        return None;
+    }
+    let last = segments.last()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
 }
 
 fn bind_status(e: BindError) -> Status {
@@ -2086,60 +2207,380 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         }))
     }
 
-    // ── M12 managed-workspace stubs (§12.8) ─────────────────────────
-    //
-    // Proto RPCs landed; real implementations follow in the service-
-    // changes commit (§12.14 step 6). These return Unimplemented so
-    // the build stays green while the proto is wired in.
+    // ── M12 managed-workspace RPCs (§12.8, §12.10) ────────────────
 
+    #[tracing::instrument(skip(self))]
     async fn clone(
         &self,
-        _request: Request<CloneReq>,
+        request: Request<CloneReq>,
     ) -> Result<Response<CloneReply>, Status> {
-        Err(Status::unimplemented("Clone not yet implemented (M12)"))
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        // Derive repo name from URL if not provided.
+        let name = if req.name.is_empty() {
+            derive_repo_name(&req.url).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "cannot derive repo name from URL {:?}; pass --name explicitly",
+                    req.url
+                ))
+            })?
+        } else {
+            req.name.clone()
+        };
+        crate::repo_meta::validate_name(&name)
+            .map_err(|e| Status::invalid_argument(format!("invalid repo name: {e:#}")))?;
+
+        // Check for duplicate repo.
+        if root_fs.repo_store(&name).is_some() {
+            return Err(Status::already_exists(format!(
+                "repo {name:?} already registered"
+            )));
+        }
+
+        let storage_dir = match &self.storage {
+            StorageConfig::OnDisk { root } => root.clone(),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "Clone requires on-disk storage",
+                ))
+            }
+        };
+
+        // Create shared git store + redb at repo level.
+        let git_store_path = crate::repo_meta::repo_git_store_path(&storage_dir, &name);
+        let redb_path = crate::repo_meta::repo_redb_path(&storage_dir, &name);
+        let settings = default_user_settings();
+        let store = Arc::new(
+            if git_store_path.join("git").exists() {
+                GitContentStore::load(&settings, &git_store_path, &redb_path)
+            } else {
+                GitContentStore::init(&settings, &git_store_path, &redb_path)
+            }
+            .map_err(store_status("opening repo store"))?,
+        );
+
+        // Parse remote (SSH tunnel, dir://, s3://, etc.).
+        let (remote_store, _ssh_tunnel) =
+            if remote::parse_ssh_url(&req.url)
+                .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?
+                .is_some()
+            {
+                let tunnels_dir = self.tunnels_dir.as_deref().ok_or_else(|| {
+                    Status::internal("SSH tunnels not available in test mode")
+                })?;
+                let (rs, tunnel) = remote::establish_ssh_remote(&req.url, tunnels_dir)
+                    .await
+                    .map_err(|e| Status::internal(format!("SSH tunnel: {e:#}")))?;
+                (Some(rs), Some(tunnel))
+            } else {
+                let rs = remote::parse(&req.url)
+                    .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?;
+                (rs, None)
+            };
+
+        // Register repo with RootFs.
+        root_fs.register_repo(
+            name.clone(),
+            req.url.clone(),
+            Arc::clone(&store),
+            remote_store,
+        );
+
+        // Allocate default workspace slot.
+        let slot = root_fs.alloc_slot();
+        let empty_tree = store.empty_tree_id().as_bytes().to_vec();
+
+        // Create per-workspace directory + workspace.toml.
+        let ws_cfg = crate::repo_meta::WorkspaceConfig {
+            state: crate::repo_meta::WorkspaceState::Active,
+            slot,
+            op_id: Vec::new(),
+            workspace_id: Vec::new(),
+            root_tree_id: empty_tree.clone(),
+        };
+        let ws_cfg_path =
+            crate::repo_meta::workspace_config_path(&storage_dir, &name, "default");
+        ws_cfg
+            .write_to(&ws_cfg_path)
+            .map_err(metadata_status("persisting workspace.toml"))?;
+
+        // Create scratch dir.
+        let scratch = crate::repo_meta::workspace_scratch_dir(&storage_dir, &name, "default");
+        std::fs::create_dir_all(&scratch).map_err(|e| {
+            Status::internal(format!("creating scratch dir: {e}"))
+        })?;
+
+        // Register default workspace with RootFs (active immediately).
+        root_fs
+            .register_workspace(
+                &name,
+                WorkspaceRegistration {
+                    name: "default".to_owned(),
+                    slot,
+                    state: RootFsWorkspaceState::Active,
+                    root_tree_id: empty_tree,
+                    op_id: Vec::new(),
+                    workspace_id: Vec::new(),
+                },
+            )
+            .map_err(|e| Status::internal(format!("registering workspace: {e}")))?;
+
+        // Persist repos.toml.
+        let repos_path = crate::repo_meta::repos_config_path(&storage_dir);
+        let mut repos_cfg = crate::repo_meta::ReposConfig::read_or_default(&repos_path)
+            .map_err(metadata_status("reading repos.toml"))?;
+        repos_cfg.repos.insert(
+            name.clone(),
+            crate::repo_meta::RepoEntry {
+                url: req.url.clone(),
+            },
+        );
+        repos_cfg.next_slot = root_fs.next_slot();
+        repos_cfg
+            .write_to(&repos_path)
+            .map_err(metadata_status("persisting repos.toml"))?;
+
+        let workspace_path = self.workspace_path(&name, "default")?;
+        info!(repo = %name, url = %req.url, path = %workspace_path, "cloned repo");
+        Ok(Response::new(CloneReply { workspace_path }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn repo_list(
         &self,
         _request: Request<RepoListReq>,
     ) -> Result<Response<RepoListReply>, Status> {
-        Err(Status::unimplemented("RepoList not yet implemented (M12)"))
+        let root_fs = self.require_root_fs()?;
+        let repos = root_fs.list_repos();
+        let repo_infos = repos
+            .into_iter()
+            .map(|(name, url, workspaces)| RepoInfo {
+                name,
+                url,
+                workspaces,
+            })
+            .collect();
+        Ok(Response::new(RepoListReply { repos: repo_infos }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn workspace_create(
         &self,
-        _request: Request<WorkspaceCreateReq>,
+        request: Request<WorkspaceCreateReq>,
     ) -> Result<Response<WorkspaceCreateReply>, Status> {
-        Err(Status::unimplemented(
-            "WorkspaceCreate not yet implemented (M12)",
-        ))
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        crate::repo_meta::validate_name(&req.workspace)
+            .map_err(|e| Status::invalid_argument(format!("invalid workspace name: {e:#}")))?;
+
+        // Verify repo exists.
+        if root_fs.repo_store(&req.repo).is_none() {
+            return Err(Status::not_found(format!(
+                "repo {:?} not registered",
+                req.repo
+            )));
+        }
+
+        let storage_dir = match &self.storage {
+            StorageConfig::OnDisk { root } => root.clone(),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "WorkspaceCreate requires on-disk storage",
+                ))
+            }
+        };
+
+        // Allocate slot.
+        let slot = root_fs.alloc_slot();
+        let store = root_fs.repo_store(&req.repo).unwrap();
+        let empty_tree = store.empty_tree_id().as_bytes().to_vec();
+
+        // Create per-workspace directory + workspace.toml in pending state.
+        let ws_cfg = crate::repo_meta::WorkspaceConfig {
+            state: crate::repo_meta::WorkspaceState::Pending,
+            slot,
+            op_id: Vec::new(),
+            workspace_id: Vec::new(),
+            root_tree_id: empty_tree.clone(),
+        };
+        let ws_cfg_path = crate::repo_meta::workspace_config_path(
+            &storage_dir,
+            &req.repo,
+            &req.workspace,
+        );
+        ws_cfg
+            .write_to(&ws_cfg_path)
+            .map_err(metadata_status("persisting workspace.toml"))?;
+
+        // Create scratch dir.
+        let scratch = crate::repo_meta::workspace_scratch_dir(
+            &storage_dir,
+            &req.repo,
+            &req.workspace,
+        );
+        std::fs::create_dir_all(&scratch).map_err(|e| {
+            Status::internal(format!("creating scratch dir: {e}"))
+        })?;
+
+        // Register workspace in pending state (hidden from readdir/lookup).
+        root_fs
+            .register_workspace(
+                &req.repo,
+                WorkspaceRegistration {
+                    name: req.workspace.clone(),
+                    slot,
+                    state: RootFsWorkspaceState::Pending,
+                    root_tree_id: empty_tree,
+                    op_id: Vec::new(),
+                    workspace_id: Vec::new(),
+                },
+            )
+            .map_err(|e| match e {
+                FsError::AlreadyExists => Status::already_exists(format!(
+                    "workspace {:?} already exists in repo {:?}",
+                    req.workspace, req.repo
+                )),
+                _ => Status::internal(format!("registering workspace: {e}")),
+            })?;
+
+        // Persist repos.toml (updated next_slot).
+        let repos_path = crate::repo_meta::repos_config_path(&storage_dir);
+        let mut repos_cfg = crate::repo_meta::ReposConfig::read_or_default(&repos_path)
+            .map_err(metadata_status("reading repos.toml"))?;
+        repos_cfg.next_slot = root_fs.next_slot();
+        repos_cfg
+            .write_to(&repos_path)
+            .map_err(metadata_status("persisting repos.toml"))?;
+
+        let workspace_path = self.workspace_path(&req.repo, &req.workspace)?;
+        info!(
+            repo = %req.repo,
+            workspace = %req.workspace,
+            slot,
+            path = %workspace_path,
+            "created workspace (pending)"
+        );
+        Ok(Response::new(WorkspaceCreateReply { workspace_path }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn workspace_finalize(
         &self,
-        _request: Request<WorkspaceFinalizeReq>,
+        request: Request<WorkspaceFinalizeReq>,
     ) -> Result<Response<WorkspaceFinalizeReply>, Status> {
-        Err(Status::unimplemented(
-            "WorkspaceFinalize not yet implemented (M12)",
-        ))
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        root_fs.finalize_workspace(&req.repo, &req.workspace).map_err(|e| {
+            match e {
+                FsError::NotFound => Status::not_found(format!(
+                    "workspace {:?}/{:?} not found",
+                    req.repo, req.workspace
+                )),
+                _ => Status::internal(format!("finalizing workspace: {e}")),
+            }
+        })?;
+
+        // Update workspace.toml state to active.
+        if let StorageConfig::OnDisk { root } = &self.storage {
+            let ws_cfg_path = crate::repo_meta::workspace_config_path(
+                root,
+                &req.repo,
+                &req.workspace,
+            );
+            if let Ok(mut cfg) = crate::repo_meta::WorkspaceConfig::read_from(&ws_cfg_path) {
+                cfg.state = crate::repo_meta::WorkspaceState::Active;
+                if let Err(e) = cfg.write_to(&ws_cfg_path) {
+                    warn!(error = %format!("{e:#}"), "failed to persist workspace.toml state");
+                }
+            }
+        }
+
+        info!(
+            repo = %req.repo,
+            workspace = %req.workspace,
+            "finalized workspace (now active)"
+        );
+        Ok(Response::new(WorkspaceFinalizeReply {}))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn workspace_list(
         &self,
-        _request: Request<WorkspaceListReq>,
+        request: Request<WorkspaceListReq>,
     ) -> Result<Response<WorkspaceListReply>, Status> {
-        Err(Status::unimplemented(
-            "WorkspaceList not yet implemented (M12)",
-        ))
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        let repos = root_fs.list_repos();
+        let repo_info = repos
+            .iter()
+            .find(|(name, _, _)| *name == req.repo);
+        let (_, _, ws_names) = repo_info.ok_or_else(|| {
+            Status::not_found(format!("repo {:?} not registered", req.repo))
+        })?;
+
+        let mount_root = self.mount_root.as_ref().ok_or_else(|| {
+            Status::failed_precondition("managed workspaces not configured")
+        })?;
+
+        let workspaces = ws_names
+            .iter()
+            .map(|ws| WorkspaceInfo {
+                name: ws.clone(),
+                path: mount_root
+                    .join(&req.repo)
+                    .join(ws)
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .collect();
+        Ok(Response::new(WorkspaceListReply { workspaces }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn workspace_delete(
         &self,
-        _request: Request<WorkspaceDeleteReq>,
+        request: Request<WorkspaceDeleteReq>,
     ) -> Result<Response<WorkspaceDeleteReply>, Status> {
-        Err(Status::unimplemented(
-            "WorkspaceDelete not yet implemented (M12)",
-        ))
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        // Remove from RootFs (drops KikiFs, retires slot).
+        let _retired_slot =
+            root_fs.remove_workspace(&req.repo, &req.workspace).map_err(|e| {
+                match e {
+                    FsError::NotFound => Status::not_found(format!(
+                        "workspace {:?}/{:?} not found",
+                        req.repo, req.workspace
+                    )),
+                    _ => Status::internal(format!("removing workspace: {e}")),
+                }
+            })?;
+
+        // Remove per-workspace directory on disk.
+        if let StorageConfig::OnDisk { root } = &self.storage {
+            let ws_dir =
+                crate::repo_meta::workspace_dir(root, &req.repo, &req.workspace);
+            if ws_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&ws_dir) {
+                    warn!(
+                        path = %ws_dir.display(),
+                        error = %e,
+                        "failed to remove workspace directory"
+                    );
+                }
+            }
+        }
+
+        info!(
+            repo = %req.repo,
+            workspace = %req.workspace,
+            "deleted workspace"
+        );
+        Ok(Response::new(WorkspaceDeleteReply {}))
     }
 }
 
@@ -4089,5 +4530,63 @@ mod tests {
         drop(vfs_handle);
         vfs_task.abort();
         vfs_task2.abort();
+    }
+
+    // ── M12 helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn derive_repo_name_from_urls() {
+        assert_eq!(
+            super::derive_repo_name("ssh://server/repos/monorepo"),
+            Some("monorepo".to_owned())
+        );
+        assert_eq!(
+            super::derive_repo_name("dir:///home/cbro/dotfiles"),
+            Some("dotfiles".to_owned())
+        );
+        assert_eq!(
+            super::derive_repo_name("ssh://server/repos/mono.git"),
+            Some("mono".to_owned())
+        );
+        assert_eq!(
+            super::derive_repo_name("s3://bucket/prefix/repo"),
+            Some("repo".to_owned())
+        );
+        assert_eq!(
+            super::derive_repo_name("ssh://server/repos/mono.git/"),
+            Some("mono".to_owned())
+        );
+        assert_eq!(super::derive_repo_name("ssh://server/"), None);
+    }
+
+    #[test]
+    fn resolve_workspace_parses_components() {
+        let mut svc = JujutsuService::bare();
+        svc.mount_root = Some(PathBuf::from("/mnt/kiki"));
+
+        let (repo, ws) = svc
+            .resolve_workspace("/mnt/kiki/monorepo/default")
+            .unwrap();
+        assert_eq!(repo, "monorepo");
+        assert_eq!(ws, "default");
+
+        // Subdirectory within workspace — trailing components ignored.
+        let (repo, ws) = svc
+            .resolve_workspace("/mnt/kiki/monorepo/fix-auth/src/main.rs")
+            .unwrap();
+        assert_eq!(repo, "monorepo");
+        assert_eq!(ws, "fix-auth");
+
+        // Path outside mount root → error.
+        assert!(svc.resolve_workspace("/tmp/other").is_err());
+
+        // Missing workspace component → error.
+        assert!(svc.resolve_workspace("/mnt/kiki/monorepo").is_err());
+
+        // No mount_root configured �� error.
+        let svc_bare = JujutsuService::bare();
+        assert!(svc_bare
+            .resolve_workspace("/mnt/kiki/repo/ws")
+            .is_err());
     }
 }
