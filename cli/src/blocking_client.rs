@@ -436,4 +436,13 @@ impl BlockingJujutsuInterfaceClient {
         let rt = self.rt.lock().unwrap();
         rt.block_on(client.workspace_delete(request))
     }
+
+    pub fn repo_delete(
+        &self,
+        request: impl tonic::IntoRequest<RepoDeleteReq>,
+    ) -> Result<tonic::Response<RepoDeleteReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.repo_delete(request))
+    }
 }

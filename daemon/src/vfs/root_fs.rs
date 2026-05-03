@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::git_store::GitContentStore;
 use crate::local_refs::LocalRefs;
@@ -346,6 +346,26 @@ impl RootFs {
         Ok(ws_entry.slot)
     }
 
+    /// Remove an entire repo: deregister all workspaces, remove
+    /// the repo dir from the synthetic namespace, and drop the store.
+    /// Returns the list of retired workspace slots.
+    pub fn remove_repo(&self, repo: &str) -> Result<Vec<u32>, FsError> {
+        let mut inner = self.inner.lock();
+        let repo_entry = inner.repos.remove(repo).ok_or(FsError::NotFound)?;
+        // Drop all live workspace KikiFs instances.
+        let mut retired = Vec::new();
+        for (_, ws_entry) in &repo_entry.workspaces {
+            inner.live.remove(&ws_entry.slot);
+            retired.push(ws_entry.slot);
+        }
+        // Remove the repo's synthetic dir and its entry in root's children.
+        inner.synthetic_dirs.remove(&repo_entry.inode);
+        if let Some(root) = inner.synthetic_dirs.get_mut(&ROOT_INODE) {
+            root.children.remove(repo);
+        }
+        Ok(retired)
+    }
+
     /// Allocate the next workspace slot. Monotonic, never reused.
     pub fn alloc_slot(&self) -> u32 {
         let mut inner = self.inner.lock();
@@ -446,32 +466,36 @@ impl RootFs {
         workspace_id: Vec<u8>,
     ) -> Result<(), FsError> {
         let mut inner = self.inner.lock();
+        // Extract storage_dir before taking a mutable borrow on repos.
+        let storage_dir = inner.storage_dir.clone();
         let repo_entry = inner.repos.get_mut(repo).ok_or(FsError::NotFound)?;
         let ws_entry = repo_entry
             .workspaces
             .get_mut(ws)
             .ok_or(FsError::NotFound)?;
-        ws_entry.op_id = op_id.clone();
-        ws_entry.workspace_id = workspace_id.clone();
-        // Persist to workspace.toml.
+        // Persist to workspace.toml BEFORE updating in-memory state,
+        // so a write failure doesn't leave memory diverged from disk.
         let cfg = crate::repo_meta::WorkspaceConfig {
             state: match ws_entry.state {
                 WorkspaceState::Active => crate::repo_meta::WorkspaceState::Active,
                 WorkspaceState::Pending => crate::repo_meta::WorkspaceState::Pending,
             },
             slot: ws_entry.slot,
-            op_id,
-            workspace_id,
+            op_id: op_id.clone(),
+            workspace_id: workspace_id.clone(),
             root_tree_id: ws_entry.root_tree_id.clone(),
         };
         let path = crate::repo_meta::workspace_config_path(
-            &inner.storage_dir,
+            &storage_dir,
             repo,
             ws,
         );
-        if let Err(e) = cfg.write_to(&path) {
-            warn!(error = %format!("{e:#}"), "failed to persist workspace.toml");
-        }
+        cfg.write_to(&path).map_err(|e| {
+            FsError::StoreError(format!("failed to persist workspace.toml: {e:#}"))
+        })?;
+        // Persist succeeded — now update in-memory state.
+        ws_entry.op_id = op_id;
+        ws_entry.workspace_id = workspace_id;
         Ok(())
     }
 
@@ -483,13 +507,15 @@ impl RootFs {
         root_tree_id: Vec<u8>,
     ) -> Result<(), FsError> {
         let mut inner = self.inner.lock();
+        // Extract storage_dir before taking a mutable borrow on repos.
+        let storage_dir = inner.storage_dir.clone();
         let repo_entry = inner.repos.get_mut(repo).ok_or(FsError::NotFound)?;
         let ws_entry = repo_entry
             .workspaces
             .get_mut(ws)
             .ok_or(FsError::NotFound)?;
-        ws_entry.root_tree_id = root_tree_id.clone();
-        // Persist to workspace.toml.
+        // Persist to workspace.toml BEFORE updating in-memory state,
+        // so a write failure doesn't leave memory diverged from disk.
         let cfg = crate::repo_meta::WorkspaceConfig {
             state: match ws_entry.state {
                 WorkspaceState::Active => crate::repo_meta::WorkspaceState::Active,
@@ -498,16 +524,18 @@ impl RootFs {
             slot: ws_entry.slot,
             op_id: ws_entry.op_id.clone(),
             workspace_id: ws_entry.workspace_id.clone(),
-            root_tree_id,
+            root_tree_id: root_tree_id.clone(),
         };
         let path = crate::repo_meta::workspace_config_path(
-            &inner.storage_dir,
+            &storage_dir,
             repo,
             ws,
         );
-        if let Err(e) = cfg.write_to(&path) {
-            warn!(error = %format!("{e:#}"), "failed to persist workspace.toml");
-        }
+        cfg.write_to(&path).map_err(|e| {
+            FsError::StoreError(format!("failed to persist workspace.toml: {e:#}"))
+        })?;
+        // Persist succeeded — now update in-memory state.
+        ws_entry.root_tree_id = root_tree_id;
         Ok(())
     }
 

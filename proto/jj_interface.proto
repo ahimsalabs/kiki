@@ -143,6 +143,9 @@ service JujutsuInterface {
   // Remove a workspace: deregister from RootFs, retire the slot, delete
   // on-disk state.
   rpc WorkspaceDelete(WorkspaceDeleteReq) returns (WorkspaceDeleteReply) {}
+  // Remove an entire repo: deregister all workspaces, remove from RootFs
+  // and repos.toml, delete on-disk state. Used for clone rollback.
+  rpc RepoDelete(RepoDeleteReq) returns (RepoDeleteReply) {}
 
   // M10.5 — catalog (mutable refs) on the per-mount level. Same shape
   // as the daemon-to-daemon `service RemoteStore` ref RPCs (§10.4) but
@@ -673,6 +676,12 @@ message WorkspaceDeleteReq {
   string workspace = 2;
 }
 message WorkspaceDeleteReply {}
+
+message RepoDeleteReq {
+  // Repo name to delete.
+  string name = 1;
+}
+message RepoDeleteReply {}
 
 // ── M13 — first-class git clone ───────────────────────────────────
 

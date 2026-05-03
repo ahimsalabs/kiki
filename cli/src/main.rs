@@ -19,6 +19,7 @@ mod backend;
 mod blocking_client;
 mod daemon_client;
 mod daemon_cmd;
+mod doctor;
 mod op_heads_store;
 mod op_store;
 mod working_copy;
@@ -48,6 +49,16 @@ pub(crate) struct InitArgs {
     destination: String,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+struct DoctorArgs {
+    /// Attempt to repair detected issues
+    #[arg(long)]
+    fix: bool,
+    /// Only check a specific repo
+    #[arg(long)]
+    repo: Option<String>,
+}
+
 #[derive(Debug, Clone, clap::Subcommand)]
 enum KikiCommands {
     Init(InitArgs),
@@ -56,6 +67,8 @@ enum KikiCommands {
     Setup,
     /// Daemon lifecycle management
     Daemon(daemon_cmd::DaemonArgs),
+    /// Diagnose and repair managed workspace state
+    Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -734,6 +747,11 @@ async fn run_kk_command(
         return run_setup(ui);
     }
 
+    // doctor runs standalone — reads storage state directly.
+    if let KikiCommands::Doctor(ref args) = command {
+        return doctor::run_doctor(ui, args.fix, args.repo.as_deref());
+    }
+
     // daemon subcommands run standalone — they manage the daemon lifecycle.
     if let KikiCommands::Daemon(ref args) = command {
         daemon_cmd::dispatch_daemon(args)?;
@@ -877,7 +895,7 @@ async fn run_kk_command(
 
             Ok(())
         }
-        KikiCommands::Daemon(_) | KikiCommands::Setup => {
+        KikiCommands::Daemon(_) | KikiCommands::Setup | KikiCommands::Doctor(_) => {
             // Handled above before daemon connection.
             unreachable!()
         }
@@ -1410,10 +1428,27 @@ async fn run_clone_command(
 
     let wc_path = std::path::PathBuf::from(&workspace_path);
 
+    // Derive repo name from workspace path (~/kiki/<repo>/<workspace>)
+    // for rollback in case init fails.
+    let repo_name = wc_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_owned());
+
     // Initialize the jj workspace at the managed path. This is the same
     // flow as `kiki kk init` (§12.11): create the .jj/ metadata through
     // the VFS, using daemon-backed store factories.
-    init_jj_workspace(command_helper, &wc_path, &workspace_path).await?;
+    if let Err(e) = init_jj_workspace(command_helper, &wc_path, &workspace_path).await {
+        // Rollback: delete the partially-created repo so we don't leave
+        // a zombie (registered, files visible, but no jj metadata).
+        if let Some(ref name) = repo_name {
+            let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
+                name: name.clone(),
+            });
+        }
+        return Err(e);
+    }
 
     // If the clone resolved an initial tree (e.g. default branch tip for
     // git clone), issue a CheckOut to materialize it and persist the
@@ -1421,12 +1456,20 @@ async fn run_clone_command(
     // with an empty tree until the user manually checks out a commit, and
     // a daemon restart before that would lose any content reference.
     if !initial_tree_id.is_empty() {
-        client
+        if let Err(e) = client
             .check_out(proto::jj_interface::CheckOutReq {
                 working_copy_path: workspace_path.clone(),
                 new_tree_id: initial_tree_id,
             })
-            .map_err(|e| user_error_with_message("initial CheckOut failed", e))?;
+        {
+            // Rollback on CheckOut failure too.
+            if let Some(ref name) = repo_name {
+                let _ = client.repo_delete(proto::jj_interface::RepoDeleteReq {
+                    name: name.clone(),
+                });
+            }
+            return Err(user_error_with_message("initial CheckOut failed", e));
+        }
     }
 
     // Create symlink if --link was requested.

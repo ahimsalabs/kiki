@@ -2017,8 +2017,13 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             let root_fs = self.require_root_fs()?;
             root_fs
                 .set_checkout_state(&repo, &ws, checkout.op_id, checkout.workspace_id)
-                .map_err(|_| {
-                    Status::not_found(format!("workspace {repo}/{ws} not found"))
+                .map_err(|e| match e {
+                    FsError::NotFound => {
+                        Status::not_found(format!("workspace {repo}/{ws} not found"))
+                    }
+                    other => Status::internal(format!(
+                        "SetCheckoutState for {repo}/{ws}: {other:?}"
+                    )),
                 })?;
             return Ok(Response::new(SetCheckoutStateReply {}));
         }
@@ -2097,10 +2102,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             let root_fs = self.require_root_fs()?;
             root_fs
                 .set_root_tree_id(repo, ws, new_root.0.to_vec())
-                .map_err(|_| {
-                    Status::not_found(format!(
-                        "workspace {repo}/{ws} disappeared during snapshot"
-                    ))
+                .map_err(|e| match e {
+                    FsError::NotFound => {
+                        Status::not_found(format!(
+                            "workspace {repo}/{ws} disappeared during snapshot"
+                        ))
+                    }
+                    other => Status::internal(format!(
+                        "persisting root_tree_id for {repo}/{ws}: {other:?}"
+                    )),
                 })?;
         } else {
             let mut mounts = self.mounts.lock().await;
@@ -2194,10 +2204,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             let root_fs = self.require_root_fs()?;
             root_fs
                 .set_root_tree_id(repo, ws, req.new_tree_id)
-                .map_err(|_| {
-                    Status::not_found(format!(
-                        "workspace {repo}/{ws} disappeared during check_out"
-                    ))
+                .map_err(|e| match e {
+                    FsError::NotFound => {
+                        Status::not_found(format!(
+                            "workspace {repo}/{ws} disappeared during check_out"
+                        ))
+                    }
+                    other => Status::internal(format!(
+                        "persisting root_tree_id for {repo}/{ws}: {other:?}"
+                    )),
                 })?;
         } else {
             let mut mounts = self.mounts.lock().await;
@@ -2268,13 +2283,16 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 .await
                 .ok()
                 .flatten();
-            let _ = rs
+            if let Err(e) = rs
                 .cas_ref(
                     crate::git_ops::GIT_REMOTES_REF,
                     current.as_ref(),
                     Some(&new_val),
                 )
-                .await;
+                .await
+            {
+                warn!("failed to replicate git_remotes ref on remote add: {e:#}");
+            }
         }
 
         Ok(Response::new(GitRemoteAddReply {}))
@@ -2855,7 +2873,12 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // and KikiFs so the FUSE mount shows content immediately (before
         // the CLI's CheckOut call persists it to workspace.toml).
         if !initial_tree_id.is_empty() && initial_tree_id != empty_tree_clone {
-            let _ = root_fs.set_root_tree_id(&name, "default", initial_tree_id.clone());
+            if let Err(e) = root_fs.set_root_tree_id(&name, "default", initial_tree_id.clone()) {
+                warn!(
+                    error = %format!("{e:?}"),
+                    "eager set_root_tree_id during git_clone (will be set by CheckOut)"
+                );
+            }
         }
 
         let reply_bookmarks = bookmarks
@@ -3206,12 +3229,20 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 &req.repo,
                 &req.workspace,
             );
-            if let Ok(mut cfg) = crate::repo_meta::WorkspaceConfig::read_from(&ws_cfg_path) {
-                cfg.state = crate::repo_meta::WorkspaceState::Active;
-                if let Err(e) = cfg.write_to(&ws_cfg_path) {
-                    warn!(error = %format!("{e:#}"), "failed to persist workspace.toml state");
-                }
-            }
+            let mut cfg = crate::repo_meta::WorkspaceConfig::read_from(&ws_cfg_path)
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "reading workspace.toml for {}/{}: {e:#}",
+                        req.repo, req.workspace
+                    ))
+                })?;
+            cfg.state = crate::repo_meta::WorkspaceState::Active;
+            cfg.write_to(&ws_cfg_path).map_err(|e| {
+                Status::internal(format!(
+                    "persisting workspace.toml state for {}/{}: {e:#}",
+                    req.repo, req.workspace
+                ))
+            })?;
         }
 
         info!(
@@ -3297,6 +3328,55 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             "deleted workspace"
         );
         Ok(Response::new(WorkspaceDeleteReply {}))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn repo_delete(
+        &self,
+        request: Request<RepoDeleteReq>,
+    ) -> Result<Response<RepoDeleteReply>, Status> {
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        // Remove from RootFs (drops all workspace KikiFs instances).
+        root_fs.remove_repo(&req.name).map_err(|e| match e {
+            FsError::NotFound => {
+                Status::not_found(format!("repo {:?} not found", req.name))
+            }
+            _ => Status::internal(format!("removing repo: {e}")),
+        })?;
+
+        // Remove on-disk state: repo directory and repos.toml entry.
+        if let StorageConfig::OnDisk { root } = &self.storage {
+            let repo_dir = crate::repo_meta::repo_dir(root, &req.name);
+            if repo_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&repo_dir) {
+                    warn!(
+                        path = %repo_dir.display(),
+                        error = %e,
+                        "failed to remove repo directory"
+                    );
+                }
+            }
+
+            // Update repos.toml.
+            let repos_path = crate::repo_meta::repos_config_path(root);
+            match crate::repo_meta::ReposConfig::read_or_default(&repos_path) {
+                Ok(mut repos_cfg) => {
+                    repos_cfg.repos.remove(&req.name);
+                    repos_cfg.next_slot = root_fs.next_slot();
+                    if let Err(e) = repos_cfg.write_to(&repos_path) {
+                        warn!(error = %format!("{e:#}"), "failed to update repos.toml after repo delete");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "failed to read repos.toml for cleanup");
+                }
+            }
+        }
+
+        info!(repo = %req.name, "deleted repo");
+        Ok(Response::new(RepoDeleteReply {}))
     }
 }
 
