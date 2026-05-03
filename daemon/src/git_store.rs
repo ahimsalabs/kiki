@@ -709,6 +709,11 @@ pub fn commit_from_proto(
             .into_iter()
             .map(|b| TreeId::from_bytes(&b))
             .collect();
+        anyhow::ensure!(
+            tree_ids.len() % 2 != 0,
+            "root_tree merge must have an odd number of terms, got {}",
+            tree_ids.len()
+        );
         Merge::from_vec(tree_ids)
     } else {
         let id = proto
@@ -754,6 +759,11 @@ pub fn commit_from_proto(
     let conflict_labels: Merge<String> = if proto.conflict_labels.is_empty() {
         Merge::resolved(String::new())
     } else {
+        anyhow::ensure!(
+            proto.conflict_labels.len() % 2 != 0,
+            "conflict_labels merge must have an odd number of terms, got {}",
+            proto.conflict_labels.len()
+        );
         Merge::from_vec(proto.conflict_labels)
     };
 
@@ -1582,6 +1592,72 @@ mod proptests {
             prop_assert_eq!(&read_back.author.name, &stored.author.name);
             prop_assert_eq!(&read_back.author.email, &stored.author.email);
             prop_assert_eq!(&read_back.root_tree, &stored.root_tree);
+        }
+    }
+
+    // ---- commit_from_proto rejects even-length merge vecs ----
+
+    /// Regression: an even-length `root_tree` repeated field triggers
+    /// `Merge::from_vec`'s assert (`values.len() % 2 != 0`), panicking
+    /// the daemon. `commit_from_proto` must return `Err`, not panic.
+    #[test]
+    fn commit_from_proto_rejects_even_length_root_tree() {
+        let proto = proto::jj_interface::Commit {
+            parents: vec![vec![0; 20]],
+            root_tree: vec![vec![1; 20], vec![2; 20]], // even: 2 entries
+            uses_tree_conflict_format: true,
+            change_id: vec![0xaa; 16],
+            ..Default::default()
+        };
+        let result = commit_from_proto(proto);
+        assert!(
+            result.is_err(),
+            "even-length root_tree should be rejected, not panic"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("odd"),
+            "error should mention odd-number requirement, got: {msg}"
+        );
+    }
+
+    /// Same regression for `conflict_labels`: even-length vec must be
+    /// rejected gracefully.
+    #[test]
+    fn commit_from_proto_rejects_even_length_conflict_labels() {
+        let proto = proto::jj_interface::Commit {
+            parents: vec![vec![0; 20]],
+            root_tree: vec![vec![1; 20]], // valid: single resolved tree
+            uses_tree_conflict_format: false,
+            conflict_labels: vec!["a".into(), "b".into()], // even: 2 entries
+            change_id: vec![0xbb; 16],
+            ..Default::default()
+        };
+        let result = commit_from_proto(proto);
+        assert!(
+            result.is_err(),
+            "even-length conflict_labels should be rejected, not panic"
+        );
+    }
+
+    proptest! {
+        /// Property: any even-length root_tree vec must be rejected.
+        #[test]
+        fn commit_from_proto_even_root_tree_never_panics(
+            n in 1usize..5,
+        ) {
+            let even_count = n * 2;
+            let tree_ids: Vec<Vec<u8>> = (0..even_count)
+                .map(|i| vec![i as u8; 20])
+                .collect();
+            let proto = proto::jj_interface::Commit {
+                parents: vec![vec![0; 20]],
+                root_tree: tree_ids,
+                uses_tree_conflict_format: true,
+                change_id: vec![0xcc; 16],
+                ..Default::default()
+            };
+            prop_assert!(commit_from_proto(proto).is_err());
         }
     }
 
