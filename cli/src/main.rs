@@ -756,14 +756,6 @@ async fn run_kk_command(
         return Ok(());
     }
 
-    // repo list reads from disk — no daemon needed.
-    if let KikiCommands::Repo(RepoCommandArgs {
-        command: RepoCommands::List,
-    }) = command
-    {
-        return run_repo_list(ui);
-    }
-
     let client = daemon_client::connect_or_start(command_helper.settings())
         .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
     match command {
