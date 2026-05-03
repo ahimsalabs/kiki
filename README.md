@@ -47,7 +47,7 @@ format and no translation layer.
 This means:
 - `kiki git push` sends objects to GitHub with zero conversion
 - Teammates without kiki just `git clone`
-- Every remote type (`dir://`, `ssh://`, `kiki://`, git forges)
+- Every remote type (`dir://`, `s3://`, `ssh://`, `kiki://`, git forges)
   stores identical bytes — same objects, different transport
 - Stock git tools (`git log`, `git blame`) work against mounts
   via a synthesized `.git` pointer
@@ -60,7 +60,7 @@ kiki (CLI)
   ▼
 daemon
   ├─ GitBackend    bare git repo (content store)
-  ├─ RemoteStore   dir:// · ssh:// · kiki:// (grpc)
+  ├─ RemoteStore   dir:// · s3:// · ssh:// · kiki:// (grpc)
   └─ VFS           FUSE (Linux) · NFS (macOS)
 ```
 
@@ -71,7 +71,7 @@ background sync. `kiki kk daemon status` shows what's running.
 ## Status
 
 **Working:** read/write/snapshot, FUSE and NFS mounts, background
-sync, multi-machine sharing via `dir://` / `ssh://` / `kiki://`,
+sync, multi-machine sharing via `dir://` / `s3://` / `ssh://` / `kiki://`,
 git push and fetch to GitHub/GitLab, operation log sharing.
 
 **In progress:** `.gitignore`-aware VFS, async offline push queue,

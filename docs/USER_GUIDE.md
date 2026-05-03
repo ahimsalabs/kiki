@@ -13,7 +13,7 @@ backed by a daemon that handles storage, caching, and remote synchronization.
 ```mermaid
 graph LR
     CLI["kiki<br/>(jj superset)"] -- "gRPC (UDS)" --> Daemon
-    Daemon -- "dir:// / ssh:// / kiki://" --> Remote["Remote Store"]
+    Daemon -- "dir:// / s3:// / ssh:// / kiki://" --> Remote["Remote Store"]
     Daemon -- mount --> VFS["Working copy<br/>(FUSE / NFS)"]
 ```
 
@@ -25,11 +25,12 @@ graph LR
   command. Mounts repos as virtual filesystems, manages a durable per-mount
   store (redb), and optionally syncs blobs and operation state to a remote.
   No manual configuration needed.
-- **Remote** (`dir://`, `ssh://`, or `kiki://`): Content-addressed blob store
-  with compare-and-swap mutable refs. `ssh://` remotes need only the `kiki`
-  binary on the server — the local daemon manages a persistent SSH tunnel to
-  the remote daemon. `kiki://` remotes connect to a running daemon on another
-  machine (e.g., over Tailscale).
+- **Remote** (`dir://`, `s3://`, `ssh://`, or `kiki://`): Content-addressed
+  blob store with compare-and-swap mutable refs. `s3://` remotes use the AWS
+  SDK default credential chain. `ssh://` remotes need only the `kiki` binary on
+  the server — the local daemon manages a persistent SSH tunnel to the remote
+  daemon. `kiki://` remotes connect to a running daemon on another machine
+  (e.g., over Tailscale).
 
 ## Prerequisites
 
@@ -111,6 +112,7 @@ kiki kk init <remote> [destination]
 | Scheme    | Example                          | Description |
 |-----------|----------------------------------|-------------|
 | `dir://`  | `dir:///tmp/kiki-remote`         | Filesystem-backed remote. Good for local testing and single-machine use. |
+| `s3://`   | `s3://my-bucket/repos/project`   | S3-backed remote. Uses AWS SDK credentials and bucket permissions. |
 | `ssh://`  | `ssh://user@host/data/store`     | SSH transport. Needs only the `kiki` binary on the server. The local daemon manages a persistent SSH tunnel. |
 | `kiki://` | `kiki://myserver:12000`          | Another kiki daemon's gRPC endpoint. Enables peer-to-peer sync (e.g., over Tailscale). |
 | `grpc://` | `grpc://[::1]:12000`             | Alias for `kiki://`. |
@@ -126,6 +128,9 @@ kiki kk init "" my-project
 
 # Repo backed by a filesystem remote
 kiki kk init "dir:///shared/kiki-store" my-project
+
+# Repo backed by S3
+kiki kk init "s3://my-bucket/repos/my-project" my-project
 
 # Repo syncing over SSH (no daemon needed on the server)
 kiki kk init "ssh://user@myserver/data/kiki-store" my-project
@@ -196,9 +201,10 @@ kiki kk status
 
 ## Multi-user / multi-machine sync
 
-When two CLIs point at the same remote (e.g., a shared `ssh://` server, a
-`dir://` path, or a `kiki://` peer), kiki serializes operation-log advances via compare-and-swap
-on the remote's mutable ref catalog. This means:
+When two CLIs point at the same remote (e.g., an `s3://` bucket prefix, a shared
+`ssh://` server, a `dir://` path, or a `kiki://` peer), kiki serializes
+operation-log advances via compare-and-swap on the remote's mutable ref catalog.
+This means:
 
 - **Blob sync:** Every write is pushed to the remote immediately
   (write-through). Reads fall through to the remote on local cache miss
@@ -217,6 +223,23 @@ kiki kk init "dir:///shared/remote" project
 
 # Machine B
 kiki kk init "dir:///shared/remote" project
+
+# Both machines see each other's commits and operations
+```
+
+### Example: two machines sharing an s3:// remote
+
+Configure AWS credentials using the standard AWS SDK mechanisms, such as
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, SSO, ECS,
+or instance metadata. Both machines must have permission to read, write, list,
+and conditionally update objects under the same bucket prefix.
+
+```bash
+# Machine A
+kiki kk init "s3://my-bucket/repos/project" project
+
+# Machine B
+kiki kk init "s3://my-bucket/repos/project" project
 
 # Both machines see each other's commits and operations
 ```
@@ -351,8 +374,10 @@ daemons sharing the same remote serialize ref updates via compare-and-swap.
   by default. For `kiki://` remotes on a LAN or Tailscale, the network
   provides the trust boundary. Don't expose the gRPC port to untrusted
   networks. `ssh://` remotes inherit SSH's authentication and encryption.
-- **No S3 / cloud remote.** Only `dir://`, `ssh://`, and `kiki://` backends
-  exist today. Cloud storage is planned for a future milestone.
+- **S3-compatible backend requirements.** `s3://` remotes rely on conditional
+  object writes/deletes for ref compare-and-swap. AWS S3 supports this; S3-like
+  services must support `If-Match` / `If-None-Match` on object writes and
+  deletes to be safe for concurrent writers.
 - **No sparse patterns.** `set_sparse_patterns` is unimplemented. With a
   lazy VFS this is less important than for on-disk working copies.
 - **Daemon restart drops kernel file handles.** The inode slab is in-memory;
@@ -361,7 +386,7 @@ daemons sharing the same remote serialize ref updates via compare-and-swap.
   commands after restart works fine.
 - **Synchronous remote push.** `Snapshot` blocks until all new blobs land on
   the remote. Fine for localhost and `dir://`; will need an async push queue
-  for real network remotes.
+  for higher-latency network remotes.
 - **Some jj commands are unimplemented.** `recover`, `rename_workspace`,
   `reset`, and sparse-patterns operations will panic with `todo!`.
 

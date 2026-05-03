@@ -503,8 +503,8 @@ impl JujutsuService {
         // is skipped by `rehydrate`) rather than panicking, so the
         // operator can prune the broken mount dir.
         //
-        // For `ssh://` URLs, re-establish the tunnel (the previous
-        // daemon's SSH child is dead).
+        // Async schemes (ssh://, s3://) need their own establishment
+        // path; the previous daemon's state is dead, so we re-establish.
         let (remote_store, ssh_tunnel) = if remote::parse_ssh_url(&meta.remote)
             .with_context(|| format!("parsing remote URL {:?}", meta.remote))?
             .is_some()
@@ -524,6 +524,14 @@ impl JujutsuService {
                     .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
                 (store, None)
             }
+        } else if remote::is_s3_url(&meta.remote) {
+            let store = remote::establish_s3_remote(&meta.remote)
+                .await
+                .with_context(|| format!(
+                    "re-establishing S3 remote for {:?}",
+                    meta.remote
+                ))?;
+            (Some(store), None)
         } else {
             let store = remote::parse(&meta.remote)
                 .with_context(|| format!("parsing remote URL {:?}", meta.remote))?;
@@ -1177,8 +1185,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // than a generic internal error or — worse — a silent drop into
         // "no remote configured". Empty string is still `Ok(None)`.
         //
-        // For `ssh://` URLs, establish a persistent tunnel to the remote
-        // daemon and connect via GrpcRemoteStore over the forwarded UDS.
+        // Async schemes (ssh://, s3://) need their own establishment
+        // path; synchronous ones (dir://, kiki://, grpc://) go through
+        // `remote::parse()`.
         let (remote_store, ssh_tunnel) = if remote::parse_ssh_url(&req.remote)
             .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?
             .is_some()
@@ -1190,6 +1199,11 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 .await
                 .map_err(|e| Status::internal(format!("SSH tunnel: {e:#}")))?;
             (Some(store), Some(tunnel))
+        } else if remote::is_s3_url(&req.remote) {
+            let store = remote::establish_s3_remote(&req.remote)
+                .await
+                .map_err(|e| Status::internal(format!("S3 remote: {e:#}")))?;
+            (Some(store), None)
         } else {
             let store = remote::parse(&req.remote)
                 .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?;

@@ -172,7 +172,7 @@ pub fn parse_dir(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
     }
     let (scheme, rest) = remote
         .split_once("://")
-        .ok_or_else(|| anyhow!("remote {remote:?} has no scheme; expected dir://…, ssh://…, or kiki://…"))?;
+        .ok_or_else(|| anyhow!("remote {remote:?} has no scheme; expected dir://…, s3://…, ssh://…, or kiki://…"))?;
     match scheme {
         "dir" => {
             if !rest.starts_with('/') {

@@ -21,6 +21,7 @@ pub use store::{BlobKind, CasOutcome, RemoteStore, validate_ref_name};
 pub mod fetch;
 pub mod fs;
 pub mod grpc;
+pub mod s3;
 pub mod server;
 pub mod tunnel;
 
@@ -34,9 +35,10 @@ mod sync_sim_tests;
 /// - `dir:///abs/path` → filesystem-backed remote.
 /// - `kiki://host:port` or `grpc://host:port` → peer daemon gRPC.
 ///
-/// `ssh://` URLs are NOT handled here — they require async tunnel
-/// establishment. Use [`establish_ssh_remote()`] for SSH remotes. This
-/// function returns `Err` for `ssh://` to prevent accidental misuse.
+/// `ssh://` and `s3://` URLs are NOT handled here — they require async
+/// setup. Use [`establish_ssh_remote()`] for SSH remotes and
+/// [`establish_s3_remote()`] for S3 remotes. This function returns
+/// `Err` for both to prevent accidental misuse.
 pub fn parse(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
     if remote.is_empty() {
         return Ok(None);
@@ -44,7 +46,7 @@ pub fn parse(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
     let (scheme, rest) = remote
         .split_once("://")
         .ok_or_else(|| anyhow!(
-            "remote {remote:?} has no scheme; expected dir://…, kiki://…, ssh://…, or grpc://…"
+            "remote {remote:?} has no scheme; expected dir://…, s3://…, ssh://…, kiki://…, or grpc://…"
         ))?;
     match scheme {
         "dir" => {
@@ -69,6 +71,12 @@ pub fn parse(remote: &str) -> Result<Option<Arc<dyn RemoteStore>>> {
             Err(anyhow!(
                 "ssh:// remotes require async tunnel establishment; \
                  use establish_ssh_remote() instead of parse()"
+            ))
+        }
+        "s3" => {
+            Err(anyhow!(
+                "s3:// remotes require async credential loading; \
+                 use establish_s3_remote() instead of parse()"
             ))
         }
         other => Err(anyhow!("unsupported remote scheme {other:?}")),
@@ -127,6 +135,29 @@ pub async fn establish_ssh_remote(
         ))?;
 
     Ok((Arc::new(store) as Arc<dyn RemoteStore>, tun))
+}
+
+/// Check whether a remote URL is an `s3://` URL.
+pub fn is_s3_url(remote: &str) -> bool {
+    remote.starts_with("s3://")
+}
+
+/// Load AWS credentials and return an `S3RemoteStore`.
+///
+/// This is the async counterpart to `parse()` for `s3://` URLs. It
+/// loads AWS config from the default credential chain (env vars,
+/// `~/.aws/credentials`, IMDS, etc.) and connects an S3 client.
+pub async fn establish_s3_remote(
+    remote: &str,
+) -> Result<Arc<dyn RemoteStore>> {
+    let (bucket, prefix) = s3::parse_s3_url(remote)?
+        .ok_or_else(|| anyhow!("not an s3:// URL: {remote:?}"))?;
+
+    let store = s3::S3RemoteStore::from_env(bucket, prefix)
+        .await
+        .with_context(|| format!("establishing S3 remote for {remote}"))?;
+
+    Ok(Arc::new(store) as Arc<dyn RemoteStore>)
 }
 
 #[cfg(test)]
@@ -246,8 +277,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_unknown_scheme_rejected() {
+    fn parse_s3_scheme_rejected_with_guidance() {
         let err = parse("s3://bucket/prefix").unwrap_err();
+        assert!(
+            err.to_string().contains("establish_s3_remote"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_unknown_scheme_rejected() {
+        let err = parse("ftp://host/path").unwrap_err();
         assert!(err.to_string().contains("unsupported"), "got: {err}");
+    }
+
+    #[test]
+    fn is_s3_url_detects_s3() {
+        assert!(is_s3_url("s3://bucket/prefix"));
+        assert!(is_s3_url("s3://bucket"));
+        assert!(!is_s3_url("dir:///path"));
+        assert!(!is_s3_url("ssh://host/path"));
+        assert!(!is_s3_url(""));
     }
 }
