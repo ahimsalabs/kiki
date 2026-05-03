@@ -11,7 +11,7 @@ content immediately materialized via `initial_tree_id`. **M13 (git
 clone & dual-remote model) landed:** `kiki clone git@...` works
 directly, `kiki remote add/remove/show` for kiki-native remotes, git
 remote metadata replication.
-Next up: M11 (async push queue). Last updated: 2026-05-03
+Next up: M11 (async push queue), M14 (blobless git clone). Last updated: 2026-05-03
 
 This document captures the roadmap for getting kiki from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -46,6 +46,7 @@ wasted effort. If it does, B and C are routine engineering.
 | **Git convergence** — replace custom content store with jj-lib `GitBackend` | ✅ done | [`GIT_CONVERGENCE.md`](./GIT_CONVERGENCE.md) |
 | **Daemon lifecycle** — auto-start, launchd/systemd integration | ✅ done | [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md) |
 | **M11** — async push queue + offline resilience | active | [`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md) |
+| **M14 — Blobless git clone** — on-demand blob fetch, background backfill, `FetchPool` priority | next | [`M14-BLOBLESS-CLONE.md`](./M14-BLOBLESS-CLONE.md) |
 | **M12 — Workspaces** — single RootFs mount, managed namespace, multi-workspace orchestration | ✅ done | [`M12-WORKSPACES.md`](./M12-WORKSPACES.md), [`WORKSPACES.md`](./WORKSPACES.md) |
 | **M13 — Git clone & dual-remote model** — first-class git URLs, `kiki remote`, `kiki+ssh://` rename | ✅ done | [`M13-GIT-CLONE.md`](./M13-GIT-CLONE.md) |
 | **Linear history & segment index** — `linear` ref protection, O(1) ancestor queries | future | [`LINEAR_HISTORY.md`](./LINEAR_HISTORY.md) |
