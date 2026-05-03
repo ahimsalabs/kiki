@@ -280,6 +280,11 @@ struct RepoCommandArgs {
 
 #[derive(Debug, Clone, clap::Subcommand)]
 enum RepoCommands {
+    /// List all managed repos and their workspaces.
+    ///
+    /// Reads directly from on-disk metadata — works even when the
+    /// daemon is not running.
+    List,
     /// Deregister a repo from the namespace without deleting data.
     ///
     /// The repo disappears from ~/kiki/ and `kiki kk status`, but all
@@ -749,6 +754,14 @@ async fn run_kk_command(
     if let KikiCommands::Daemon(ref args) = command {
         daemon_cmd::dispatch_daemon(args)?;
         return Ok(());
+    }
+
+    // repo list reads from disk — no daemon needed.
+    if let KikiCommands::Repo(RepoCommandArgs {
+        command: RepoCommands::List,
+    }) = command
+    {
+        return run_repo_list(ui);
     }
 
     let client = daemon_client::connect_or_start(command_helper.settings())
@@ -1875,6 +1888,7 @@ fn run_repo_command(
     args: RepoCommandArgs,
 ) -> Result<(), CommandError> {
     match args.command {
+        RepoCommands::List => run_repo_list(ui),
         RepoCommands::Forget(forget_args) => {
             run_repo_forget(ui, command_helper, client, forget_args)
         }
@@ -1882,6 +1896,64 @@ fn run_repo_command(
             run_repo_purge(ui, command_helper, client, purge_args)
         }
     }
+}
+
+/// `kiki kk repo list`
+///
+/// Reads repos.toml and per-workspace configs directly from disk — no
+/// daemon connection needed.
+fn run_repo_list(ui: &mut Ui) -> Result<(), CommandError> {
+    use kiki_daemon::repo_meta;
+
+    let storage_dir = store::paths::default_storage_dir();
+    let repos_path = repo_meta::repos_config_path(&storage_dir);
+    let repos_cfg = repo_meta::ReposConfig::read_or_default(&repos_path)
+        .map_err(|e| user_error(format!("failed to read repos.toml: {e:#}")))?;
+
+    if repos_cfg.repos.is_empty() {
+        writeln!(ui.status(), "No managed repos.")?;
+        writeln!(
+            ui.status(),
+            "Use `kiki kk init <remote>` to clone a repo.",
+        )?;
+        return Ok(());
+    }
+
+    let mount_root = store::paths::default_mount_root();
+    ui.request_pager();
+    let mut formatter = ui.stdout_formatter();
+
+    for (repo_name, entry) in &repos_cfg.repos {
+        writeln!(formatter, "{repo_name}")?;
+        writeln!(formatter, "  url: {}", entry.url)?;
+        writeln!(
+            formatter,
+            "  mount: {}/{}",
+            mount_root.display(),
+            repo_name,
+        )?;
+
+        match repo_meta::list_workspace_configs(&storage_dir, repo_name) {
+            Ok(workspaces) if workspaces.is_empty() => {
+                writeln!(formatter, "  workspaces: (none)")?;
+            }
+            Ok(workspaces) => {
+                writeln!(formatter, "  workspaces:")?;
+                for (ws_name, ws_cfg) in &workspaces {
+                    let state = match ws_cfg.state {
+                        repo_meta::WorkspaceState::Active => "",
+                        repo_meta::WorkspaceState::Pending => " (pending)",
+                    };
+                    writeln!(formatter, "    {ws_name}{state}")?;
+                }
+            }
+            Err(e) => {
+                writeln!(formatter, "  workspaces: (error: {e:#})")?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve the repo name from an explicit argument or infer from cwd.
