@@ -24,6 +24,58 @@ use rand::Rng;
 
 use crate::{validate_ref_name, BlobKind, CasOutcome, RemoteStore};
 
+// NFS filesystem magic numbers for detection.
+// flock(2) is advisory-only and does not provide mutual exclusion
+// across NFS clients — the entire CAS consistency model breaks
+// silently when the root dir is on NFS.
+#[cfg(target_os = "linux")]
+const NFS_SUPER_MAGIC: i64 = 0x6969;
+
+/// Check whether `path` resides on an NFS mount. Returns `Ok(true)` if
+/// NFS is detected, `Ok(false)` otherwise. Errors are non-fatal: if
+/// statfs fails, we conservatively return `false` (better to attempt
+/// the flock than to refuse on an exotic local FS).
+fn is_nfs_mount(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        let c_path = match CString::new(path.as_os_str().as_encoded_bytes()) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        unsafe {
+            let mut buf: libc::statfs = std::mem::zeroed();
+            if libc::statfs(c_path.as_ptr(), &mut buf) == 0 {
+                return buf.f_type == NFS_SUPER_MAGIC;
+            }
+        }
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        let c_path = match CString::new(path.as_os_str().as_encoded_bytes()) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        unsafe {
+            let mut buf: libc::statfs = std::mem::zeroed();
+            if libc::statfs(c_path.as_ptr(), &mut buf) == 0 {
+                let fstype = std::ffi::CStr::from_ptr(buf.f_fstypename.as_ptr());
+                if let Ok(s) = fstype.to_str() {
+                    return s == "nfs";
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Filesystem-backed blob CAS rooted at `root`.
 ///
 /// `root` is created on first write if missing. Per-kind subdirs are
@@ -78,7 +130,19 @@ impl RefsLock {
     /// file if needed. Blocks until acquired; localhost contention is
     /// rare (refs are scarce; CAS holds the lock for one read + one
     /// rename) so we don't spin or backoff.
+    ///
+    /// Returns an error if the directory is on NFS — `flock(2)` is
+    /// advisory-only and does not provide cross-host mutual exclusion
+    /// on NFS mounts, which would silently break the CAS invariant.
     fn acquire(refs_dir: &Path) -> Result<Self> {
+        if is_nfs_mount(refs_dir) {
+            return Err(anyhow!(
+                "dir:// remote at {} is on an NFS mount; flock-based CAS \
+                 does not provide cross-host mutual exclusion over NFS. \
+                 Use a grpc:// or s3:// remote for multi-host sharing",
+                refs_dir.display()
+            ));
+        }
         fs::create_dir_all(refs_dir)
             .with_context(|| format!("creating {}", refs_dir.display()))?;
         let lock_path = refs_dir.join(".lock");
@@ -646,6 +710,38 @@ mod tests {
         let (_dir, s) = make_store();
         // refs_dir doesn't exist yet — list_refs must not error.
         assert!(s.list_refs().await.unwrap().is_empty());
+    }
+
+    // ---- NFS detection ----
+
+    #[test]
+    fn is_nfs_mount_returns_false_for_tmpdir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !is_nfs_mount(dir.path()),
+            "tmpdir should not be detected as NFS"
+        );
+    }
+
+    #[test]
+    fn is_nfs_mount_returns_false_for_nonexistent_path() {
+        assert!(
+            !is_nfs_mount(Path::new("/nonexistent/path/that/does/not/exist")),
+            "nonexistent path should return false, not panic"
+        );
+    }
+
+    /// Verify that cas_ref on a local tmpdir still works (NFS check
+    /// doesn't false-positive on local filesystems).
+    #[tokio::test]
+    async fn cas_ref_works_on_local_fs_after_nfs_check() {
+        let (_dir, s) = make_store();
+        let v = Bytes::from_static(b"value");
+        let outcome = s
+            .cas_ref("test_ref", None, Some(&v))
+            .await
+            .expect("cas_ref should succeed on local FS");
+        assert_eq!(outcome, CasOutcome::Updated);
     }
 
     #[tokio::test]
