@@ -22,6 +22,7 @@ pub mod hash;
 pub mod local_refs;
 pub mod mount_meta;
 pub mod remote;
+pub mod repo_meta;
 pub mod service;
 pub mod ty;
 pub mod vfs;
