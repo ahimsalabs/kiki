@@ -268,6 +268,34 @@ Commands work in any workspace — `cd /mnt/kiki/myproject/fix-auth` and run
 `kiki log` to see the same repo's history from a different working-copy
 commit.
 
+### Using stock git commands
+
+Every kiki workspace synthesizes a `.git` file pointing at a per-workspace
+git worktree (own HEAD, own index) backed by the shared object store.
+This means stock git commands work inside kiki mounts:
+
+```bash
+cd /mnt/kiki/myproject/default
+
+# git status, diff, log all work
+git status
+git log --oneline
+
+# You can commit with git — kiki detects the change automatically
+echo 'hello' > new-file.txt
+git add new-file.txt
+git commit -m "committed with git"
+
+# kiki log now shows the git commit
+kiki log
+```
+
+The import happens automatically: before every `kiki` command, a dispatch
+hook checks whether HEAD changed externally (e.g. via `git commit`) and
+imports the new commit into jj's graph. Each workspace has its own HEAD
+and index, so `git add` / `git commit` in one workspace doesn't interfere
+with another.
+
 ### 4. Daemon management
 
 The daemon is invisible in normal use. For debugging:

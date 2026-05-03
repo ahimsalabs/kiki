@@ -64,8 +64,10 @@ This means:
 - Teammates without kiki just `git clone`
 - Every remote type (`dir://`, `s3://`, `kiki+ssh://`, `kiki://`, git forges)
   stores identical bytes — same objects, different transport
-- Stock git tools (`git log`, `git blame`) work against mounts
-  via a synthesized `.git` pointer
+- Stock git tools (`git log`, `git blame`, `git commit`) work
+  against mounts via a synthesized `.git` pointer — each workspace
+  gets its own git worktree (own HEAD + index) so `git add` /
+  `git commit` work independently per workspace
 
 ## Architecture
 
@@ -91,7 +93,8 @@ sync, multi-machine sharing via `dir://` / `s3://` / `kiki+ssh://` / `kiki://`,
 git push and fetch to GitHub/GitLab, operation log sharing,
 `.gitignore`-aware VFS, daemon lifecycle, managed workspaces
 (`kiki clone`, `kiki workspace`, single RootFs mount at `/mnt/kiki/`),
-first-class git clone with immediate content materialization.
+first-class git clone with immediate content materialization,
+colocated git support (`git commit` inside mounts visible in `kiki log`).
 
 **In progress:** async offline push queue.
 
