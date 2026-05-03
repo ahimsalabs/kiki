@@ -2085,6 +2085,62 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             bookmark_changes,
         }))
     }
+
+    // ── M12 managed-workspace stubs (§12.8) ─────────────────────────
+    //
+    // Proto RPCs landed; real implementations follow in the service-
+    // changes commit (§12.14 step 6). These return Unimplemented so
+    // the build stays green while the proto is wired in.
+
+    async fn clone(
+        &self,
+        _request: Request<CloneReq>,
+    ) -> Result<Response<CloneReply>, Status> {
+        Err(Status::unimplemented("Clone not yet implemented (M12)"))
+    }
+
+    async fn repo_list(
+        &self,
+        _request: Request<RepoListReq>,
+    ) -> Result<Response<RepoListReply>, Status> {
+        Err(Status::unimplemented("RepoList not yet implemented (M12)"))
+    }
+
+    async fn workspace_create(
+        &self,
+        _request: Request<WorkspaceCreateReq>,
+    ) -> Result<Response<WorkspaceCreateReply>, Status> {
+        Err(Status::unimplemented(
+            "WorkspaceCreate not yet implemented (M12)",
+        ))
+    }
+
+    async fn workspace_finalize(
+        &self,
+        _request: Request<WorkspaceFinalizeReq>,
+    ) -> Result<Response<WorkspaceFinalizeReply>, Status> {
+        Err(Status::unimplemented(
+            "WorkspaceFinalize not yet implemented (M12)",
+        ))
+    }
+
+    async fn workspace_list(
+        &self,
+        _request: Request<WorkspaceListReq>,
+    ) -> Result<Response<WorkspaceListReply>, Status> {
+        Err(Status::unimplemented(
+            "WorkspaceList not yet implemented (M12)",
+        ))
+    }
+
+    async fn workspace_delete(
+        &self,
+        _request: Request<WorkspaceDeleteReq>,
+    ) -> Result<Response<WorkspaceDeleteReply>, Status> {
+        Err(Status::unimplemented(
+            "WorkspaceDelete not yet implemented (M12)",
+        ))
+    }
 }
 
 #[cfg(test)]

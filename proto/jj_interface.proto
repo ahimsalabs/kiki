@@ -123,6 +123,27 @@ service JujutsuInterface {
 
   rpc DaemonStatus(DaemonStatusReq) returns (DaemonStatusReply) {}
 
+  // M12 — managed workspaces (§12.8). Repo and workspace lifecycle
+  // RPCs. The daemon manages the RootFs namespace; the CLI drives jj
+  // workspace initialization after the daemon allocates a slot.
+
+  // Clone a remote repo into the managed namespace. Creates the shared
+  // git store, registers a "default" workspace, and returns its path
+  // under mount_root.
+  rpc Clone(CloneReq) returns (CloneReply) {}
+  // List all registered repos and their workspaces.
+  rpc RepoList(RepoListReq) returns (RepoListReply) {}
+  // Allocate a workspace slot and register it in pending state.
+  // The CLI owns jj workspace initialization (step 8 of §12.10).
+  rpc WorkspaceCreate(WorkspaceCreateReq) returns (WorkspaceCreateReply) {}
+  // Transition a pending workspace to active (visible in readdir/lookup).
+  rpc WorkspaceFinalize(WorkspaceFinalizeReq) returns (WorkspaceFinalizeReply) {}
+  // List workspaces within a repo.
+  rpc WorkspaceList(WorkspaceListReq) returns (WorkspaceListReply) {}
+  // Remove a workspace: deregister from RootFs, retire the slot, delete
+  // on-disk state.
+  rpc WorkspaceDelete(WorkspaceDeleteReq) returns (WorkspaceDeleteReply) {}
+
   // M10.5 — catalog (mutable refs) on the per-mount level. Same shape
   // as the daemon-to-daemon `service RemoteStore` ref RPCs (§10.4) but
   // routed through the CLI's existing channel to its local daemon
@@ -573,3 +594,67 @@ message GitBookmarkChange {
   // Raw commit OID (20 bytes). Empty means the bookmark was deleted.
   bytes commit_id = 2;
 }
+
+// ── M12 — managed workspaces (§12.8) ───────────────────────────────
+
+message CloneReq {
+  // Remote URL (ssh://server/repo, dir:///path, s3://bucket/prefix).
+  string url = 1;
+  // Repo name in the managed namespace. Empty = derive from URL
+  // (last path component, stripped of .git suffix).
+  string name = 2;
+}
+message CloneReply {
+  // Full path to the default workspace, e.g. "/mnt/kiki/monorepo/default".
+  string workspace_path = 1;
+}
+
+message RepoListReq {}
+message RepoListReply {
+  repeated RepoInfo repos = 1;
+}
+message RepoInfo {
+  string name = 1;
+  string url = 2;
+  repeated string workspaces = 3;
+}
+
+message WorkspaceCreateReq {
+  // Repo name (must already be registered via Clone).
+  string repo = 1;
+  // Workspace name (must be unique within the repo).
+  string workspace = 2;
+}
+message WorkspaceCreateReply {
+  // Full path to the new workspace, e.g. "/mnt/kiki/monorepo/fix-auth".
+  string workspace_path = 1;
+}
+
+message WorkspaceFinalizeReq {
+  // Repo name.
+  string repo = 1;
+  // Workspace name (must be in pending state).
+  string workspace = 2;
+}
+message WorkspaceFinalizeReply {}
+
+message WorkspaceListReq {
+  // Repo name.
+  string repo = 1;
+}
+message WorkspaceListReply {
+  repeated WorkspaceInfo workspaces = 1;
+}
+message WorkspaceInfo {
+  string name = 1;
+  // Full path under mount_root, e.g. "/mnt/kiki/monorepo/default".
+  string path = 2;
+}
+
+message WorkspaceDeleteReq {
+  // Repo name.
+  string repo = 1;
+  // Workspace name to delete.
+  string workspace = 2;
+}
+message WorkspaceDeleteReply {}
