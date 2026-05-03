@@ -36,7 +36,7 @@ store.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
-tower = "0.4"
+tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio.workspace = true
 tonic-reflection.workspace = true

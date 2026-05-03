@@ -10,9 +10,8 @@
 //!
 //! - `lookup`/`getattr` carry a `Request` (uid/gid/pid of the caller).
 //!   We ignore it for now — single-user mount, no permission checks.
-//! - `readdir` returns a `ReplyDirectory<DirEntryStream<'_>>` where the
-//!   stream is an associated type. The simplest concrete stream is
-//!   `futures::stream::Iter<vec::IntoIter<…>>` since `JjKikiFs::readdir`
+//! - `readdir` returns a `ReplyDirectory<impl Stream<…>>` (RPITIT since
+//!   fuse3 0.9). We use `futures::stream::iter` since `JjKikiFs::readdir`
 //!   already returns the full listing.
 //! - The `.` and `..` entries are added by the adapter, not by `JjKikiFs`,
 //!   because their inode numbers are protocol-specific.
@@ -137,10 +136,8 @@ fn to_file_attr(a: Attr) -> FileAttr {
     }
 }
 
-/// Concrete stream type used for `readdir`. `JjKikiFs::readdir` already
-/// returns everything in one shot, so we wrap it in a `stream::iter`.
-type DirStream =
-    stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntry>>>;
+// fuse3 0.9 uses RPITIT for readdir/readdirplus — no more associated
+// stream types needed.
 
 impl Filesystem for FuseAdapter {
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {
@@ -235,18 +232,13 @@ impl Filesystem for FuseAdapter {
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
-    type DirEntryStream<'a>
-        = DirStream
-    where
-        Self: 'a;
-
     async fn readdir(
         &self,
         _req: Request,
         parent: Inode,
         _fh: u64,
         offset: i64,
-    ) -> FuseResult<ReplyDirectory<Self::DirEntryStream<'_>>> {
+    ) -> FuseResult<ReplyDirectory<impl futures::Stream<Item = FuseResult<DirectoryEntry>> + Send + '_>> {
         let entries = self
             .inner
             .readdir(parent)
@@ -564,11 +556,6 @@ impl Filesystem for FuseAdapter {
         Ok(())
     }
 
-    type DirEntryPlusStream<'a>
-        = stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntryPlus>>>
-    where
-        Self: 'a;
-
     /// `readdirplus` is the kernel's preferred readdir on Linux >= 3.9;
     /// fuse3 unconditionally advertises `FUSE_DO_READDIRPLUS` during
     /// `init`, and there's no mount-option to opt out. If our impl
@@ -589,7 +576,7 @@ impl Filesystem for FuseAdapter {
         _fh: u64,
         offset: u64,
         _lock_owner: u64,
-    ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'_>>> {
+    ) -> FuseResult<ReplyDirectoryPlus<impl futures::Stream<Item = FuseResult<DirectoryEntryPlus>> + Send + '_>> {
         let entries = self
             .inner
             .readdir(parent)

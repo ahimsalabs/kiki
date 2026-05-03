@@ -21,13 +21,13 @@ clap = { version = "4.5.0", features = ["derive"] }
 chrono = { version = "0.4.38", default-features = false, features = ["std", "clock"] }
 digest = "0.10"
 gix = { version = "0.81", default-features = false }
-# fuse3 0.8 builds on Linux + macOS but real mounts only land on Linux
+# fuse3 builds on Linux + macOS but real mounts only land on Linux
 # (per `docs/PLAN.md` §4.3). The adapter is built on every platform so the
 # code compiles in CI; it's only wired up to a kernel mount on Linux at M4.
 # `unprivileged` pulls in the `which`/`nix` deps that locate the
 # `fusermount3` setuid helper — required for `Session::mount_with_unprivileged`,
 # which is how M4 attaches the mount without `sudo`.
-fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 futures = "0.3.30"
 itertools = "0.14"
 jj-cli = "0.40"
@@ -35,7 +35,7 @@ jj-lib = {version = "0.40", default-features = true}
 # Needed by the fuse3 adapter to map FsError onto unix errno constants.
 libc = "0.2"
 jj-lib-proc-macros = {version = "0.40", default-features = true}
-nfsserve = "0.10"
+nfsserve = "0.11"
 parking_lot = "0.12.3"
 pollster = "0.4"
 prost = "0.14"
@@ -51,7 +51,7 @@ serde_json = "1"
 store = { path = "./store" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1.14", features = ["net"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 toml = "0.8"
 tonic = "0.14"
