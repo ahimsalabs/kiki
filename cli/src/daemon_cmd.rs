@@ -201,7 +201,11 @@ fn show_status() -> Result<(), CommandError> {
                         )
                     {
                         let status = resp.into_inner();
-                        println!("Mounts: {}", status.data.len());
+                        println!(
+                            "Mount: {}",
+                            if status.mount_active { "active" } else { "not active" }
+                        );
+                        println!("Workspaces: {}", status.data.len());
                     }
                 } else {
                     println!("Status: stale (process not running)");

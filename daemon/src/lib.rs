@@ -279,54 +279,88 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
                 }
             };
             if mount_root_ready {
-                // Clean up a stale mount left by a previous daemon that
-                // crashed or was killed without unmounting. On Linux the
-                // symptom is ENOTCONN; on macOS the NFS client gets
-                // ESTALE or hangs until the TCP timeout.
-                cleanup_stale_mount(&config.mount_root);
+                const MAX_BIND_ATTEMPTS: u32 = 3;
+                const BIND_RETRY_DELAY: std::time::Duration =
+                    std::time::Duration::from_millis(500);
 
                 let mount_path = config.mount_root.to_string_lossy().to_string();
-                match handle.bind(mount_path, Arc::clone(&root_fs) as Arc<dyn crate::vfs::JjKikiFs>).await {
-                    Ok((transport, attachment)) => {
-                        // On Linux (FUSE), the kernel mount was already
-                        // established by `mount_with_unprivileged` inside
-                        // `bind_fuse`. On macOS (NFS), `bind_nfs` only
-                        // starts the NFS TCP server — we need to attach
-                        // the kernel mount ourselves.
-                        #[cfg(target_os = "macos")]
-                        if let TransportInfo::Nfs { port } = transport {
-                            if let Err(e) = mount_nfs_at(&config.mount_root, port) {
+                let mut bound: Option<(TransportInfo, MountAttachment)> = None;
+
+                for attempt in 1..=MAX_BIND_ATTEMPTS {
+                    // Clean up a stale mount left by a previous daemon
+                    // that crashed or was killed without unmounting. On
+                    // Linux the symptom is ENOTCONN; on macOS the NFS
+                    // client gets ESTALE or hangs until the TCP timeout.
+                    // Re-run on each attempt because fusermount3 -u may
+                    // need the kernel to finish releasing the mountpoint.
+                    cleanup_stale_mount(&config.mount_root);
+
+                    match handle
+                        .bind(
+                            mount_path.clone(),
+                            Arc::clone(&root_fs) as Arc<dyn crate::vfs::JjKikiFs>,
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            bound = Some(result);
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < MAX_BIND_ATTEMPTS {
+                                warn!(
+                                    attempt,
+                                    max_attempts = MAX_BIND_ATTEMPTS,
+                                    error = %format!("{e:#}"),
+                                    mount_root = %config.mount_root.display(),
+                                    "bind attempt failed; retrying",
+                                );
+                                tokio::time::sleep(BIND_RETRY_DELAY).await;
+                            } else {
                                 warn!(
                                     error = %format!("{e:#}"),
-                                    port,
                                     mount_root = %config.mount_root.display(),
-                                    "NFS mount_nfs failed; the NFS server is running \
-                                     on port {port} but the kernel mount could not be \
-                                     attached. Try manually:\n  \
-                                     mount_nfs -o port={port},mountport={port},nolocks,vers=3,actimeo=0 \
-                                     localhost:/ {}",
-                                    config.mount_root.display(),
+                                    "failed to bind RootFs mount after \
+                                     {MAX_BIND_ATTEMPTS} attempts; managed \
+                                     workspaces accessible via gRPC only"
                                 );
-                                // Keep the attachment alive so the NFS
-                                // server stays running — the user (or
-                                // `kiki kk doctor`) can mount manually.
                             }
                         }
-                        #[cfg(not(target_os = "macos"))]
-                        let _ = &transport;
+                    }
+                }
 
-                        info!(mount_root = %config.mount_root.display(), "RootFs mount bound");
-                        Some(attachment)
+                if let Some((transport, attachment)) = bound {
+                    // On Linux (FUSE), the kernel mount was already
+                    // established by `mount_with_unprivileged` inside
+                    // `bind_fuse`. On macOS (NFS), `bind_nfs` only
+                    // starts the NFS TCP server — we need to attach
+                    // the kernel mount ourselves.
+                    #[cfg(target_os = "macos")]
+                    if let TransportInfo::Nfs { port } = transport {
+                        if let Err(e) = mount_nfs_at(&config.mount_root, port) {
+                            warn!(
+                                error = %format!("{e:#}"),
+                                port,
+                                mount_root = %config.mount_root.display(),
+                                "NFS mount_nfs failed; the NFS server is running \
+                                 on port {port} but the kernel mount could not be \
+                                 attached. Try manually:\n  \
+                                 mount_nfs -o port={port},mountport={port},nolocks,vers=3,actimeo=0 \
+                                 localhost:/ {}",
+                                config.mount_root.display(),
+                            );
+                            // Keep the attachment alive so the NFS
+                            // server stays running — the user (or
+                            // `kiki kk doctor`) can mount manually.
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            error = %format!("{e:#}"),
-                            mount_root = %config.mount_root.display(),
-                            "failed to bind RootFs mount; managed workspaces \
-                             accessible via gRPC only"
-                        );
-                        None
-                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = &transport;
+
+                    info!(mount_root = %config.mount_root.display(), "RootFs mount bound");
+                    Some(attachment)
+                } else {
+                    None
                 }
             } else {
                 None

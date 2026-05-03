@@ -1423,7 +1423,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
         // Sort by path so output is deterministic.
         data.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(Response::new(DaemonStatusReply { data }))
+
+        // mount_active mirrors require_mount_active(): true when the VFS
+        // mount is bound, or when mounts are disabled (test mode).
+        let mount_active = self.vfs_handle.is_none() || self._mount_attachment.is_some();
+
+        Ok(Response::new(DaemonStatusReply {
+            data,
+            mount_active,
+        }))
     }
 
     // ---- M10.5: per-mount catalog (mutable refs) -------------------
