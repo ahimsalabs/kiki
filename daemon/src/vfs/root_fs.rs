@@ -1543,4 +1543,523 @@ mod tests {
             workspace_id,
         }
     }
+
+    /// Build a RootFs with a real on-disk store and one active workspace.
+    /// Returns `(RootFs, store, tempdir_guard)`.
+    fn setup_one_workspace(
+        repo_name: &str,
+        ws_name: &str,
+        slot: u32,
+    ) -> (RootFs, Arc<GitContentStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let settings = test_settings();
+        let store_path = storage.join(format!("repos/{repo_name}/git_store"));
+        let redb_path = storage.join(format!("repos/{repo_name}/store.redb"));
+        let store = Arc::new(
+            GitContentStore::init(&settings, &store_path, &redb_path).unwrap(),
+        );
+        let empty_tree = store.empty_tree_id().as_bytes().to_vec();
+
+        // Create scratch dir for the workspace.
+        let scratch = crate::repo_meta::workspace_scratch_dir(storage, repo_name, ws_name);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let fs = RootFs::new(
+            PathBuf::from("/mnt/kiki"),
+            storage.to_path_buf(),
+            slot,
+        );
+        fs.register_repo(
+            repo_name.into(),
+            format!("dir:///test/{repo_name}"),
+            Arc::clone(&store),
+            None,
+        );
+        fs.register_workspace(
+            repo_name,
+            ws_reg(ws_name, slot, WorkspaceState::Active, empty_tree, ws_name.as_bytes().to_vec()),
+        )
+        .unwrap();
+
+        (fs, store, dir)
+    }
+
+    /// Build a RootFs with one repo and two active workspaces.
+    fn setup_two_workspaces(
+        repo_name: &str,
+    ) -> (RootFs, Arc<GitContentStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let settings = test_settings();
+        let store_path = storage.join(format!("repos/{repo_name}/git_store"));
+        let redb_path = storage.join(format!("repos/{repo_name}/store.redb"));
+        let store = Arc::new(
+            GitContentStore::init(&settings, &store_path, &redb_path).unwrap(),
+        );
+        let empty_tree = store.empty_tree_id().as_bytes().to_vec();
+
+        for ws in ["default", "feature"] {
+            let scratch = crate::repo_meta::workspace_scratch_dir(storage, repo_name, ws);
+            std::fs::create_dir_all(&scratch).unwrap();
+        }
+
+        let fs = RootFs::new(
+            PathBuf::from("/mnt/kiki"),
+            storage.to_path_buf(),
+            1,
+        );
+        fs.register_repo(
+            repo_name.into(),
+            format!("dir:///test/{repo_name}"),
+            Arc::clone(&store),
+            None,
+        );
+        fs.register_workspace(
+            repo_name,
+            ws_reg("default", 1, WorkspaceState::Active, empty_tree.clone(), b"default".to_vec()),
+        )
+        .unwrap();
+        fs.register_workspace(
+            repo_name,
+            ws_reg("feature", 2, WorkspaceState::Active, empty_tree, b"feature".to_vec()),
+        )
+        .unwrap();
+
+        (fs, store, dir)
+    }
+
+    // ── Write-path delegation ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_and_read_through_rootfs() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "default", 1);
+
+        // Navigate to workspace root.
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_root = fs.lookup(repo_ino, "default").await.unwrap();
+        assert_eq!(slot_of(ws_root), 1);
+
+        // Create a file.
+        let (file_ino, attr) = fs.create_file(ws_root, "hello.txt", false).await.unwrap();
+        assert_eq!(slot_of(file_ino), 1, "file inode must be in workspace slot");
+        assert_eq!(slot_of(attr.inode), 1, "attr inode must be in workspace slot");
+        assert_eq!(attr.kind, FileKind::Regular);
+
+        // Write data.
+        let written = fs.write(file_ino, 0, b"hello world").await.unwrap();
+        assert_eq!(written, 11);
+
+        // Read it back.
+        let (data, eof) = fs.read(file_ino, 0, 4096).await.unwrap();
+        assert_eq!(data, b"hello world");
+        assert!(eof);
+
+        // getattr should reflect the size.
+        let attr = fs.getattr(file_ino).await.unwrap();
+        assert_eq!(attr.size, 11);
+        assert_eq!(slot_of(attr.inode), 1);
+    }
+
+    #[tokio::test]
+    async fn mkdir_and_create_file_inside() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "ws", 1);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_root = fs.lookup(repo_ino, "ws").await.unwrap();
+
+        // mkdir src/
+        let (dir_ino, dir_attr) = fs.mkdir(ws_root, "src").await.unwrap();
+        assert_eq!(slot_of(dir_ino), 1);
+        assert_eq!(dir_attr.kind, FileKind::Directory);
+
+        // Create file inside src/
+        let (file_ino, _) = fs.create_file(dir_ino, "main.rs", false).await.unwrap();
+        assert_eq!(slot_of(file_ino), 1);
+        fs.write(file_ino, 0, b"fn main() {}").await.unwrap();
+
+        // readdir on src/ should include main.rs
+        let entries = fs.readdir(dir_ino).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"main.rs"));
+        for e in &entries {
+            assert_eq!(slot_of(e.inode), 1, "entry {} inode in wrong slot", e.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn symlink_through_rootfs() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "ws", 1);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_root = fs.lookup(repo_ino, "ws").await.unwrap();
+
+        let (link_ino, attr) = fs.symlink(ws_root, "link", "/target/path").await.unwrap();
+        assert_eq!(slot_of(link_ino), 1);
+        assert_eq!(attr.kind, FileKind::Symlink);
+
+        let target = fs.readlink(link_ino).await.unwrap();
+        assert_eq!(target, "/target/path");
+    }
+
+    #[tokio::test]
+    async fn remove_through_rootfs() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "ws", 1);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_root = fs.lookup(repo_ino, "ws").await.unwrap();
+
+        fs.create_file(ws_root, "doomed.txt", false).await.unwrap();
+        assert!(fs.lookup(ws_root, "doomed.txt").await.is_ok());
+
+        fs.remove(ws_root, "doomed.txt").await.unwrap();
+        assert_eq!(
+            fs.lookup(ws_root, "doomed.txt").await,
+            Err(FsError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_within_workspace() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "ws", 1);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_root = fs.lookup(repo_ino, "ws").await.unwrap();
+
+        let (file_ino, _) = fs.create_file(ws_root, "old.txt", false).await.unwrap();
+        fs.write(file_ino, 0, b"data").await.unwrap();
+
+        fs.rename(ws_root, "old.txt", ws_root, "new.txt").await.unwrap();
+
+        assert_eq!(fs.lookup(ws_root, "old.txt").await, Err(FsError::NotFound));
+        let new_ino = fs.lookup(ws_root, "new.txt").await.unwrap();
+        let (data, _) = fs.read(new_ino, 0, 4096).await.unwrap();
+        assert_eq!(data, b"data");
+    }
+
+    #[tokio::test]
+    async fn setattr_through_rootfs() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "ws", 1);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_root = fs.lookup(repo_ino, "ws").await.unwrap();
+
+        let (file_ino, _) = fs.create_file(ws_root, "f.txt", false).await.unwrap();
+        fs.write(file_ino, 0, b"12345").await.unwrap();
+
+        // Truncate via setattr.
+        let attr = fs.setattr(file_ino, Some(3), None).await.unwrap();
+        assert_eq!(attr.size, 3);
+        assert_eq!(slot_of(attr.inode), 1);
+
+        // Set executable.
+        let attr = fs.setattr(file_ino, None, Some(true)).await.unwrap();
+        assert!(attr.executable);
+    }
+
+    // ── Workspace isolation ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn workspace_isolation_dirty_state() {
+        let (fs, _store, _dir) = setup_two_workspaces("repo");
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+
+        // Write a file in workspace "default".
+        let ws_default = fs.lookup(repo_ino, "default").await.unwrap();
+        let (file_ino, _) = fs.create_file(ws_default, "only-in-default.txt", false)
+            .await.unwrap();
+        fs.write(file_ino, 0, b"default data").await.unwrap();
+
+        // Workspace "feature" should not see it.
+        let ws_feature = fs.lookup(repo_ino, "feature").await.unwrap();
+        assert_eq!(
+            fs.lookup(ws_feature, "only-in-default.txt").await,
+            Err(FsError::NotFound),
+            "dirty state in 'default' must not leak to 'feature'"
+        );
+
+        // Write a different file in "feature".
+        let (feat_file, _) = fs.create_file(ws_feature, "feature-only.txt", false)
+            .await.unwrap();
+        fs.write(feat_file, 0, b"feature data").await.unwrap();
+
+        // "default" should not see it.
+        assert_eq!(
+            fs.lookup(ws_default, "feature-only.txt").await,
+            Err(FsError::NotFound),
+            "dirty state in 'feature' must not leak to 'default'"
+        );
+
+        // Each workspace reads its own file correctly.
+        let (data, _) = fs.read(file_ino, 0, 4096).await.unwrap();
+        assert_eq!(data, b"default data");
+        let (data, _) = fs.read(feat_file, 0, 4096).await.unwrap();
+        assert_eq!(data, b"feature data");
+    }
+
+    #[tokio::test]
+    async fn workspace_inodes_dont_collide() {
+        let (fs, _store, _dir) = setup_two_workspaces("repo");
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_a = fs.lookup(repo_ino, "default").await.unwrap();
+        let ws_b = fs.lookup(repo_ino, "feature").await.unwrap();
+
+        // Create files with the same name in both workspaces.
+        let (ino_a, _) = fs.create_file(ws_a, "same.txt", false).await.unwrap();
+        let (ino_b, _) = fs.create_file(ws_b, "same.txt", false).await.unwrap();
+
+        // Global inodes must differ (different slots).
+        assert_ne!(ino_a, ino_b, "same filename in different workspaces must have different global inodes");
+        assert_ne!(slot_of(ino_a), slot_of(ino_b));
+
+        // Write different content to each.
+        fs.write(ino_a, 0, b"aaa").await.unwrap();
+        fs.write(ino_b, 0, b"bbb").await.unwrap();
+
+        // Read back — each file has independent content.
+        let (a_data, _) = fs.read(ino_a, 0, 4096).await.unwrap();
+        let (b_data, _) = fs.read(ino_b, 0, 4096).await.unwrap();
+        assert_eq!(a_data, b"aaa");
+        assert_eq!(b_data, b"bbb");
+    }
+
+    // ── Shared store ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shared_store_across_workspaces() {
+        let (fs, _store, _dir) = setup_two_workspaces("repo");
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+
+        // Write and snapshot in workspace "default".
+        let ws_default = fs.lookup(repo_ino, "default").await.unwrap();
+        let default_kikifs = {
+            let inner = fs.inner.lock();
+            // Trigger hydration first.
+            drop(inner);
+            // Access via get_workspace to get the KikiFs handle.
+            let handle = fs.get_workspace("repo", "default").await.unwrap();
+            handle.fs
+        };
+        let (file_ino, _) = fs.create_file(ws_default, "shared.txt", false)
+            .await.unwrap();
+        fs.write(file_ino, 0, b"shared content").await.unwrap();
+
+        // Snapshot persists to the shared git store.
+        let root_tree = default_kikifs.snapshot().await.unwrap();
+
+        // The shared store should have the blob.
+        // Check out the same tree in workspace "feature".
+        let feature_kikifs = {
+            let handle = fs.get_workspace("repo", "feature").await.unwrap();
+            handle.fs
+        };
+        feature_kikifs.check_out(root_tree).await.unwrap();
+
+        // Now read the file through RootFs in "feature".
+        let ws_feature = fs.lookup(repo_ino, "feature").await.unwrap();
+        let feat_file = fs.lookup(ws_feature, "shared.txt").await.unwrap();
+        let (data, _) = fs.read(feat_file, 0, 4096).await.unwrap();
+        assert_eq!(data, b"shared content", "shared store should serve the same blob");
+
+        // Confirm only one git_store exists (store Arc identity).
+        let handle_a = fs.get_workspace("repo", "default").await.unwrap();
+        let handle_b = fs.get_workspace("repo", "feature").await.unwrap();
+        assert!(
+            Arc::ptr_eq(&handle_a.store, &handle_b.store),
+            "both workspaces must share the same GitContentStore"
+        );
+    }
+
+    // ── Concurrent workspace access ────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_workspace_access() {
+        let (fs, _store, _dir) = setup_two_workspaces("repo");
+        let fs = Arc::new(fs);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_a = fs.lookup(repo_ino, "default").await.unwrap();
+        let ws_b = fs.lookup(repo_ino, "feature").await.unwrap();
+
+        // Spawn two tasks that write concurrently to different workspaces.
+        let fs_a = Arc::clone(&fs);
+        let task_a = tokio::spawn(async move {
+            for i in 0..10 {
+                let name = format!("file_a_{i}.txt");
+                let (ino, _) = fs_a.create_file(ws_a, &name, false).await.unwrap();
+                let data = format!("data_a_{i}");
+                fs_a.write(ino, 0, data.as_bytes()).await.unwrap();
+            }
+        });
+
+        let fs_b = Arc::clone(&fs);
+        let task_b = tokio::spawn(async move {
+            for i in 0..10 {
+                let name = format!("file_b_{i}.txt");
+                let (ino, _) = fs_b.create_file(ws_b, &name, false).await.unwrap();
+                let data = format!("data_b_{i}");
+                fs_b.write(ino, 0, data.as_bytes()).await.unwrap();
+            }
+        });
+
+        // Both tasks should complete without deadlock or panic.
+        let (ra, rb) = tokio::join!(task_a, task_b);
+        ra.unwrap();
+        rb.unwrap();
+
+        // Verify files in each workspace.
+        let entries_a = fs.readdir(ws_a).await.unwrap();
+        let names_a: Vec<&str> = entries_a.iter().map(|e| e.name.as_str()).collect();
+        for i in 0..10 {
+            let name = format!("file_a_{i}.txt");
+            assert!(names_a.contains(&name.as_str()), "missing {name} in workspace A");
+        }
+        // No workspace B files in A.
+        assert!(
+            !names_a.iter().any(|n| n.starts_with("file_b_")),
+            "workspace B files leaked into A"
+        );
+
+        let entries_b = fs.readdir(ws_b).await.unwrap();
+        let names_b: Vec<&str> = entries_b.iter().map(|e| e.name.as_str()).collect();
+        for i in 0..10 {
+            let name = format!("file_b_{i}.txt");
+            assert!(names_b.contains(&name.as_str()), "missing {name} in workspace B");
+        }
+        assert!(
+            !names_b.iter().any(|n| n.starts_with("file_a_")),
+            "workspace A files leaked into B"
+        );
+    }
+
+    // ── Workspace delete + slot monotonicity (end-to-end) ──────────
+
+    #[tokio::test]
+    async fn delete_workspace_with_files_and_new_slot_is_higher() {
+        let (fs, store, _dir) = setup_two_workspaces("repo");
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_feat = fs.lookup(repo_ino, "feature").await.unwrap();
+
+        // Write files into "feature" to ensure it's hydrated.
+        let (file_ino, _) = fs.create_file(ws_feat, "doomed.txt", false).await.unwrap();
+        fs.write(file_ino, 0, b"will be deleted").await.unwrap();
+
+        // Delete workspace "feature" (slot 2).
+        let deleted_slot = fs.remove_workspace("repo", "feature").unwrap();
+        assert_eq!(deleted_slot, 2);
+
+        // Verify "feature" is gone from readdir.
+        let entries = fs.readdir(repo_ino).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"feature"), "deleted workspace should not appear");
+        assert!(names.contains(&"default"), "other workspace should remain");
+
+        // Accessing deleted workspace inode returns error.
+        assert!(fs.readdir(ws_feat).await.is_err());
+
+        // Create a new workspace — its slot must be > deleted_slot.
+        let scratch = crate::repo_meta::workspace_scratch_dir(
+            _dir.path(), "repo", "new-ws",
+        );
+        std::fs::create_dir_all(&scratch).unwrap();
+        let new_slot = fs.alloc_slot();
+        assert!(new_slot > deleted_slot, "new slot {new_slot} must be higher than deleted {deleted_slot}");
+
+        fs.register_workspace(
+            "repo",
+            ws_reg("new-ws", new_slot, WorkspaceState::Active, store.empty_tree_id().as_bytes().to_vec(), b"new-ws".to_vec()),
+        ).unwrap();
+
+        let entries = fs.readdir(repo_ino).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"new-ws"));
+        assert!(names.contains(&"default"));
+        assert_eq!(entries.len(), 2);
+    }
+
+    // ── Mutation on repo-dir synthetic (deeper than root) ──────────
+
+    #[tokio::test]
+    async fn mutation_on_repo_dir_returns_permission_denied() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "ws", 1);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        assert_eq!(slot_of(repo_ino), 0);
+
+        // All mutations on the repo dir should be rejected.
+        assert_eq!(fs.create_file(repo_ino, "x", false).await.unwrap_err(), FsError::PermissionDenied);
+        assert_eq!(fs.mkdir(repo_ino, "x").await.unwrap_err(), FsError::PermissionDenied);
+        assert_eq!(fs.symlink(repo_ino, "x", "/t").await.unwrap_err(), FsError::PermissionDenied);
+        assert_eq!(fs.write(repo_ino, 0, b"x").await, Err(FsError::PermissionDenied));
+        assert_eq!(fs.setattr(repo_ino, Some(0), None).await.unwrap_err(), FsError::PermissionDenied);
+        assert_eq!(fs.remove(repo_ino, "x").await, Err(FsError::PermissionDenied));
+        assert_eq!(fs.rename(repo_ino, "a", repo_ino, "b").await, Err(FsError::PermissionDenied));
+        assert_eq!(fs.read(repo_ino, 0, 100).await, Err(FsError::NotAFile));
+        assert_eq!(fs.readlink(repo_ino).await, Err(FsError::NotASymlink));
+    }
+
+    // ── Cross-workspace rename with real workspaces ────────────────
+
+    #[tokio::test]
+    async fn cross_workspace_rename_returns_exdev() {
+        let (fs, _store, _dir) = setup_two_workspaces("repo");
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+        let ws_a = fs.lookup(repo_ino, "default").await.unwrap();
+        let ws_b = fs.lookup(repo_ino, "feature").await.unwrap();
+
+        // Create a file in workspace A.
+        let (file_ino, _) = fs.create_file(ws_a, "moveme.txt", false).await.unwrap();
+        fs.write(file_ino, 0, b"test").await.unwrap();
+
+        // Attempt to rename to workspace B root.
+        assert_eq!(
+            fs.rename(ws_a, "moveme.txt", ws_b, "moved.txt").await,
+            Err(FsError::CrossDevice),
+            "rename across workspaces must return EXDEV"
+        );
+
+        // File still exists in A.
+        assert!(fs.lookup(ws_a, "moveme.txt").await.is_ok());
+    }
+
+    // ── Concurrent hydration race ──────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_hydration_race() {
+        let (fs, _store, _dir) = setup_one_workspace("repo", "ws", 1);
+        let fs = Arc::new(fs);
+
+        let repo_ino = fs.lookup(ROOT_INODE, "repo").await.unwrap();
+
+        // Spawn multiple tasks that all trigger hydration simultaneously.
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let fs = Arc::clone(&fs);
+            handles.push(tokio::spawn(async move {
+                let ws_root = fs.lookup(repo_ino, "ws").await.unwrap();
+                let entries = fs.readdir(ws_root).await.unwrap();
+                (ws_root, entries.len())
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        // All tasks should have gotten the same workspace root inode.
+        let expected_root = results[0].0;
+        for (root, _) in &results {
+            assert_eq!(*root, expected_root, "all tasks should see the same workspace root");
+        }
+
+        // Only one KikiFs should have been created (double-checked locking).
+        let inner = fs.inner.lock();
+        assert_eq!(inner.live.len(), 1, "only one KikiFs should exist despite concurrent hydration");
+    }
 }

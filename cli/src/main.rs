@@ -132,8 +132,6 @@ enum KikiSubcommand {
     Kk(KikiArgs),
     /// Clone a remote repo into the managed workspace namespace
     Clone(CloneCommandArgs),
-    /// Manage workspaces within a cloned repo
-    Workspace(WorkspaceCommandArgs),
 }
 
 /// Clone a remote repo into the managed namespace (`/mnt/kiki/<name>/default`).
@@ -521,6 +519,87 @@ async fn kiki_git_dispatch_hook(
     old_dispatch.call(ui, command_helper).await
 }
 
+/// Dispatch hook for `kiki workspace` — intercepts `jj workspace`
+/// subcommands and routes `create`/`list`/`delete` through the daemon's
+/// managed-workspace RPCs instead of jj's built-in workspace management.
+/// Mirrors the `kiki_git_dispatch_hook` pattern (§12.2 #7).
+async fn kiki_workspace_dispatch_hook(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    old_dispatch: BoxedAsyncCliDispatch<'_>,
+) -> Result<(), CommandError> {
+    if let Some(("workspace", ws_matches)) = command_helper.matches().subcommand()
+        && is_kiki_backend(command_helper)
+    {
+        match ws_matches.subcommand_name() {
+            Some("create" | "add") | Some("list") | Some("delete" | "forget") => {
+                return dispatch_kiki_workspace(ui, command_helper).await;
+            }
+            _ => {
+                // Other workspace subcommands (e.g. `workspace root`) fall
+                // through to jj's built-in handling.
+            }
+        }
+    }
+    old_dispatch.call(ui, command_helper).await
+}
+
+/// Re-parse workspace args from the raw command line and dispatch to
+/// kiki's managed-workspace implementation.
+async fn dispatch_kiki_workspace(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+) -> Result<(), CommandError> {
+    use clap::Parser as _;
+
+    let string_args = command_helper.string_args();
+    let ws_pos = string_args
+        .iter()
+        .position(|s| s == "workspace")
+        .ok_or_else(|| cli_error("internal: 'workspace' not found in command args"))?;
+    let ws_args = &string_args[ws_pos..];
+
+    // Map jj workspace subcommand names to kiki's naming:
+    // `jj workspace add` → `kiki workspace create`
+    // `jj workspace forget` → `kiki workspace delete`
+    let mapped: Vec<String> = ws_args
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if i == 1 {
+                match s.as_str() {
+                    "add" => "create".to_owned(),
+                    "forget" => "delete".to_owned(),
+                    other => other.to_owned(),
+                }
+            } else {
+                s.clone()
+            }
+        })
+        .collect();
+
+    let parsed = KikiWorkspaceCli::try_parse_from(&mapped).map_err(|e| {
+        user_error(format!(
+            "on kiki-backend repos, workspace management goes through the daemon:\n\n  \
+             workspace create <REPO> <WORKSPACE>\n  \
+             workspace list [<REPO>]\n  \
+             workspace delete <REPO> <WORKSPACE>\n\n\
+             {e}"
+        ))
+    })?;
+
+    run_workspace_command(ui, command_helper, WorkspaceCommandArgs { command: parsed.command })
+        .await
+}
+
+/// Top-level clap parser for re-parsing workspace args from raw strings.
+#[derive(clap::Parser, Debug)]
+#[command(name = "workspace")]
+struct KikiWorkspaceCli {
+    #[command(subcommand)]
+    command: WorkspaceCommands,
+}
+
 /// Re-parse git args and dispatch to kiki's daemon-backed implementation.
 async fn dispatch_kiki_git(
     ui: &mut Ui,
@@ -568,9 +647,6 @@ async fn run_kk_command(
     match command {
         KikiSubcommand::Clone(args) => {
             return run_clone_command(ui, command_helper, args).await;
-        }
-        KikiSubcommand::Workspace(args) => {
-            return run_workspace_command(ui, command_helper, args).await;
         }
         KikiSubcommand::Kk(_) => {} // fall through to existing dispatch below
     }
@@ -1376,6 +1452,7 @@ fn main() -> std::process::ExitCode {
         .add_subcommand(run_kk_command)
         .add_dispatch_hook(kiki_git_import_hook)
         .add_dispatch_hook(kiki_git_dispatch_hook)
+        .add_dispatch_hook(kiki_workspace_dispatch_hook)
         .run()
         .into()
 }

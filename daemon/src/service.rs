@@ -4589,4 +4589,379 @@ mod tests {
             .resolve_workspace("/mnt/kiki/repo/ws")
             .is_err());
     }
+
+    // ── M12 RPC integration tests ──────────────────────────────────
+
+    /// Construct a `JujutsuService` with an on-disk storage dir and a
+    /// RootFs, ready for M12 RPC testing (Clone, WorkspaceCreate, etc.).
+    fn service_with_rootfs() -> (JujutsuService, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_dir = dir.path().to_path_buf();
+        let mount_root = PathBuf::from("/mnt/kiki");
+
+        let root_fs = Arc::new(crate::vfs::RootFs::new(
+            mount_root.clone(),
+            storage_dir.clone(),
+            1,
+        ));
+
+        let svc = JujutsuService {
+            mounts: Arc::new(Mutex::new(HashMap::new())),
+            vfs_handle: None,
+            storage: StorageConfig::OnDisk {
+                root: storage_dir,
+            },
+            tunnels_dir: None,
+            root_fs: Some(root_fs),
+            mount_root: Some(mount_root),
+            _mount_attachment: None,
+        };
+        (svc, dir)
+    }
+
+    #[tokio::test]
+    async fn clone_rpc_with_dir_url() {
+        let (svc, dir) = service_with_rootfs();
+
+        // Create a bare git repo to clone from.
+        let src = dir.path().join("source-repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        assert!(git_init.status.success(), "git init failed");
+
+        let url = format!("dir://{}", src.display());
+
+        let reply = svc
+            .clone(Request::new(CloneReq {
+                url: url.clone(),
+                name: "myrepo".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(reply.workspace_path, "/mnt/kiki/myrepo/default");
+
+        // repos.toml should exist and contain the repo.
+        let repos_path = crate::repo_meta::repos_config_path(dir.path());
+        let repos = crate::repo_meta::ReposConfig::read_or_default(&repos_path).unwrap();
+        assert!(repos.repos.contains_key("myrepo"));
+        assert_eq!(repos.repos["myrepo"].url, url);
+
+        // workspace.toml should exist.
+        let ws_path = crate::repo_meta::workspace_config_path(
+            dir.path(), "myrepo", "default",
+        );
+        let ws_cfg = crate::repo_meta::WorkspaceConfig::read_from(&ws_path).unwrap();
+        assert_eq!(ws_cfg.state, crate::repo_meta::WorkspaceState::Active);
+        assert_eq!(ws_cfg.slot, 1);
+    }
+
+    #[tokio::test]
+    async fn clone_rpc_derives_name_from_url() {
+        let (svc, dir) = service_with_rootfs();
+
+        let src = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        let reply = svc
+            .clone(Request::new(CloneReq {
+                url: format!("dir://{}", src.display()),
+                name: String::new(), // derive from URL
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(reply.workspace_path, "/mnt/kiki/dotfiles/default");
+    }
+
+    #[tokio::test]
+    async fn clone_rpc_duplicate_repo_is_error() {
+        let (svc, dir) = service_with_rootfs();
+
+        let src = dir.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        let url = format!("dir://{}", src.display());
+
+        // First clone succeeds.
+        svc.clone(Request::new(CloneReq {
+            url: url.clone(),
+            name: "repo".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Second clone of the same name fails.
+        let err = svc
+            .clone(Request::new(CloneReq {
+                url,
+                name: "repo".into(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn repo_list_rpc() {
+        let (svc, dir) = service_with_rootfs();
+
+        // Empty initially.
+        let reply = svc
+            .repo_list(Request::new(RepoListReq {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.repos.is_empty());
+
+        // Clone a repo.
+        let src = dir.path().join("alpha");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        svc.clone(Request::new(CloneReq {
+            url: format!("dir://{}", src.display()),
+            name: "alpha".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Now list shows one repo.
+        let reply = svc
+            .repo_list(Request::new(RepoListReq {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.repos.len(), 1);
+        assert_eq!(reply.repos[0].name, "alpha");
+        assert!(reply.repos[0].workspaces.contains(&"default".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn workspace_create_finalize_list_delete_flow() {
+        let (svc, dir) = service_with_rootfs();
+
+        // Clone a repo first.
+        let src = dir.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        svc.clone(Request::new(CloneReq {
+            url: format!("dir://{}", src.display()),
+            name: "repo".into(),
+        }))
+        .await
+        .unwrap();
+
+        // WorkspaceCreate — pending state.
+        let create_reply = svc
+            .workspace_create(Request::new(WorkspaceCreateReq {
+                repo: "repo".into(),
+                workspace: "fix-auth".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(create_reply.workspace_path, "/mnt/kiki/repo/fix-auth");
+
+        // workspace.toml should exist with pending state.
+        let ws_path = crate::repo_meta::workspace_config_path(
+            dir.path(), "repo", "fix-auth",
+        );
+        let ws_cfg = crate::repo_meta::WorkspaceConfig::read_from(&ws_path).unwrap();
+        assert_eq!(ws_cfg.state, crate::repo_meta::WorkspaceState::Pending);
+
+        // WorkspaceList — pending workspace should NOT appear.
+        let list_reply = svc
+            .workspace_list(Request::new(WorkspaceListReq {
+                repo: "repo".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ws_names: Vec<&str> = list_reply.workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert!(ws_names.contains(&"default"));
+        assert!(
+            !ws_names.contains(&"fix-auth"),
+            "pending workspace should be hidden from list"
+        );
+
+        // WorkspaceFinalize — transition to active.
+        svc.workspace_finalize(Request::new(WorkspaceFinalizeReq {
+            repo: "repo".into(),
+            workspace: "fix-auth".into(),
+        }))
+        .await
+        .unwrap();
+
+        // workspace.toml should now be active.
+        let ws_cfg = crate::repo_meta::WorkspaceConfig::read_from(&ws_path).unwrap();
+        assert_eq!(ws_cfg.state, crate::repo_meta::WorkspaceState::Active);
+
+        // WorkspaceList — now "fix-auth" appears.
+        let list_reply = svc
+            .workspace_list(Request::new(WorkspaceListReq {
+                repo: "repo".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ws_names: Vec<&str> = list_reply.workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert!(ws_names.contains(&"default"));
+        assert!(ws_names.contains(&"fix-auth"));
+
+        // WorkspaceDelete.
+        svc.workspace_delete(Request::new(WorkspaceDeleteReq {
+            repo: "repo".into(),
+            workspace: "fix-auth".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Should be gone from list.
+        let list_reply = svc
+            .workspace_list(Request::new(WorkspaceListReq {
+                repo: "repo".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list_reply.workspaces.len(), 1);
+        assert_eq!(list_reply.workspaces[0].name, "default");
+
+        // On-disk directory should be removed.
+        let ws_dir = crate::repo_meta::workspace_dir(dir.path(), "repo", "fix-auth");
+        assert!(!ws_dir.exists(), "workspace directory should be deleted");
+    }
+
+    #[tokio::test]
+    async fn workspace_create_duplicate_is_error() {
+        let (svc, dir) = service_with_rootfs();
+
+        let src = dir.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        svc.clone(Request::new(CloneReq {
+            url: format!("dir://{}", src.display()),
+            name: "repo".into(),
+        }))
+        .await
+        .unwrap();
+
+        // "default" was created by Clone — creating it again should fail.
+        let err = svc
+            .workspace_create(Request::new(WorkspaceCreateReq {
+                repo: "repo".into(),
+                workspace: "default".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn workspace_create_nonexistent_repo_is_error() {
+        let (svc, _dir) = service_with_rootfs();
+
+        let err = svc
+            .workspace_create(Request::new(WorkspaceCreateReq {
+                repo: "nonexistent".into(),
+                workspace: "ws".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn workspace_delete_nonexistent_is_error() {
+        let (svc, dir) = service_with_rootfs();
+
+        let src = dir.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        svc.clone(Request::new(CloneReq {
+            url: format!("dir://{}", src.display()),
+            name: "repo".into(),
+        }))
+        .await
+        .unwrap();
+
+        let err = svc
+            .workspace_delete(Request::new(WorkspaceDeleteReq {
+                repo: "repo".into(),
+                workspace: "nonexistent".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn clone_rpc_slot_allocation_is_monotonic() {
+        let (svc, dir) = service_with_rootfs();
+
+        // Clone two repos — each gets a default workspace with a unique slot.
+        for name in ["alpha", "beta"] {
+            let src = dir.path().join(name);
+            std::fs::create_dir_all(&src).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "--bare"])
+                .current_dir(&src)
+                .output()
+                .unwrap();
+            svc.clone(Request::new(CloneReq {
+                url: format!("dir://{}", src.display()),
+                name: name.into(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Check repos.toml: next_slot should be >= 3 (slots 1 and 2 used).
+        let repos_path = crate::repo_meta::repos_config_path(dir.path());
+        let repos = crate::repo_meta::ReposConfig::read_or_default(&repos_path).unwrap();
+        assert!(repos.next_slot >= 3, "next_slot must be >= 3 after two clones");
+
+        // workspace.toml slots should differ.
+        let ws1 = crate::repo_meta::WorkspaceConfig::read_from(
+            &crate::repo_meta::workspace_config_path(dir.path(), "alpha", "default"),
+        ).unwrap();
+        let ws2 = crate::repo_meta::WorkspaceConfig::read_from(
+            &crate::repo_meta::workspace_config_path(dir.path(), "beta", "default"),
+        ).unwrap();
+        assert_ne!(ws1.slot, ws2.slot, "different repos must get different slots");
+        assert!(ws1.slot > 0 && ws2.slot > 0, "slots must be > 0");
+    }
 }
