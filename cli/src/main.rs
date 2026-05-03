@@ -143,6 +143,13 @@ struct CloneCommandArgs {
     /// Repo name override (default: derived from URL's last path segment)
     #[arg(long)]
     name: Option<String>,
+    /// Create a symlink at this path pointing into the managed namespace.
+    ///
+    /// The repo still lives under /mnt/kiki/<name>/default, but you can
+    /// `cd <path>` to work there. All paths are canonicalized before
+    /// reaching the daemon, so tools see the real VFS path.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    link: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -163,25 +170,29 @@ enum WorkspaceCommands {
 
 #[derive(Debug, Clone, clap::Args)]
 struct WorkspaceCreateArgs {
-    /// Repo name
-    repo: String,
-    /// Workspace name
-    workspace: String,
+    /// Workspace name, or repo/workspace.
+    ///
+    /// If a bare name like `fix-auth` is given, the repo is inferred
+    /// from the current directory (you must be inside a managed
+    /// workspace under mount_root). Use `myrepo/fix-auth` to be
+    /// explicit.
+    name: String,
     // TODO(M12): --revision flag for checkout target override
 }
 
 #[derive(Debug, Clone, clap::Args)]
 struct WorkspaceListArgs {
-    /// Repo name (omit to list all repos and their workspaces)
+    /// Repo name (omit to infer from cwd, or list all repos)
     repo: Option<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
 struct WorkspaceDeleteArgs {
-    /// Repo name
-    repo: String,
-    /// Workspace name
-    workspace: String,
+    /// Workspace name, or repo/workspace.
+    ///
+    /// If a bare name like `fix-auth` is given, the repo is inferred
+    /// from the current directory.
+    name: String,
 }
 
 fn create_store_factories() -> StoreFactories {
@@ -581,9 +592,9 @@ async fn dispatch_kiki_workspace(
     let parsed = KikiWorkspaceCli::try_parse_from(&mapped).map_err(|e| {
         user_error(format!(
             "on kiki-backend repos, workspace management goes through the daemon:\n\n  \
-             workspace create <REPO> <WORKSPACE>\n  \
-             workspace list [<REPO>]\n  \
-             workspace delete <REPO> <WORKSPACE>\n\n\
+             workspace create [repo/]<name>\n  \
+             workspace list [<repo>]\n  \
+             workspace delete [repo/]<name>\n\n\
              {e}"
         ))
     })?;
@@ -1063,6 +1074,56 @@ fn workspace_path(command_helper: &CommandHelper) -> Result<String, CommandError
         .ok_or_else(|| cli_error("workspace path is not valid UTF-8"))
 }
 
+/// Infer the repo name from the current working directory by stripping
+/// `mount_root` and taking the first path component. Returns `None` if
+/// cwd is not under `mount_root`.
+///
+/// Example: cwd = `/mnt/kiki/monorepo/default/src`, mount_root = `/mnt/kiki`
+/// → `Some("monorepo")`.
+fn infer_repo_from_cwd(command_helper: &CommandHelper) -> Option<String> {
+    let mount_root = daemon_cmd::configured_mount_root();
+    let cwd = command_helper.cwd();
+    // Canonicalize cwd to resolve symlinks (e.g. ~/src/bar → /mnt/kiki/bar/default).
+    let canonical = cwd.canonicalize().ok()?;
+    let rel = canonical.strip_prefix(&mount_root).ok()?;
+    rel.components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .map(|s| s.to_owned())
+}
+
+/// Parse a workspace specifier into `(repo, workspace)`.
+///
+/// Accepts two forms:
+/// - `fix-auth` — bare name, repo inferred from cwd
+/// - `myrepo/fix-auth` — explicit repo/workspace
+///
+/// Returns a user-facing error if a bare name is given but the repo
+/// can't be inferred.
+fn parse_workspace_spec(
+    name: &str,
+    command_helper: &CommandHelper,
+) -> Result<(String, String), CommandError> {
+    if let Some((repo, ws)) = name.split_once('/') {
+        if repo.is_empty() || ws.is_empty() {
+            return Err(user_error(format!(
+                "invalid workspace specifier {name:?}: \
+                 use 'workspace-name' or 'repo/workspace-name'"
+            )));
+        }
+        Ok((repo.to_owned(), ws.to_owned()))
+    } else {
+        let repo = infer_repo_from_cwd(command_helper).ok_or_else(|| {
+            user_error(format!(
+                "cannot infer repo from current directory; \
+                 use '{name}' from inside a managed workspace, \
+                 or specify 'repo/{name}' explicitly"
+            ))
+        })?;
+        Ok((repo, name.to_owned()))
+    }
+}
+
 /// Finalize whatever transport the daemon chose. On Linux (Fuse) the
 /// daemon already attached the mount; on macOS (Nfs) we shell out to
 /// `mount_nfs`. `None` is the test-mode reply (`disable_mount = true`):
@@ -1205,32 +1266,61 @@ async fn run_clone_command(
     )
     .await?;
 
-    let repo_name = args
-        .name
-        .as_deref()
-        .unwrap_or_else(|| {
-            // Best-effort: extract from the path the daemon returned.
-            wc_path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("repo")
-        });
+    // Create symlink if --link was requested.
+    if let Some(link_path) = &args.link {
+        if link_path.exists() {
+            return Err(user_error(format!(
+                "link target already exists: {}",
+                link_path.display()
+            )));
+        }
+        if let Some(parent) = link_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    user_error_with_message(
+                        format!("creating parent directory {}", parent.display()),
+                        e,
+                    )
+                })?;
+            }
+        }
+        std::os::unix::fs::symlink(&wc_path, link_path).map_err(|e| {
+            user_error_with_message(
+                format!(
+                    "creating symlink {} -> {}",
+                    link_path.display(),
+                    wc_path.display()
+                ),
+                e,
+            )
+        })?;
+    }
+
+    let display_path = args
+        .link
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| reply.workspace_path.clone());
 
     writeln!(
         ui.status(),
         "Cloned into {} (workspace: default)",
         reply.workspace_path,
     )?;
-    writeln!(
-        ui.hint_default(),
-        "cd {} to start working",
-        reply.workspace_path,
-    )?;
-
-    // Suppress unused variable warning — repo_name is used for the hint
-    // in future commits (e.g. `kiki workspace create {repo_name}/<name>`).
-    let _ = repo_name;
+    if args.link.is_some() {
+        writeln!(
+            ui.hint_default(),
+            "cd {} to start working (symlink -> {})",
+            display_path,
+            reply.workspace_path,
+        )?;
+    } else {
+        writeln!(
+            ui.hint_default(),
+            "cd {} to start working",
+            display_path,
+        )?;
+    }
 
     Ok(())
 }
@@ -1249,15 +1339,15 @@ async fn run_workspace_command(
             run_workspace_create(ui, command_helper, &client, create_args).await
         }
         WorkspaceCommands::List(list_args) => {
-            run_workspace_list(ui, &client, list_args)
+            run_workspace_list(ui, command_helper, &client, list_args)
         }
         WorkspaceCommands::Delete(delete_args) => {
-            run_workspace_delete(ui, &client, delete_args)
+            run_workspace_delete(ui, command_helper, &client, delete_args)
         }
     }
 }
 
-/// `kiki workspace create <repo> <workspace>`
+/// `kiki workspace create [repo/]<workspace>`
 ///
 /// 1. WorkspaceCreate RPC (daemon allocates slot, pending state)
 /// 2. jj workspace init at the returned path
@@ -1268,11 +1358,13 @@ async fn run_workspace_create(
     client: &BlockingJujutsuInterfaceClient,
     args: WorkspaceCreateArgs,
 ) -> Result<(), CommandError> {
+    let (repo, workspace) = parse_workspace_spec(&args.name, command_helper)?;
+
     // Step 1: WorkspaceCreate RPC (pending state).
     let reply = client
         .workspace_create(proto::jj_interface::WorkspaceCreateReq {
-            repo: args.repo.clone(),
-            workspace: args.workspace.clone(),
+            repo: repo.clone(),
+            workspace: workspace.clone(),
         })
         .map_err(|e| user_error_with_message("WorkspaceCreate RPC failed", e))?
         .into_inner();
@@ -1319,7 +1411,7 @@ async fn run_workspace_create(
         Ok(Box::new(store))
     };
 
-    let ws_name = WorkspaceName::new(&args.workspace);
+    let ws_name = WorkspaceName::new(&workspace);
 
     let init_result = Workspace::init_with_factories(
         command_helper.settings(),
@@ -1344,8 +1436,8 @@ async fn run_workspace_create(
     if let Err(e) = init_result {
         // Best-effort cleanup: delete the pending workspace.
         let _ = client.workspace_delete(proto::jj_interface::WorkspaceDeleteReq {
-            repo: args.repo.clone(),
-            workspace: args.workspace.clone(),
+            repo: repo.clone(),
+            workspace: workspace.clone(),
         });
         return Err(e.into());
     }
@@ -1353,16 +1445,21 @@ async fn run_workspace_create(
     // Step 3: Finalize — transition from pending to active.
     client
         .workspace_finalize(proto::jj_interface::WorkspaceFinalizeReq {
-            repo: args.repo.clone(),
-            workspace: args.workspace.clone(),
+            repo: repo.clone(),
+            workspace: workspace.clone(),
         })
         .map_err(|e| user_error_with_message("WorkspaceFinalize RPC failed", e))?;
 
     writeln!(
         ui.status(),
         "Created workspace {}/{} at {}",
-        args.repo,
-        args.workspace,
+        repo,
+        workspace,
+        reply.workspace_path,
+    )?;
+    writeln!(
+        ui.hint_default(),
+        "cd {} to start working",
         reply.workspace_path,
     )?;
 
@@ -1372,10 +1469,13 @@ async fn run_workspace_create(
 /// `kiki workspace list [<repo>]`
 fn run_workspace_list(
     ui: &mut Ui,
+    command_helper: &CommandHelper,
     client: &BlockingJujutsuInterfaceClient,
     args: WorkspaceListArgs,
 ) -> Result<(), CommandError> {
-    if let Some(repo) = args.repo {
+    // Infer repo from cwd if not given explicitly.
+    let repo = args.repo.or_else(|| infer_repo_from_cwd(command_helper));
+    if let Some(repo) = repo {
         // List workspaces in a specific repo.
         let reply = client
             .workspace_list(proto::jj_interface::WorkspaceListReq {
@@ -1414,24 +1514,27 @@ fn run_workspace_list(
     Ok(())
 }
 
-/// `kiki workspace delete <repo> <workspace>`
+/// `kiki workspace delete [repo/]<workspace>`
 fn run_workspace_delete(
     ui: &mut Ui,
+    command_helper: &CommandHelper,
     client: &BlockingJujutsuInterfaceClient,
     args: WorkspaceDeleteArgs,
 ) -> Result<(), CommandError> {
+    let (repo, workspace) = parse_workspace_spec(&args.name, command_helper)?;
+
     client
         .workspace_delete(proto::jj_interface::WorkspaceDeleteReq {
-            repo: args.repo.clone(),
-            workspace: args.workspace.clone(),
+            repo: repo.clone(),
+            workspace: workspace.clone(),
         })
         .map_err(|e| user_error_with_message("WorkspaceDelete RPC failed", e))?;
 
     writeln!(
         ui.status(),
         "Deleted workspace {}/{}",
-        args.repo,
-        args.workspace,
+        repo,
+        workspace,
     )?;
     Ok(())
 }
