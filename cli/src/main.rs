@@ -1164,7 +1164,7 @@ fn workspace_path(command_helper: &CommandHelper) -> Result<String, CommandError
 /// Example: cwd = `/mnt/kiki/monorepo/default/src`, mount_root = `/mnt/kiki`
 /// → `Some("monorepo")`.
 fn infer_repo_from_cwd(command_helper: &CommandHelper) -> Option<String> {
-    let mount_root = daemon_cmd::configured_mount_root();
+    let mount_root = store::paths::default_mount_root();
     let cwd = command_helper.cwd();
     // Canonicalize cwd to resolve symlinks (e.g. ~/src/bar → /mnt/kiki/bar/default).
     let canonical = cwd.canonicalize().ok()?;
@@ -1270,7 +1270,8 @@ fn mount_nfs_localhost(_wc_path: &std::path::Path, _port: u32) -> Result<(), Com
 /// Check prerequisites and create the workspace mount root directory.
 /// Runs without a daemon connection — safe to call before anything else.
 fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
-    let mount_root = daemon_cmd::configured_mount_root();
+    let mount_root = store::paths::default_mount_root();
+    let state_dir = store::paths::state_dir();
 
     writeln!(ui.status(), "kiki setup")?;
     writeln!(ui.status())?;
@@ -1302,32 +1303,24 @@ fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
         }
     }
 
-    // ── 2. Create mount root ───────────────────────────────────────
+    // ── 2. Create state dir ──────────────────────────────────────
+    write!(ui.status(), "  state dir ({}) ... ", state_dir.display())?;
+    match std::fs::create_dir_all(&state_dir) {
+        Ok(()) => writeln!(ui.status(), "ok")?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            writeln!(ui.status(), "ok")?;
+        }
+        Err(e) => {
+            writeln!(ui.status(), "FAILED: {e}")?;
+        }
+    }
+
+    // ── 3. Create mount root ───────────────────────────────────────
     write!(ui.status(), "  mount root ({}) ... ", mount_root.display())?;
     let mount_root_ok = if mount_root.exists() {
-        // Check we can write to it.
-        let probe = mount_root.join(".kiki-setup-probe");
-        match std::fs::File::create(&probe) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&probe);
-                writeln!(ui.status(), "ok")?;
-                true
-            }
-            Err(e) => {
-                writeln!(ui.status(), "NOT WRITABLE")?;
-                writeln!(
-                    ui.warning_default(),
-                    "Mount root exists but is not writable: {e}\n  \
-                     Fix with: sudo chown $USER {}",
-                    mount_root.display(),
-                )?;
-                false
-            }
-        }
+        writeln!(ui.status(), "ok")?;
+        true
     } else {
-        // Try to create it directly. AlreadyExists is fine — can happen
-        // when a stale FUSE mountpoint makes `exists()` return false but
-        // the directory inode is still present.
         match std::fs::create_dir_all(&mount_root) {
             Ok(()) => {
                 writeln!(ui.status(), "created")?;
@@ -1353,7 +1346,7 @@ fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
         }
     };
 
-    // ── 3. Summary ─────────────────────────────────────────────────
+    // ── 4. Summary ─────────────────────────────────────────────────
     writeln!(ui.status())?;
     if mount_root_ok {
         writeln!(

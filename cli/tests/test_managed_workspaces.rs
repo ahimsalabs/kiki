@@ -51,6 +51,7 @@ struct ManagedTestEnvironment {
     env_root: PathBuf,
     home_dir: PathBuf,
     mount_root: PathBuf,
+    kiki_home: PathBuf,
     cli_config_path: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     config_file_number: std::cell::RefCell<i64>,
@@ -62,7 +63,7 @@ struct ManagedTestEnvironment {
 
 impl Drop for ManagedTestEnvironment {
     fn drop(&mut self) {
-        let _ = self.daemon_child.kill();
+        self.stop_daemon();
     }
 }
 
@@ -80,18 +81,12 @@ impl ManagedTestEnvironment {
         let daemon_dir = env_root.join("daemon");
         std::fs::create_dir(&daemon_dir).unwrap();
 
-        // Create mount_root directory for the RootFs FUSE mount.
+        // Create mount_root directory for the RootFs FUSE mount (must be empty).
         let mount_root = env_root.join("mnt");
         std::fs::create_dir(&mount_root).unwrap();
-
-        // Write kiki config.toml with mount_root BEFORE starting daemon.
-        let kiki_config_dir = home_dir.join(".config/kiki");
-        std::fs::create_dir_all(&kiki_config_dir).unwrap();
-        let config_content = format!(
-            "mount_root = {:?}\n",
-            mount_root.to_str().unwrap()
-        );
-        std::fs::write(kiki_config_dir.join("config.toml"), &config_content).unwrap();
+        // State directory (KIKI_HOME) — separate from mount point.
+        let kiki_home = env_root.join("state");
+        std::fs::create_dir(&kiki_home).unwrap();
 
         // Spawn daemon with FUSE enabled (no --disable-mount).
         let socket_path = env_root.join("daemon.sock");
@@ -102,6 +97,8 @@ impl ManagedTestEnvironment {
             "--storage-dir", daemon_dir.to_str().unwrap(),
         ]);
         command.env("HOME", home_dir.to_str().unwrap());
+        command.env("KIKI_HOME", kiki_home.to_str().unwrap());
+        command.env("KIKI_MOUNT", mount_root.to_str().unwrap());
         command.env("KIKI_SOCKET_PATH", socket_path.to_str().unwrap());
         // Suppress daemon output to avoid noise.
         command.stdout(std::process::Stdio::null());
@@ -148,6 +145,7 @@ impl ManagedTestEnvironment {
             env_root,
             home_dir,
             mount_root,
+            kiki_home,
             cli_config_path: config_dir,
             env_vars,
             config_file_number: std::cell::RefCell::new(0),
@@ -183,6 +181,8 @@ impl ManagedTestEnvironment {
         cmd.env("JJ_OP_USERNAME", "test-username");
         cmd.env("JJ_TZ_OFFSET_MINS", "660");
         cmd.env("KIKI_SOCKET_PATH", self.socket_path.to_str().unwrap());
+        cmd.env("KIKI_HOME", self.kiki_home.to_str().unwrap());
+        cmd.env("KIKI_MOUNT", self.mount_root.to_str().unwrap());
 
         let mut command_number = self.command_number.borrow_mut();
         *command_number += 1;
@@ -237,11 +237,21 @@ impl ManagedTestEnvironment {
     pub fn stop_daemon(&mut self) {
         let _ = self.daemon_child.kill();
         let _ = self.daemon_child.wait();
-        // Explicitly unmount — killing the daemon leaves a stale mount.
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-u", self.mount_root.to_str().unwrap()])
-            .status();
-        // Wait for mount to be cleaned up.
+        // Explicitly unmount all FUSE mounts under env_root — killing the
+        // daemon leaves stale mounts (both the RootFs mount at mount_root
+        // and any per-repo mounts from Initialize RPCs).
+        let prefix = self.env_root.to_str().unwrap();
+        if let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") {
+            for line in info.lines() {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 5 && fields[4].starts_with(prefix) {
+                    let _ = std::process::Command::new("fusermount3")
+                        .args(["-u", fields[4]])
+                        .status();
+                }
+            }
+        }
+        // Wait for mount_root to be cleaned up (restart tests need this).
         for _ in 0..50 {
             if !is_mountpoint(&self.mount_root) {
                 break;
@@ -259,6 +269,8 @@ impl ManagedTestEnvironment {
             "--storage-dir", self.daemon_dir.to_str().unwrap(),
         ]);
         command.env("HOME", self.home_dir.to_str().unwrap());
+        command.env("KIKI_HOME", self.kiki_home.to_str().unwrap());
+        command.env("KIKI_MOUNT", self.mount_root.to_str().unwrap());
         command.env("KIKI_SOCKET_PATH", self.socket_path.to_str().unwrap());
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());

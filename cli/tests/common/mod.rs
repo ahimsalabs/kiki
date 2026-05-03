@@ -37,18 +37,19 @@ pub struct TestEnvironment {
     daemon_child: std::process::Child,
     daemon_dir: PathBuf,
     socket_path: PathBuf,
+    kiki_home: PathBuf,
+    kiki_mount: PathBuf,
 }
 
 impl Drop for TestEnvironment {
     fn drop(&mut self) {
-        // TODO maybe make retaining an env a option in the testing harness
-
-        //let mut other = TempDir::new("").unwrap();
-        //std::mem::swap(&mut self._temp_dir, &mut other);
-        //std::mem::forget(other);
-        self.daemon_child
-            .kill()
-            .expect("Failed to kill daemon process")
+        let _ = self.daemon_child.kill();
+        let _ = self.daemon_child.wait();
+        // Explicitly unmount all FUSE mounts under env_root — SIGKILL
+        // prevents the daemon's MountHandle Drop from running. The daemon
+        // creates per-repo mounts (Initialize RPC) plus the RootFs mount
+        // at kiki_home; we must unmount them all.
+        self.unmount_all();
     }
 }
 
@@ -91,6 +92,13 @@ impl Default for TestEnvironment {
         }
         command.args(&args);
         command.env("KIKI_SOCKET_PATH", &socket_path);
+        // Isolate KIKI_HOME (state dir) and KIKI_MOUNT (FUSE mount point).
+        let kiki_home = env_root.join("kiki_home");
+        std::fs::create_dir(&kiki_home).unwrap();
+        let kiki_mount = env_root.join("kiki_mount");
+        std::fs::create_dir(&kiki_mount).unwrap();
+        command.env("KIKI_HOME", &kiki_home);
+        command.env("KIKI_MOUNT", &kiki_mount);
         let daemon_child = command
             .spawn()
             .expect("Failed to start daemon for integration test");
@@ -118,6 +126,8 @@ impl Default for TestEnvironment {
             daemon_child,
             daemon_dir,
             socket_path,
+            kiki_home,
+            kiki_mount,
         };
         // Use absolute timestamps in the operation log to make tests independent of the
         // current time.
@@ -152,6 +162,8 @@ impl TestEnvironment {
         cmd.env("JJ_OP_USERNAME", "test-username");
         cmd.env("JJ_TZ_OFFSET_MINS", "660");
         cmd.env("KIKI_SOCKET_PATH", self.socket_path.to_str().unwrap());
+        cmd.env("KIKI_HOME", self.kiki_home.to_str().unwrap());
+        cmd.env("KIKI_MOUNT", self.kiki_mount.to_str().unwrap());
 
         let mut command_number = self.command_number.borrow_mut();
         *command_number += 1;
@@ -241,6 +253,23 @@ impl TestEnvironment {
     pub fn jj_cmd_panic(&self, current_dir: &Path, args: &[&str]) -> String {
         let assert = self.jj_cmd(current_dir, args).assert().code(101).stdout("");
         self.normalize_output(&get_stderr_string(&assert))
+    }
+
+    /// Unmount all FUSE mounts whose mountpoint is under this test's env_root.
+    /// Reads /proc/self/mountinfo to find them.
+    fn unmount_all(&self) {
+        let prefix = self.env_root.to_str().unwrap();
+        if let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") {
+            for line in info.lines() {
+                // mountinfo fields: id parent major:minor root mountpoint opts ...
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 5 && fields[4].starts_with(prefix) {
+                    let _ = std::process::Command::new("fusermount3")
+                        .args(["-u", fields[4]])
+                        .status();
+                }
+            }
+        }
     }
 
     pub fn env_root(&self) -> &Path {

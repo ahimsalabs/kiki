@@ -65,35 +65,36 @@ The workspace produces one binary:
 ### Zero-config defaults
 
 kiki requires **no configuration** for local use. The daemon is auto-started
-when you run your first `kiki` command. It communicates over a Unix domain
-socket at a platform-appropriate path:
+when you run your first `kiki` command.
 
-| Platform | Socket path |
-|----------|-------------|
-| Linux    | `$XDG_RUNTIME_DIR/kiki/daemon.sock` (or `/tmp/kiki-$UID/daemon.sock`) |
-| macOS    | `~/Library/Caches/kiki/daemon.sock` |
+Two separate directories:
 
-Storage lives at `~/.local/state/kiki` (Linux) or
-`~/Library/Application Support/kiki` (macOS).
+```
+~/.local/share/kiki/            # KIKI_HOME — state directory
+~/.local/share/kiki/daemon.sock # CLI ↔ daemon socket
+~/.local/share/kiki/daemon.pid  # daemon PID file
+~/.local/share/kiki/daemon.log  # daemon log
+~/.local/share/kiki/store/      # git stores, redb, workspace metadata
+~/.local/share/kiki/config.toml # optional config
+
+~/kiki/                          # KIKI_MOUNT — FUSE mount (repos/workspaces)
+```
+
+The FUSE mount point (`~/kiki/`) must be empty before the daemon mounts it.
+Repos appear as `~/kiki/<repo>/<workspace>/` when the daemon is running.
 
 ### Optional config file
 
-For power users, `~/.config/kiki/config.toml` can override defaults:
+`$KIKI_HOME/config.toml` can override defaults:
 
 ```toml
 # All fields are optional.
-
-# Mount root for the managed workspace namespace.
-# Default: ~/kiki (created automatically on first use).
-# Power users can set a traditional mount point:
-# mount_root = "/mnt/kiki"
-# (requires: sudo mkdir -p /mnt/kiki && sudo chown $USER /mnt/kiki)
 
 # TCP listener for daemon-to-daemon remote access (kiki:// scheme).
 # Default: disabled.
 # grpc_addr = "[::1]:12000"
 
-# Override storage directory.
+# Override storage directory (default: $KIKI_HOME/store/).
 # storage_dir = "/path/to/storage"
 
 # NFS port range (macOS only).
@@ -106,6 +107,8 @@ For power users, `~/.config/kiki/config.toml` can override defaults:
 
 | Variable | Effect |
 |----------|--------|
+| `KIKI_HOME` | State directory (stores, config, daemon runtime). Default: `~/.local/share/kiki`. |
+| `KIKI_MOUNT` | FUSE mount point (repos/workspaces appear here). Default: `~/kiki`. |
 | `KIKI_SOCKET_PATH` | Override socket location. Disables auto-start (user manages daemon). |
 | `RUST_LOG` | Control daemon log verbosity (e.g., `info`, `debug`). |
 

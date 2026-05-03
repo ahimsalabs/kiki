@@ -352,7 +352,7 @@ fn check_stale_mounts(
     _total_fixed: &mut u32,
 ) -> Result<(), jj_cli::command_error::CommandError> {
     // 1. Check the managed mount root (~/kiki/).
-    let mount_root = crate::daemon_cmd::configured_mount_root();
+    let mount_root = store::paths::default_mount_root();
     if mount_root.exists() || is_stale_mount(&mount_root).is_some() {
         if let Some(err_msg) = is_stale_mount(&mount_root) {
             writeln!(

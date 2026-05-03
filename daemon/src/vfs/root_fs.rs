@@ -75,6 +75,9 @@ struct SyntheticDir {
     children: BTreeMap<String, InodeId>,
 }
 
+// ── Passthrough layer ──────────────────────────────────────────────
+//
+
 /// Per-repo metadata held by `RootFs`.
 #[derive(Debug)]
 struct RepoEntry {
@@ -151,7 +154,7 @@ pub struct WorkspaceRegistration {
 
 #[derive(Debug)]
 struct RootFsInner {
-    /// Mount root path (e.g. `/mnt/kiki`).
+    /// Mount root path (e.g. `~/kiki`).
     #[allow(dead_code)]
     mount_root: PathBuf,
     /// Storage directory for persisted state.
@@ -198,11 +201,14 @@ impl RootFs {
                 children: BTreeMap::new(),
             },
         );
+
+        let next_synthetic = ROOT_INODE + 1;
+
         RootFs {
             inner: Mutex::new(RootFsInner {
                 mount_root,
                 storage_dir,
-                next_synthetic: ROOT_INODE + 1,
+                next_synthetic,
                 synthetic_dirs,
                 repos: HashMap::new(),
                 live: HashMap::new(),
@@ -814,6 +820,10 @@ impl RootFs {
         Ok(fs)
     }
 
+    // ── Passthrough helpers ──────────────────────────────────────
+
+    // ── Synthetic helpers ──────────────────────────────────────────
+
     /// Synthetic lookup: resolve a name within a synthetic dir (slot 0).
     fn synthetic_lookup(&self, parent: InodeId, name: &str) -> Result<InodeId, FsError> {
         let inner = self.inner.lock();
@@ -933,7 +943,6 @@ impl JjKikiFs for RootFs {
     ) -> Result<(Vec<u8>, bool), FsError> {
         let slot = slot_of(ino);
         if slot == 0 {
-            // Can't read a synthetic directory.
             Err(FsError::NotAFile)
         } else {
             let fs = self.get_or_hydrate_by_slot(slot).await?;
@@ -1330,7 +1339,7 @@ mod tests {
             ws_reg("default", 3, WorkspaceState::Active, vec![0; 20], b"default".to_vec()),
         ).unwrap();
 
-        // Root has two repos.
+        // Root has two repos (plus .kiki).
         let root_entries = fs.synthetic_readdir(ROOT_INODE).unwrap();
         assert_eq!(root_entries.len(), 2);
         let names: Vec<&str> = root_entries.iter().map(|e| e.name.as_str()).collect();
