@@ -646,7 +646,7 @@ impl JujutsuService {
     ///
     /// Used by existing RPCs once they route through RootFs (next commit)
     /// and by tests now.
-    #[allow(dead_code, clippy::result_large_err)]
+    #[allow(clippy::result_large_err)]
     fn resolve_workspace(&self, working_copy_path: &str) -> Result<(String, String), Status> {
         let mount_root = self.mount_root.as_ref().ok_or_else(|| {
             Status::failed_precondition("managed workspaces not configured")
@@ -686,6 +686,63 @@ impl JujutsuService {
             Status::failed_precondition("managed workspaces not configured")
         })?;
         Ok(mount_root.join(repo).join(ws).to_string_lossy().into_owned())
+    }
+
+    // ── Unified dispatch helpers ────────────────────────────────────
+    //
+    // Try RootFs (managed workspace) first; fall back to the ad-hoc
+    // `mounts` HashMap if the path isn't under mount_root or if
+    // root_fs doesn't know about it.
+
+    /// Resolve store + remote for a `working_copy_path`, trying the
+    /// managed workspace model first.
+    async fn resolve_handles(
+        &self,
+        path: &str,
+    ) -> Result<(Arc<GitContentStore>, Option<Arc<dyn RemoteStore>>), Status> {
+        if let Some(ref root_fs) = self.root_fs
+            && let Ok((repo, ws)) = self.resolve_workspace(path)
+            && let Ok(handle) = root_fs.get_workspace(&repo, &ws).await
+        {
+            return Ok((handle.store, handle.remote_store));
+        }
+        mount_handles(&self.mounts, path).await
+    }
+
+    /// Resolve store only (convenience wrapper).
+    async fn resolve_store(
+        &self,
+        path: &str,
+    ) -> Result<Arc<GitContentStore>, Status> {
+        let (store, _) = self.resolve_handles(path).await?;
+        Ok(store)
+    }
+
+    /// Resolve catalog handle (remote-backed or local-backed).
+    async fn resolve_catalog(
+        &self,
+        path: &str,
+    ) -> Result<CatalogHandle, Status> {
+        if let Some(ref root_fs) = self.root_fs
+            && let Ok((repo, ws)) = self.resolve_workspace(path)
+            && let Ok(handle) = root_fs.get_workspace(&repo, &ws).await
+        {
+            return Ok(match handle.remote_store {
+                Some(r) => CatalogHandle::Remote(r),
+                None => CatalogHandle::Local(handle.local_refs),
+            });
+        }
+        catalog_for(&self.mounts, path).await
+    }
+
+    /// Check if a `working_copy_path` is a managed workspace path.
+    /// Returns `Some((repo, ws))` if it resolves, `None` if not.
+    fn is_managed(&self, path: &str) -> Option<(String, String)> {
+        if self.root_fs.is_some() {
+            self.resolve_workspace(path).ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -861,7 +918,7 @@ fn transport_to_proto(info: TransportInfo) -> initialize_reply::Transport {
 
 /// Minimal [`UserSettings`] for the daemon. Content writes through
 /// `GitBackend` require a plausible user/operation identity.
-fn default_user_settings() -> jj_lib::settings::UserSettings {
+pub(crate) fn default_user_settings() -> jj_lib::settings::UserSettings {
     let toml_str = r#"
         user.name = "kiki daemon"
         user.email = "daemon@localhost"
@@ -905,18 +962,7 @@ fn open_store_for(
     }
 }
 
-/// Look up a mount by `working_copy_path` and clone its store handle so
-/// the lock can be released before doing real work. All store RPCs use
-/// this — the lock is short, the RPC body is long.
-async fn store_for(
-    mounts: &Arc<Mutex<HashMap<String, Mount>>>,
-    path: &str,
-) -> Result<Arc<GitContentStore>, Status> {
-    let (store, _remote) = mount_handles(mounts, path).await?;
-    Ok(store)
-}
-
-/// Variant of [`store_for`] that also clones the per-mount
+/// Variant of [`JujutsuService::resolve_handles`] that also clones the per-mount
 /// `RemoteStore` (M9). Returned as `(local, remote)` so handlers can
 /// destructure cleanly. `remote` is `None` when no remote is
 /// configured for the mount; handlers fall back to the existing
@@ -1304,16 +1350,33 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         &self,
         _request: Request<DaemonStatusReq>,
     ) -> Result<Response<DaemonStatusReply>, Status> {
-        let mounts = self.mounts.lock().await;
-        // Sort by path so output is deterministic — `kk status` is
-        // user-facing and `HashMap` iteration order is not.
-        let mut data: Vec<_> = mounts
-            .values()
-            .map(|m| proto::jj_interface::daemon_status_reply::Data {
-                path: m.working_copy_path.clone(),
-                remote: m.remote.clone(),
-            })
-            .collect();
+        let mut data = Vec::new();
+
+        // Include managed workspaces from RootFs.
+        if let Some(ref root_fs) = self.root_fs {
+            for (repo, url, workspaces) in root_fs.list_repos() {
+                for ws in workspaces {
+                    let path = self.workspace_path(&repo, &ws).unwrap_or_default();
+                    data.push(proto::jj_interface::daemon_status_reply::Data {
+                        path,
+                        remote: url.clone(),
+                    });
+                }
+            }
+        }
+
+        // Include ad-hoc mounts.
+        {
+            let mounts = self.mounts.lock().await;
+            for m in mounts.values() {
+                data.push(proto::jj_interface::daemon_status_reply::Data {
+                    path: m.working_copy_path.clone(),
+                    remote: m.remote.clone(),
+                });
+            }
+        }
+
+        // Sort by path so output is deterministic.
         data.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Response::new(DaemonStatusReply { data }))
     }
@@ -1334,7 +1397,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let req = request.into_inner();
         remote::validate_ref_name(&req.name)
             .map_err(|e| Status::invalid_argument(format!("ref name: {e:#}")))?;
-        let catalog = catalog_for(&self.mounts, &req.working_copy_path).await?;
+        let catalog = self.resolve_catalog(&req.working_copy_path).await?;
         let value = catalog
             .get_ref(&req.name)
             .await
@@ -1359,7 +1422,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let req = request.into_inner();
         remote::validate_ref_name(&req.name)
             .map_err(|e| Status::invalid_argument(format!("ref name: {e:#}")))?;
-        let catalog = catalog_for(&self.mounts, &req.working_copy_path).await?;
+        let catalog = self.resolve_catalog(&req.working_copy_path).await?;
         // proto3 `optional bytes` decodes to `Option<Vec<u8>>`; lift
         // to `Option<Bytes>` so the trait sees the same
         // absent-vs-empty distinction as the wire.
@@ -1387,7 +1450,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ListCatalogRefsReq>,
     ) -> Result<Response<ListCatalogRefsReply>, Status> {
         let req = request.into_inner();
-        let catalog = catalog_for(&self.mounts, &req.working_copy_path).await?;
+        let catalog = self.resolve_catalog(&req.working_copy_path).await?;
         let names = catalog
             .list_refs()
             .await
@@ -1401,7 +1464,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GetEmptyTreeIdReq>,
     ) -> Result<Response<TreeId>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let store = self.resolve_store(&req.working_copy_path).await?;
         Ok(Response::new(TreeId {
             tree_id: store.empty_tree_id().as_bytes().to_vec(),
         }))
@@ -1413,7 +1476,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteFileReq>,
     ) -> Result<Response<FileId>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let id = store
             .write_file(&req.data)
             .map_err(store_status("write_file"))?;
@@ -1441,7 +1504,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadFileReq>,
     ) -> Result<Response<File>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let id: ty::Id = FileId { file_id: req.file_id }
             .try_into()
             .map_err(decode_status("file id"))?;
@@ -1458,7 +1521,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteSymlinkReq>,
     ) -> Result<Response<SymlinkId>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let id = store
             .write_symlink(&req.target)
             .map_err(store_status("write_symlink"))?;
@@ -1481,7 +1544,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadSymlinkReq>,
     ) -> Result<Response<Symlink>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let id: ty::Id = SymlinkId { symlink_id: req.symlink_id }
             .try_into()
             .map_err(decode_status("symlink id"))?;
@@ -1501,7 +1564,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteTreeReq>,
     ) -> Result<Response<TreeId>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let tree_proto = req
             .tree
             .ok_or_else(|| Status::invalid_argument("WriteTreeReq.tree is required"))?;
@@ -1528,7 +1591,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadTreeReq>,
     ) -> Result<Response<Tree>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let id: ty::Id = TreeId { tree_id: req.tree_id }
             .try_into()
             .map_err(decode_status("tree id"))?;
@@ -1545,7 +1608,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteCommitReq>,
     ) -> Result<Response<CommitId>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let commit_proto = req
             .commit
             .ok_or_else(|| Status::invalid_argument("WriteCommitReq.commit is required"))?;
@@ -1585,9 +1648,15 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             tracing::warn!("export_head after WriteCommit: {e:#}");
         } else {
             // Track what we exported so Snapshot can detect external changes.
-            let mut mounts = self.mounts.lock().await;
-            if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
-                mount.last_exported_head = id.clone();
+            if let Some((repo, ws)) = self.is_managed(&req.working_copy_path) {
+                if let Some(ref root_fs) = self.root_fs {
+                    root_fs.set_last_exported_head(&repo, &ws, id.clone());
+                }
+            } else {
+                let mut mounts = self.mounts.lock().await;
+                if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
+                    mount.last_exported_head = id.clone();
+                }
             }
         }
 
@@ -1600,7 +1669,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadCommitReq>,
     ) -> Result<Response<Commit>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let id: ty::Id = CommitId { commit_id: req.commit_id }
             .try_into()
             .map_err(decode_status("commit id"))?;
@@ -1627,7 +1696,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteViewReq>,
     ) -> Result<Response<WriteViewReply>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         validate_op_store_blob_id(OpStoreBlobKind::View, &req.view_id, &req.data)
             .await
             .map_err(decode_status("view blob"))?;
@@ -1665,7 +1734,11 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
         // Track what we exported so git_detect_head_change can detect
         // external ref changes (e.g. `git fetch` from the mount).
-        {
+        if let Some((repo, ws)) = self.is_managed(&req.working_copy_path) {
+            if let Some(ref root_fs) = self.root_fs {
+                root_fs.set_last_exported_bookmarks(&repo, &ws, bookmarks);
+            }
+        } else {
             let mut mounts = self.mounts.lock().await;
             if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
                 mount.last_exported_bookmarks = Some(bookmarks);
@@ -1681,7 +1754,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadViewReq>,
     ) -> Result<Response<ReadViewReply>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         if req.view_id.len() != 64 {
             return Err(Status::invalid_argument(format!(
                 "view_id must be 64 bytes, got {}",
@@ -1729,7 +1802,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<WriteOperationReq>,
     ) -> Result<Response<WriteOperationReply>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         validate_op_store_blob_id(OpStoreBlobKind::Operation, &req.operation_id, &req.data)
             .await
             .map_err(decode_status("operation blob"))?;
@@ -1755,7 +1828,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ReadOperationReq>,
     ) -> Result<Response<ReadOperationReply>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         if req.operation_id.len() != 64 {
             return Err(Status::invalid_argument(format!(
                 "operation_id must be 64 bytes, got {}",
@@ -1806,7 +1879,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<ResolveOperationIdPrefixReq>,
     ) -> Result<Response<ResolveOperationIdPrefixReply>, Status> {
         let req = request.into_inner();
-        let (store, _remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, _remote) = self.resolve_handles(&req.working_copy_path).await?;
         let result = store
             .operation_ids_matching_prefix(&req.hex_prefix)
             .map_err(store_status("operation_ids_matching_prefix"))?;
@@ -1832,6 +1905,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GetTreeStateReq>,
     ) -> Result<Response<GetTreeStateReply>, Status> {
         let req = request.into_inner();
+        // Try managed workspace first.
+        if let Some((repo, ws)) = self.is_managed(&req.working_copy_path) {
+            let root_fs = self.require_root_fs()?;
+            let tree_id = root_fs.get_root_tree_id(&repo, &ws).map_err(|_| {
+                Status::not_found(format!("workspace {repo}/{ws} not found"))
+            })?;
+            return Ok(Response::new(GetTreeStateReply { tree_id }));
+        }
         let mounts = self.mounts.lock().await;
         let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
             Status::not_found(format!("no mount at {}", req.working_copy_path))
@@ -1847,14 +1928,24 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GetCheckoutStateReq>,
     ) -> Result<Response<CheckoutState>, Status> {
         let req = request.into_inner();
+        // Try managed workspace first.
+        if let Some((repo, ws)) = self.is_managed(&req.working_copy_path) {
+            let root_fs = self.require_root_fs()?;
+            let (op_id, workspace_id) = root_fs.get_checkout_state(&repo, &ws).map_err(|_| {
+                Status::not_found(format!("workspace {repo}/{ws} not found"))
+            })?;
+            if op_id.is_empty() && workspace_id.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "checkout state not yet set for {}",
+                    req.working_copy_path
+                )));
+            }
+            return Ok(Response::new(CheckoutState { op_id, workspace_id }));
+        }
         let mounts = self.mounts.lock().await;
         let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
             Status::not_found(format!("no mount at {}", req.working_copy_path))
         })?;
-        // `op_id`/`workspace_id` start empty after `Initialize`. Surfacing
-        // that as `failed_precondition` keeps the contract crisp: the CLI
-        // must call `SetCheckoutState` first (which it does inside
-        // `KikiWorkingCopy::init`).
         if mount.op_id.is_empty() && mount.workspace_id.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "checkout state not yet set for {}",
@@ -1877,11 +1968,18 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         let checkout = req.checkout_state.ok_or_else(|| {
             Status::invalid_argument("SetCheckoutStateReq.checkout_state is required")
         })?;
+        // Try managed workspace first.
+        if let Some((repo, ws)) = self.is_managed(&req.working_copy_path) {
+            let root_fs = self.require_root_fs()?;
+            root_fs
+                .set_checkout_state(&repo, &ws, checkout.op_id, checkout.workspace_id)
+                .map_err(|_| {
+                    Status::not_found(format!("workspace {repo}/{ws} not found"))
+                })?;
+            return Ok(Response::new(SetCheckoutStateReply {}));
+        }
         let mut mounts = self.mounts.lock().await;
         let mount = mounts.get_mut(&req.working_copy_path).ok_or_else(|| {
-            // Unlike `get_*` which only read, this RPC mutates state. We
-            // refuse to lazily create a Mount because that would mask CLI
-            // bugs (forgotten `Initialize`).
             Status::not_found(format!(
                 "no mount at {} (call Initialize first)",
                 req.working_copy_path
@@ -1907,11 +2005,18 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<SnapshotReq>,
     ) -> Result<Response<SnapshotReply>, Status> {
         let req = request.into_inner();
+        let managed = self.is_managed(&req.working_copy_path);
 
-        // Clone fs / store / remote handles out from under the lock so
-        // the (potentially I/O-heavy) snapshot walk + post-walk remote
-        // push don't hold it. Same pattern as `check_out`.
-        let (fs, store, remote, last_exported_head) = {
+        // Clone fs / store / remote handles. For managed workspaces,
+        // resolve through RootFs; for ad-hoc mounts, from the HashMap.
+        let (fs, store, remote, last_exported_head) = if let Some((ref repo, ref ws)) = managed {
+            let root_fs = self.require_root_fs()?;
+            let handle = root_fs.get_workspace(repo, ws).await.map_err(|_| {
+                Status::not_found(format!("workspace {repo}/{ws} not found"))
+            })?;
+            let leh = root_fs.get_last_exported_head(repo, ws);
+            (handle.fs as Arc<dyn JjKikiFs>, handle.store, handle.remote_store, leh)
+        } else {
             let mounts = self.mounts.lock().await;
             let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
                 Status::not_found(format!("no mount at {}", req.working_copy_path))
@@ -1935,41 +2040,44 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // M9 §13.2: blobs written through `JjKikiFs::snapshot_node`
         // bypass the RPC handlers, so we walk the rolled-up tree and
         // push every reachable blob the remote doesn't already have.
-        // Synchronous push: `Snapshot` blocks until durable. The walk
-        // is cheap on a clean (no-change) snapshot — `has_blob` returns
-        // true for every reachable blob and we put_blob nothing.
         if let Some(remote) = &remote {
             push_reachable_blobs(&store, remote.as_ref(), new_root)
                 .await
                 .map_err(remote_status("post-snapshot remote push"))?;
         }
 
-        // Stamp the new root tree id back on the Mount so subsequent
-        // `GetTreeState`/`Snapshot` reads agree with what the VFS just
-        // produced. Done *after* the snapshot + remote push succeeds —
-        // we'd rather report failure than declare a snapshot durable
-        // that didn't fully push to the remote.
-        let mut mounts = self.mounts.lock().await;
-        if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
-            let new_root_tree_id = new_root.0.to_vec();
-            let new_metadata = MountMetadata {
-                working_copy_path: mount.working_copy_path.clone(),
-                remote: mount.remote.clone(),
-                op_id: mount.op_id.clone(),
-                workspace_id: mount.workspace_id.clone(),
-                root_tree_id: new_root_tree_id.clone(),
-            };
-            persist_metadata_snapshot(&mount.meta_path, &new_metadata)
-                .map_err(metadata_status("persist snapshot metadata"))?;
-            mount.root_tree_id = new_root_tree_id;
+        // Stamp the new root tree id. For managed workspaces, persist
+        // via RootFs (which writes workspace.toml). For ad-hoc mounts,
+        // persist via mount.toml.
+        if let Some((ref repo, ref ws)) = managed {
+            let root_fs = self.require_root_fs()?;
+            root_fs
+                .set_root_tree_id(repo, ws, new_root.0.to_vec())
+                .map_err(|_| {
+                    Status::not_found(format!(
+                        "workspace {repo}/{ws} disappeared during snapshot"
+                    ))
+                })?;
         } else {
-            // Mount disappeared between the two locks; surface as
-            // not_found rather than internal-error so a transient race
-            // (no explicit Unmount today, but future-proof) is debuggable.
-            return Err(Status::not_found(format!(
-                "mount at {} disappeared during snapshot",
-                req.working_copy_path
-            )));
+            let mut mounts = self.mounts.lock().await;
+            if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
+                let new_root_tree_id = new_root.0.to_vec();
+                let new_metadata = MountMetadata {
+                    working_copy_path: mount.working_copy_path.clone(),
+                    remote: mount.remote.clone(),
+                    op_id: mount.op_id.clone(),
+                    workspace_id: mount.workspace_id.clone(),
+                    root_tree_id: new_root_tree_id.clone(),
+                };
+                persist_metadata_snapshot(&mount.meta_path, &new_metadata)
+                    .map_err(metadata_status("persist snapshot metadata"))?;
+                mount.root_tree_id = new_root_tree_id;
+            } else {
+                return Err(Status::not_found(format!(
+                    "mount at {} disappeared during snapshot",
+                    req.working_copy_path
+                )));
+            }
         }
 
         // Detect external git HEAD changes (e.g. `git commit` from the
@@ -2010,11 +2118,16 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         .try_into()
         .map_err(decode_status("tree id"))?;
         info!(path = %req.working_copy_path, tree_id = %hex_bytes(&new_tree_id.0), "CheckOut");
+        let managed = self.is_managed(&req.working_copy_path);
 
-        // Clone the per-mount fs + store handles out from under the lock
-        // so the (potentially I/O-heavy) `JjKikiFs::check_out` call
-        // doesn't hold it. Mirrors how `store_for` works.
-        let (fs, store) = {
+        // Clone fs + store handles. Same dual-path as Snapshot.
+        let (fs, store) = if let Some((ref repo, ref ws)) = managed {
+            let root_fs = self.require_root_fs()?;
+            let handle = root_fs.get_workspace(repo, ws).await.map_err(|_| {
+                Status::not_found(format!("workspace {repo}/{ws} not found"))
+            })?;
+            (handle.fs as Arc<dyn JjKikiFs>, handle.store)
+        } else {
             let mounts = self.mounts.lock().await;
             let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
                 Status::not_found(format!("no mount at {}", req.working_copy_path))
@@ -2022,9 +2135,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             (mount.fs.clone(), mount.store.clone())
         };
 
-        // The VFS swap validates the tree exists in the store; map the
-        // miss onto failed_precondition so the caller gets a crisp
-        // "write the tree first" signal rather than internal-error noise.
+        // The VFS swap validates the tree exists in the store.
         fs.check_out(new_tree_id).await.map_err(|e| match e {
             FsError::StoreMiss => Status::failed_precondition(format!(
                 "tree {} not in store; call WriteTree first",
@@ -2033,36 +2144,39 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             other => Status::internal(format!("check_out failed: {other}")),
         })?;
 
-        // Stamp the new root tree id on the Mount under the lock. We do
-        // this *after* the swap succeeds: if the swap fails the mount's
-        // declared `root_tree_id` should still match what the kernel
-        // sees through `fs`.
-        let mut mounts = self.mounts.lock().await;
-        if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
-            let new_root_tree_id = req.new_tree_id;
-            let new_metadata = MountMetadata {
-                working_copy_path: mount.working_copy_path.clone(),
-                remote: mount.remote.clone(),
-                op_id: mount.op_id.clone(),
-                workspace_id: mount.workspace_id.clone(),
-                root_tree_id: new_root_tree_id.clone(),
-            };
-            persist_metadata_snapshot(&mount.meta_path, &new_metadata)
-                .map_err(metadata_status("persist checkout metadata"))?;
-            mount.root_tree_id = new_root_tree_id;
+        // Stamp the new root tree id. Dual-path persistence.
+        if let Some((ref repo, ref ws)) = managed {
+            let root_fs = self.require_root_fs()?;
+            root_fs
+                .set_root_tree_id(repo, ws, req.new_tree_id)
+                .map_err(|_| {
+                    Status::not_found(format!(
+                        "workspace {repo}/{ws} disappeared during check_out"
+                    ))
+                })?;
         } else {
-            // Mount disappeared between the two locks. Extremely
-            // unlikely (no Unmount RPC exists yet) but we should not
-            // pretend success.
-            return Err(Status::not_found(format!(
-                "mount at {} disappeared during check_out",
-                req.working_copy_path
-            )));
+            let mut mounts = self.mounts.lock().await;
+            if let Some(mount) = mounts.get_mut(&req.working_copy_path) {
+                let new_root_tree_id = req.new_tree_id;
+                let new_metadata = MountMetadata {
+                    working_copy_path: mount.working_copy_path.clone(),
+                    remote: mount.remote.clone(),
+                    op_id: mount.op_id.clone(),
+                    workspace_id: mount.workspace_id.clone(),
+                    root_tree_id: new_root_tree_id.clone(),
+                };
+                persist_metadata_snapshot(&mount.meta_path, &new_metadata)
+                    .map_err(metadata_status("persist checkout metadata"))?;
+                mount.root_tree_id = new_root_tree_id;
+            } else {
+                return Err(Status::not_found(format!(
+                    "mount at {} disappeared during check_out",
+                    req.working_copy_path
+                )));
+            }
         }
 
-        // Best-effort: rebuild the git index to match the checked-out
-        // tree so `git status`/`git diff` from the mount show the same
-        // changes as `jj diff`.
+        // Best-effort: rebuild the git index to match the checked-out tree.
         let git_path = store.git_repo_path().to_path_buf();
         if let Err(e) = crate::git_ops::reset_index(&git_path, &new_tree_id.0) {
             warn!("reset_index after CheckOut: {e:#}");
@@ -2079,7 +2193,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitRemoteAddReq>,
     ) -> Result<Response<GitRemoteAddReply>, Status> {
         let req = request.into_inner();
-        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = self.resolve_handles(&req.working_copy_path).await?;
         let git_path = store.git_repo_path().to_path_buf();
         let git_path_for_metadata = git_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -2123,7 +2237,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitRemoteListReq>,
     ) -> Result<Response<GitRemoteListReply>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let store = self.resolve_store(&req.working_copy_path).await?;
         let git_path = store.git_repo_path().to_path_buf();
         let remotes = tokio::task::spawn_blocking(move || {
             crate::git_ops::remote_list(&git_path)
@@ -2145,7 +2259,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitPushReq>,
     ) -> Result<Response<GitPushReply>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let store = self.resolve_store(&req.working_copy_path).await?;
         let git_path = store.git_repo_path().to_path_buf();
         let bookmarks: Vec<(String, Vec<u8>)> = req
             .bookmarks
@@ -2168,7 +2282,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitFetchReq>,
     ) -> Result<Response<GitFetchReply>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let store = self.resolve_store(&req.working_copy_path).await?;
         let git_path = store.git_repo_path().to_path_buf();
         let remote = req.remote;
         let bookmarks = tokio::task::spawn_blocking(move || {
@@ -2191,17 +2305,28 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitDetectHeadChangeReq>,
     ) -> Result<Response<GitDetectHeadChangeReply>, Status> {
         let req = request.into_inner();
-        let (store, last_exported_head, last_exported_bookmarks) = {
-            let mounts = self.mounts.lock().await;
-            let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
-                Status::not_found(format!("no mount at {}", req.working_copy_path))
-            })?;
-            (
-                mount.store.clone(),
-                mount.last_exported_head.clone(),
-                mount.last_exported_bookmarks.clone(),
-            )
-        };
+        let (store, last_exported_head, last_exported_bookmarks) =
+            if let Some((ref repo, ref ws)) = self.is_managed(&req.working_copy_path) {
+                let root_fs = self.require_root_fs()?;
+                let handle = root_fs.get_workspace(repo, ws).await.map_err(|_| {
+                    Status::not_found(format!("workspace {repo}/{ws} not found"))
+                })?;
+                (
+                    handle.store,
+                    root_fs.get_last_exported_head(repo, ws),
+                    root_fs.get_last_exported_bookmarks(repo, ws),
+                )
+            } else {
+                let mounts = self.mounts.lock().await;
+                let mount = mounts.get(&req.working_copy_path).ok_or_else(|| {
+                    Status::not_found(format!("no mount at {}", req.working_copy_path))
+                })?;
+                (
+                    mount.store.clone(),
+                    mount.last_exported_head.clone(),
+                    mount.last_exported_bookmarks.clone(),
+                )
+            };
 
         let git_path = store.git_repo_path().to_path_buf();
 
@@ -2433,7 +2558,13 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
 
         let workspace_path = self.workspace_path(&name, "default")?;
         info!(repo = %name, url = %req.url, path = %workspace_path, "cloned repo");
-        Ok(Response::new(CloneReply { workspace_path }))
+        Ok(Response::new(CloneReply {
+            workspace_path,
+            // Native kiki clone doesn't yet resolve a HEAD tree; the user
+            // manually checks out a commit after clone. Future: read
+            // remote's HEAD ref to provide initial content.
+            initial_tree_id: Vec::new(),
+        }))
     }
 
     // ── M13 — first-class git clone ──────────────────────────────────
@@ -2602,6 +2733,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         })?;
 
         // Register default workspace with RootFs.
+        let empty_tree_clone = empty_tree.clone();
         root_fs
             .register_workspace(
                 &name,
@@ -2632,6 +2764,31 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             .map_err(metadata_status("persisting repos.toml"))?;
 
         let workspace_path = self.workspace_path(&name, "default")?;
+
+        // Resolve the default branch's root tree so the CLI can issue an
+        // initial CheckOut after workspace init. Without this, the workspace
+        // starts with an empty tree until the user manually checks out a commit.
+        let initial_tree_id = if let Some(ref branch) = default_branch {
+            bookmarks
+                .iter()
+                .find(|(bm_name, _)| bm_name == branch)
+                .and_then(|(_, commit_id)| {
+                    store.read_commit(commit_id).ok().flatten().and_then(|commit| {
+                        commit.root_tree.as_resolved().map(|tid| tid.to_bytes())
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // If we resolved an initial tree, register it with the workspace
+        // and KikiFs so the FUSE mount shows content immediately (before
+        // the CLI's CheckOut call persists it to workspace.toml).
+        if !initial_tree_id.is_empty() && initial_tree_id != empty_tree_clone {
+            let _ = root_fs.set_root_tree_id(&name, "default", initial_tree_id.clone());
+        }
+
         let reply_bookmarks = bookmarks
             .into_iter()
             .map(|(bm_name, commit_id)| GitFetchedBookmark {
@@ -2650,6 +2807,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             workspace_path,
             bookmarks: reply_bookmarks,
             default_branch: default_branch.unwrap_or_default(),
+            initial_tree_id,
         }))
     }
 

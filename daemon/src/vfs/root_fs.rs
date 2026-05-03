@@ -116,6 +116,14 @@ struct WorkspaceLive {
     workspace_name: String,
     fs: Arc<KikiFs>,
     local_refs: Arc<LocalRefs>,
+    /// Last HEAD commit id exported via `export_head`. Used to detect
+    /// external git HEAD changes (e.g. `git commit` from the mount).
+    /// Runtime-only; not persisted.
+    last_exported_head: Vec<u8>,
+    /// Last bookmarks exported via `export_bookmarks` in WriteView.
+    /// `None` until first WriteView; `Some(vec![])` means "exported
+    /// an empty set."
+    last_exported_bookmarks: Option<Vec<(String, Vec<u8>)>>,
 }
 
 // ── Public API types ────────────────────────────────────────────────
@@ -274,12 +282,14 @@ impl RootFs {
             );
             repo_inode
         };
-        // Only active workspaces appear in the repo dir's children.
-        if reg.state == WorkspaceState::Active {
-            let global_root = to_global(reg.slot, ROOT_INODE);
-            if let Some(repo_dir) = inner.synthetic_dirs.get_mut(&repo_inode) {
-                repo_dir.children.insert(reg.name, global_root);
-            }
+        // Add the workspace to the repo dir's lookup table regardless of
+        // state. This makes the workspace accessible via FUSE lookup (needed
+        // by the CLI to write .jj/ during init before finalize). Pending
+        // workspaces are filtered out of readdir (§12.10 step 5) so users
+        // don't see half-initialized workspaces in `ls`.
+        let global_root = to_global(reg.slot, ROOT_INODE);
+        if let Some(repo_dir) = inner.synthetic_dirs.get_mut(&repo_inode) {
+            repo_dir.children.insert(reg.name, global_root);
         }
         // Ensure next_slot stays ahead.
         if reg.slot >= inner.next_slot {
@@ -370,9 +380,6 @@ impl RootFs {
                 .workspaces
                 .get(ws)
                 .ok_or(FsError::NotFound)?;
-            if ws_entry.state == WorkspaceState::Pending {
-                return Err(FsError::NotFound);
-            }
             if let Some(live) = inner.live.get(&ws_entry.slot) {
                 return Ok(WorkspaceHandle {
                     fs: Arc::clone(&live.fs),
@@ -416,6 +423,8 @@ impl RootFs {
                 workspace_name: hydration_info.ws_name,
                 fs: Arc::clone(&fs),
                 local_refs: Arc::clone(&local_refs),
+                last_exported_head: Vec::new(),
+                last_exported_bookmarks: None,
             },
         );
         Ok(WorkspaceHandle {
@@ -500,6 +509,101 @@ impl RootFs {
             warn!(error = %format!("{e:#}"), "failed to persist workspace.toml");
         }
         Ok(())
+    }
+
+    // ── Workspace state getters (service dispatch) ──────────────
+
+    /// Get the root_tree_id for a workspace. Returns `Err` if repo
+    /// or workspace not found.
+    pub fn get_root_tree_id(
+        &self,
+        repo: &str,
+        ws: &str,
+    ) -> Result<Vec<u8>, FsError> {
+        let inner = self.inner.lock();
+        let repo_entry = inner.repos.get(repo).ok_or(FsError::NotFound)?;
+        let ws_entry = repo_entry
+            .workspaces
+            .get(ws)
+            .ok_or(FsError::NotFound)?;
+        Ok(ws_entry.root_tree_id.clone())
+    }
+
+    /// Get the checkout state (op_id, workspace_id) for a workspace.
+    pub fn get_checkout_state(
+        &self,
+        repo: &str,
+        ws: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>), FsError> {
+        let inner = self.inner.lock();
+        let repo_entry = inner.repos.get(repo).ok_or(FsError::NotFound)?;
+        let ws_entry = repo_entry
+            .workspaces
+            .get(ws)
+            .ok_or(FsError::NotFound)?;
+        Ok((ws_entry.op_id.clone(), ws_entry.workspace_id.clone()))
+    }
+
+    /// Get the last exported HEAD commit id (runtime-only, not persisted).
+    /// Returns empty vec if workspace is not hydrated or no HEAD exported.
+    pub fn get_last_exported_head(
+        &self,
+        repo: &str,
+        ws: &str,
+    ) -> Vec<u8> {
+        let inner = self.inner.lock();
+        let Some(repo_entry) = inner.repos.get(repo) else { return Vec::new() };
+        let Some(ws_entry) = repo_entry.workspaces.get(ws) else { return Vec::new() };
+        inner.live.get(&ws_entry.slot)
+            .map(|l| l.last_exported_head.clone())
+            .unwrap_or_default()
+    }
+
+    /// Set the last exported HEAD commit id on a hydrated workspace.
+    pub fn set_last_exported_head(
+        &self,
+        repo: &str,
+        ws: &str,
+        head: Vec<u8>,
+    ) {
+        let mut inner = self.inner.lock();
+        let slot = match inner.repos.get(repo).and_then(|r| r.workspaces.get(ws)) {
+            Some(ws_entry) => ws_entry.slot,
+            None => return,
+        };
+        if let Some(live) = inner.live.get_mut(&slot) {
+            live.last_exported_head = head;
+        }
+    }
+
+    /// Get the last exported bookmarks (runtime-only).
+    pub fn get_last_exported_bookmarks(
+        &self,
+        repo: &str,
+        ws: &str,
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        let inner = self.inner.lock();
+        let repo_entry = inner.repos.get(repo)?;
+        let ws_entry = repo_entry.workspaces.get(ws)?;
+        inner.live.get(&ws_entry.slot)
+            .and_then(|l| l.last_exported_bookmarks.clone())
+    }
+
+    /// Set the last exported bookmarks on a hydrated workspace.
+    pub fn set_last_exported_bookmarks(
+        &self,
+        repo: &str,
+        ws: &str,
+        bookmarks: Vec<(String, Vec<u8>)>,
+    ) {
+        let mut inner = self.inner.lock();
+        let slot = match inner.repos.get(repo).and_then(|r| r.workspaces.get(ws)) {
+            Some(ws_entry) => ws_entry.slot,
+            None => return,
+        };
+        if let Some(live) = inner.live.get_mut(&slot) {
+            live.last_exported_bookmarks = Some(bookmarks);
+        }
     }
 
     // ── Query helpers ───────────────────────────────────────────
@@ -654,6 +758,8 @@ impl RootFs {
                 workspace_name: hydration_info.ws_name,
                 fs: Arc::clone(&fs),
                 local_refs: Arc::new(local_refs),
+                last_exported_head: Vec::new(),
+                last_exported_bookmarks: None,
             },
         );
         Ok(fs)
@@ -685,6 +791,8 @@ impl RootFs {
     }
 
     /// Synthetic readdir: list children of a synthetic directory.
+    /// Pending workspaces are filtered out (visible via lookup but hidden
+    /// from directory listing until finalized).
     fn synthetic_readdir(&self, dir: InodeId) -> Result<Vec<DirEntry>, FsError> {
         let inner = self.inner.lock();
         let synth = inner
@@ -694,6 +802,25 @@ impl RootFs {
         let entries = synth
             .children
             .iter()
+            .filter(|(name, inode)| {
+                // For repo dirs, filter out pending workspaces.
+                // A workspace child has a non-zero slot.
+                let ino = **inode;
+                if slot_of(ino) == 0 {
+                    return true; // Not a workspace entry (e.g. root → repo).
+                }
+                let slot = slot_of(ino);
+                // Check if there's a pending workspace in this slot.
+                for repo in inner.repos.values() {
+                    if let Some(ws) = repo.workspaces.get(name.as_str())
+                        && ws.slot == slot
+                        && ws.state == WorkspaceState::Pending
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|(name, &inode)| DirEntry {
                 inode,
                 name: name.clone(),
@@ -1051,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_workspace_hidden_from_readdir_and_lookup() {
+    fn pending_workspace_hidden_from_readdir_but_accessible_via_lookup() {
         let fs = RootFs::new(
             PathBuf::from("/mnt/kiki"),
             PathBuf::from("/tmp/storage"),
@@ -1067,11 +1194,11 @@ mod tests {
 
         let repo_ino = fs.synthetic_lookup(ROOT_INODE, "repo").unwrap();
         let entries = fs.synthetic_readdir(repo_ino).unwrap();
-        assert!(entries.is_empty(), "pending workspace should be hidden");
+        assert!(entries.is_empty(), "pending workspace should be hidden from readdir");
 
-        // Lookup should also fail.
+        // Lookup should succeed (needed for CLI to write .jj/ during init).
         let result = fs.synthetic_lookup(repo_ino, "wip");
-        assert_eq!(result, Err(FsError::NotFound));
+        assert_eq!(result, Ok(to_global(1, ROOT_INODE)));
     }
 
     #[test]

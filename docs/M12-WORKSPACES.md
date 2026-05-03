@@ -1,6 +1,11 @@
 # M12: Managed Workspaces (RootFs)
 
-Active spec for M12. Implements the managed-workspace model from
+**Status: ✅ done.** All phases implemented, 14 e2e tests passing
+with real FUSE, `root_tree_id` persistence across daemon restarts
+verified. Git clone materializes content immediately via
+`initial_tree_id`. Last updated: 2026-05-03.
+
+Spec for M12. Implements the managed-workspace model from
 [`WORKSPACES.md`](./WORKSPACES.md) (Option B: single mount,
 `RootFs` routing). The milestone index in [`PLAN.md`](./PLAN.md)
 links here. Depends on daemon lifecycle (landed), git convergence
@@ -477,6 +482,7 @@ message CloneReq {
 }
 message CloneReply {
     string workspace_path = 1;  // e.g. "/mnt/kiki/monorepo/default"
+    bytes initial_tree_id = 2;  // root tree for initial checkout (may be empty)
 }
 
 message RepoListReq {}
@@ -710,9 +716,13 @@ replacing the current per-`Initialize` binding pattern.
 9. Register repo + workspace with `RootFs` (so `ls /mnt/kiki/`
    shows the new repo, `ls /mnt/kiki/<name>/` shows `default`).
 10. Persist `repos.toml`.
-11. Return `CloneReply { workspace_path }`.
+11. Return `CloneReply { workspace_path, initial_tree_id }`.
 12. CLI calls `Workspace::init_with_factories` at `workspace_path`
     (same as current `kiki kk init` post-Initialize flow).
+13. If `initial_tree_id` is non-empty, CLI issues `CheckOut` RPC
+    with that tree — materializes content in the FUSE mount and
+    persists `root_tree_id` to `workspace.toml`. This ensures the
+    workspace survives daemon restarts with correct content.
 
 #### `WorkspaceCreate` flow
 
@@ -877,9 +887,16 @@ for display and for `working_copy_path` routing in RPCs.
   Assert identical content. Verify only one `git_store/` exists per
   repo.
 
-- **Daemon restart** — clone, create workspace, write files. Stop
-  daemon. Restart. Assert both workspaces are visible in readdir,
-  file contents are correct (re-hydrated from persisted state).
+- **Daemon restart (structure)** — clone, create workspace. Stop
+  daemon. Restart. Assert both workspaces are visible in readdir.
+
+- **Daemon restart (file content)** — clone, write+commit files
+  (triggers Snapshot+CheckOut, persisting root_tree_id). Restart.
+  Assert file content survives (KikiFs rehydrated from workspace.toml).
+
+- **Git clone content persistence** — git clone, verify content is
+  immediately visible (initial_tree_id CheckOut). Restart daemon,
+  verify content survives.
 
 - **Concurrent workspace access** — two tasks reading/writing in
   different workspaces of the same repo simultaneously. Assert no

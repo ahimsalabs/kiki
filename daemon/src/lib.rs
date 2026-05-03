@@ -14,6 +14,8 @@ use tracing::{error, info, warn};
 
 use crate::remote::{fs::FsRemoteStore, server::RemoteStoreService, RemoteStore};
 use crate::service::StorageConfig;
+use crate::vfs::RootFs;
+use crate::vfs::root_fs::{WorkspaceRegistration, WorkspaceState as RootFsWorkspaceState};
 use crate::vfs_mgr::*;
 
 pub mod git_ops;
@@ -107,7 +109,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
     info!(path = %config.socket_path.display(), "UDS listener bound");
     let uds_stream = UnixListenerStream::new(uds_listener);
 
-    // VFS manager.
+    // VFS manager — must be serving before any bind() calls.
     let mut vfs_mgr = VfsManager::new(VfsManagerConfig {
         min_nfs_port: config.nfs_min_port,
         max_nfs_port: config.nfs_max_port,
@@ -116,13 +118,71 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
     if config.disable_mount {
         info!("disable_mount=true: skipping mountpoint validation and VFS attach");
     }
+    // Spawn the VFS manager task so its serve() loop is polling the
+    // channel before we send any bind requests (M12 §12.10 step 5).
+    let vfs_task = tokio::spawn(async move { vfs_mgr.serve().await });
 
     // Storage and service.
     let storage = StorageConfig::on_disk(config.storage_dir.clone());
-    let svc = service::JujutsuService::new(vfs_handle, storage);
+    let mut svc = service::JujutsuService::new(vfs_handle.clone(), storage);
     svc.rehydrate()
         .await
         .context("rehydrating persisted mounts")?;
+
+    // ── M12: managed workspace rehydration ─────────────────────────
+    //
+    // Read repos.toml, reconstruct RootFs with all registered repos
+    // and workspaces, bind the single FUSE mount at mount_root, and
+    // hand the RootFs to the service so M12 RPCs work.
+    let root_fs = rehydrate_root_fs(&config).context("rehydrating managed workspaces")?;
+    let mount_attachment = if !config.disable_mount {
+        if let Some(ref handle) = vfs_handle {
+            // Ensure mount_root exists. If the parent isn't writable (e.g.
+            // /mnt/kiki and /mnt isn't user-owned), skip gracefully — the
+            // daemon still works for ad-hoc mounts and gRPC-only access.
+            let mount_root_ready = if config.mount_root.exists() {
+                true
+            } else {
+                match std::fs::create_dir_all(&config.mount_root) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            mount_root = %config.mount_root.display(),
+                            "cannot create mount root; RootFs FUSE mount skipped"
+                        );
+                        false
+                    }
+                }
+            };
+            if mount_root_ready {
+                let mount_path = config.mount_root.to_string_lossy().to_string();
+                match handle.bind(mount_path, Arc::clone(&root_fs) as Arc<dyn crate::vfs::JjKikiFs>).await {
+                    Ok((_transport, attachment)) => {
+                        info!(mount_root = %config.mount_root.display(), "RootFs FUSE mount bound");
+                        Some(attachment)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %format!("{e:#}"),
+                            mount_root = %config.mount_root.display(),
+                            "failed to bind RootFs FUSE mount; managed workspaces \
+                             accessible via gRPC only"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        info!("disable_mount=true: skipping RootFs FUSE mount");
+        None
+    };
+    svc.set_root_fs(root_fs, config.mount_root.clone(), mount_attachment);
 
     // Reflection + remote store services.
     let reflection_svc = tonic_reflection::server::Builder::configure()
@@ -190,12 +250,13 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
         info!("Received Ctrl+C");
     };
 
-    let vfs_fut = vfs_mgr.serve();
-
     // Main select loop.
     let result = tokio::select! {
-        () = vfs_fut => {
-            info!("VFS manager exited; shutting down");
+        res = vfs_task => {
+            match res {
+                Ok(()) => info!("VFS manager exited; shutting down"),
+                Err(e) => error!(error = %e, "VFS manager task panicked"),
+            }
             Ok(())
         }
         ret = uds_fut => {
@@ -233,4 +294,145 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
     info!("Daemon stopped");
 
     result
+}
+
+/// Reconstruct the [`RootFs`] from persisted `repos.toml` and per-workspace
+/// `workspace.toml` files. Does not bind a FUSE mount — the caller does
+/// that. Safe to call on first run (no `repos.toml` → empty `RootFs`).
+///
+/// Failures for individual repos/workspaces are logged and skipped so that
+/// one corrupt workspace doesn't prevent the daemon from starting.
+fn rehydrate_root_fs(config: &DaemonConfig) -> anyhow::Result<Arc<RootFs>> {
+    use crate::git_store::GitContentStore;
+    use crate::repo_meta;
+
+    let repos_path = repo_meta::repos_config_path(&config.storage_dir);
+    let repos_cfg = repo_meta::ReposConfig::read_or_default(&repos_path)
+        .context("reading repos.toml")?;
+
+    let root_fs = Arc::new(RootFs::new(
+        config.mount_root.clone(),
+        config.storage_dir.clone(),
+        repos_cfg.next_slot,
+    ));
+
+    if repos_cfg.repos.is_empty() {
+        info!("no managed repos in repos.toml (first run or empty)");
+        return Ok(root_fs);
+    }
+
+    let settings = crate::service::default_user_settings();
+
+    for (repo_name, repo_entry) in &repos_cfg.repos {
+        // Open the shared git store + redb for this repo.
+        let git_store_path =
+            repo_meta::repo_git_store_path(&config.storage_dir, repo_name);
+        let redb_path = repo_meta::repo_redb_path(&config.storage_dir, repo_name);
+
+        let store = match GitContentStore::load(&settings, &git_store_path, &redb_path) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(
+                    repo = %repo_name,
+                    error = %format!("{e:#}"),
+                    "skipping repo: failed to open git store"
+                );
+                continue;
+            }
+        };
+
+        // Parse remote store (dir://, s3://, kiki+ssh:// etc.).
+        // SSH remotes are not established at startup — they require an
+        // async tunnel handshake. The Clone/WorkspaceCreate RPCs handle
+        // SSH setup lazily. For now, only synchronous remote stores
+        // (dir://, s3://) are wired up at rehydration.
+        let remote_store = match crate::remote::parse(&repo_entry.url) {
+            Ok(rs) => rs,
+            Err(e) => {
+                warn!(
+                    repo = %repo_name,
+                    url = %repo_entry.url,
+                    error = %format!("{e:#}"),
+                    "skipping remote store setup (repo still accessible locally)"
+                );
+                None
+            }
+        };
+
+        root_fs.register_repo(
+            repo_name.clone(),
+            repo_entry.url.clone(),
+            Arc::clone(&store),
+            remote_store,
+        );
+
+        // Scan workspaces for this repo.
+        let workspaces = match repo_meta::list_workspace_configs(
+            &config.storage_dir,
+            repo_name,
+        ) {
+            Ok(ws) => ws,
+            Err(e) => {
+                warn!(
+                    repo = %repo_name,
+                    error = %format!("{e:#}"),
+                    "failed to list workspaces; repo registered but empty"
+                );
+                continue;
+            }
+        };
+
+        for (ws_name, ws_cfg) in workspaces {
+            // Clean up stale pending workspaces (CLI crashed before
+            // finalize). §12.10: "pending workspaces are either cleaned
+            // up automatically or left for manual cleanup."
+            if ws_cfg.state == repo_meta::WorkspaceState::Pending {
+                info!(
+                    repo = %repo_name,
+                    workspace = %ws_name,
+                    "skipping pending workspace (not finalized)"
+                );
+                continue;
+            }
+
+            let state = match ws_cfg.state {
+                repo_meta::WorkspaceState::Active => RootFsWorkspaceState::Active,
+                repo_meta::WorkspaceState::Pending => RootFsWorkspaceState::Pending,
+            };
+
+            if let Err(e) = root_fs.register_workspace(
+                repo_name,
+                WorkspaceRegistration {
+                    name: ws_name.clone(),
+                    slot: ws_cfg.slot,
+                    state,
+                    root_tree_id: ws_cfg.root_tree_id,
+                    op_id: ws_cfg.op_id,
+                    workspace_id: ws_cfg.workspace_id,
+                },
+            ) {
+                warn!(
+                    repo = %repo_name,
+                    workspace = %ws_name,
+                    error = %e,
+                    "failed to register workspace"
+                );
+            }
+        }
+
+        let ws_count = root_fs
+            .list_repos()
+            .iter()
+            .find(|(n, _, _)| n == repo_name)
+            .map(|(_, _, ws)| ws.len())
+            .unwrap_or(0);
+        info!(
+            repo = %repo_name,
+            url = %repo_entry.url,
+            workspaces = ws_count,
+            "rehydrated repo"
+        );
+    }
+
+    Ok(root_fs)
 }

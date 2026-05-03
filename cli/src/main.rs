@@ -1247,7 +1247,7 @@ async fn run_clone_command(
     let client = daemon_client::connect_or_start(command_helper.settings())
         .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
 
-    let workspace_path = match classify_clone_url(&args.url) {
+    let (workspace_path, initial_tree_id) = match classify_clone_url(&args.url) {
         CloneSource::KikiRemote(url) => {
             if args.remote.is_some() {
                 return Err(user_error(
@@ -1263,7 +1263,7 @@ async fn run_clone_command(
                 })
                 .map_err(|e| user_error_with_message("Clone RPC failed", e))?
                 .into_inner();
-            reply.workspace_path
+            (reply.workspace_path, reply.initial_tree_id)
         }
         CloneSource::Git(git_url) => {
             writeln!(ui.status(), "Cloning from git: {}...", git_url)?;
@@ -1283,7 +1283,7 @@ async fn run_clone_command(
                     reply.default_branch,
                 )?;
             }
-            reply.workspace_path
+            (reply.workspace_path, reply.initial_tree_id)
         }
     };
 
@@ -1293,6 +1293,20 @@ async fn run_clone_command(
     // flow as `kiki kk init` (§12.11): create the .jj/ metadata through
     // the VFS, using daemon-backed store factories.
     init_jj_workspace(command_helper, &wc_path, &workspace_path).await?;
+
+    // If the clone resolved an initial tree (e.g. default branch tip for
+    // git clone), issue a CheckOut to materialize it and persist the
+    // root_tree_id to workspace.toml. Without this, the workspace starts
+    // with an empty tree until the user manually checks out a commit, and
+    // a daemon restart before that would lose any content reference.
+    if !initial_tree_id.is_empty() {
+        client
+            .check_out(proto::jj_interface::CheckOutReq {
+                working_copy_path: workspace_path.clone(),
+                new_tree_id: initial_tree_id,
+            })
+            .map_err(|e| user_error_with_message("initial CheckOut failed", e))?;
+    }
 
     // Create symlink if --link was requested.
     if let Some(link_path) = &args.link {

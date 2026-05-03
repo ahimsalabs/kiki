@@ -618,6 +618,10 @@ message CloneReq {
 message CloneReply {
   // Full path to the default workspace, e.g. "/mnt/kiki/monorepo/default".
   string workspace_path = 1;
+  // Root tree id for the initial checkout. Empty if the remote has no HEAD
+  // or is freshly initialized. The CLI should issue a CheckOut with this
+  // tree after workspace init to materialize content.
+  bytes initial_tree_id = 2;
 }
 
 message RepoListReq {}
@@ -689,6 +693,10 @@ message GitCloneReply {
   repeated GitFetchedBookmark bookmarks = 2;
   // Default branch name (e.g. "main", "master").
   string default_branch = 3;
+  // Root tree id of the default branch's tip commit. Empty if the default
+  // branch couldn't be resolved (e.g. empty repo). The CLI should issue a
+  // CheckOut with this tree after workspace init to materialize content.
+  bytes initial_tree_id = 4;
 }
 
 // ── M13 — kiki remote management ─────────────────────────────────
