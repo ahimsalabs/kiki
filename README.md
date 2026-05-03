@@ -50,8 +50,8 @@ kiki remote show                  # show current kiki remote
 ```
 
 The `kk` subcommand handles other kiki-specific operations
-(`kk status`, `kk daemon`). `kk init` remains available for
-ad-hoc mounts outside the managed namespace.
+(`kk status`, `kk daemon`). `kk init` creates ad-hoc mounts
+outside the managed namespace.
 
 ## Git-native storage
 
@@ -89,11 +89,11 @@ and workspaces. `kiki kk daemon status` shows what's running.
 **Working:** read/write/snapshot, FUSE and NFS mounts, background
 sync, multi-machine sharing via `dir://` / `s3://` / `kiki+ssh://` / `kiki://`,
 git push and fetch to GitHub/GitLab, operation log sharing,
-`.gitignore`-aware VFS, daemon lifecycle.
+`.gitignore`-aware VFS, daemon lifecycle, managed workspaces
+(`kiki clone`, `kiki workspace`, single RootFs mount at `/mnt/kiki/`),
+first-class git clone with immediate content materialization.
 
-**In progress:** [managed workspaces](./docs/M12-WORKSPACES.md)
-(`kiki clone`, `kiki workspace`, single-mount RootFs namespace),
-async offline push queue.
+**In progress:** async offline push queue.
 
 **Designed:** [code review](./docs/REVIEW.md),
 [auth](./docs/AUTH.md),

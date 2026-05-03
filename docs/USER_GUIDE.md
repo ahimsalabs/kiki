@@ -1,12 +1,14 @@
 # kiki User Guide
 
-kiki is an experimental remote backend for [jj](https://jj-vcs.github.io/jj/latest/).
-It serves the working copy as a virtual filesystem (FUSE on Linux, NFS on macOS)
-backed by a daemon that handles storage, caching, and remote synchronization.
+kiki is a virtual filesystem for your repos, built on
+[jj](https://jj-vcs.github.io/jj/latest/). A daemon serves the working copy
+through FUSE (Linux) or NFS (macOS) and handles storage, caching, and remote
+synchronization.
 
-> **Status:** experimental. The core workflow (clone, edit, commit, sync between
-> peers, multiple workspaces) works end-to-end on Linux. macOS support is present
-> but less tested. Not yet suitable for production repositories.
+> **Status:** experimental. The core workflow (clone from git or kiki remote,
+> edit, commit, sync between peers, multiple workspaces, daemon restart
+> persistence) works end-to-end on Linux. macOS support is present but less
+> tested. Not yet suitable for production repositories.
 
 ## Architecture overview
 
@@ -177,7 +179,9 @@ cd /mnt/kiki/myproject/default
 ```
 
 Each clone creates a `default` workspace. The workspace appears immediately
-at `/mnt/kiki/<name>/default/`.
+at `/mnt/kiki/<name>/default/`. For git clones, the default branch's content
+is materialized on clone — `ls` shows your files right away without needing
+to check out a branch manually.
 
 ### 2. Create workspaces
 
@@ -210,10 +214,9 @@ The default checkout target is the parents of the source workspace's
 working-copy commit (matching `jj workspace add` behavior). Use
 `--revision` to override.
 
-### Ad-hoc mounts (legacy)
+### Ad-hoc mounts
 
-The `kiki kk init` command remains available for one-off mounts outside
-the managed namespace:
+For one-off mounts outside the managed namespace:
 
 ```bash
 kiki kk init <remote> [destination]
@@ -221,8 +224,7 @@ kiki kk init <remote> [destination]
 
 This creates a standalone mount at `destination` (default: `.`) without
 registering it in the `/mnt/kiki/` namespace. Useful for testing or
-when you need a mount at a specific path. See [Ad-hoc mounts](#ad-hoc-mounts)
-for details.
+when you need a mount at a specific path.
 
 ### 3. Use standard jj commands
 
@@ -323,10 +325,12 @@ and conditionally update objects under the same bucket prefix.
 
 ```bash
 # Machine A
-kiki kk init "s3://my-bucket/repos/project" project
+kiki clone "s3://my-bucket/repos/project"
+cd /mnt/kiki/project/default
 
 # Machine B
-kiki kk init "s3://my-bucket/repos/project" project
+kiki clone "s3://my-bucket/repos/project"
+cd /mnt/kiki/project/default
 
 # Both machines see each other's commits and operations
 ```
@@ -515,11 +519,12 @@ daemons sharing the same remote serialize ref updates via compare-and-swap.
   deletes to be safe for concurrent writers.
 - **No sparse patterns.** `set_sparse_patterns` is unimplemented. With a
   lazy VFS this is less important than for on-disk working copies.
-- **Daemon restart drops kernel file handles.** The inode slab is in-memory;
+- **Daemon restart loses uncommitted writes.** The inode slab is in-memory;
   applications with open file descriptors across a daemon restart will see
-  ESTALE. Repo and workspace metadata are preserved (`repos.toml`,
-  `workspace.toml`), so the daemon re-creates the namespace and lazily
-  re-hydrates workspaces on restart.
+  ESTALE. Committed content and workspace structure survive restarts — the
+  daemon re-reads `repos.toml` and `workspace.toml`, re-creates the namespace,
+  and lazily re-hydrates each workspace's tree. Only dirty writes (files
+  modified but not yet snapshotted by a jj command) are lost on restart.
 - **Synchronous remote push.** `Snapshot` blocks until all new blobs land on
   the remote. Fine for localhost and `dir://`; will need an async push queue
   for higher-latency network remotes.
