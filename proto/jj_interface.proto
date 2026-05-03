@@ -338,6 +338,10 @@ message CheckOutReq {
   // already be present in the per-mount store (write it with `WriteTree`
   // before issuing `CheckOut`).
   bytes new_tree_id = 2;
+  // Committer timestamp of the commit being checked out, in milliseconds
+  // since the Unix epoch. Used as the mtime/ctime for all files in the
+  // mount. 0 means unknown (falls back to Unix epoch).
+  int64 commit_timestamp_millis = 3;
 }
 
 // Empty for now. Reserved for stats (added/updated/removed counts) once
@@ -630,6 +634,8 @@ message CloneReply {
   // or is freshly initialized. The CLI should issue a CheckOut with this
   // tree after workspace init to materialize content.
   bytes initial_tree_id = 2;
+  // Committer timestamp (millis since epoch) of the initial commit.
+  int64 initial_commit_timestamp_millis = 3;
 }
 
 message RepoListReq {}
@@ -711,6 +717,9 @@ message GitCloneReply {
   // branch couldn't be resolved (e.g. empty repo). The CLI should issue a
   // CheckOut with this tree after workspace init to materialize content.
   bytes initial_tree_id = 4;
+  // Committer timestamp (millis since epoch) of the initial commit, for
+  // setting mtime on the initial CheckOut.
+  int64 initial_commit_timestamp_millis = 5;
 }
 
 // ── M13 — kiki remote management ─────────────────────────────────

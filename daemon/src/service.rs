@@ -542,7 +542,7 @@ impl JujutsuService {
         // way M9's RPC-layer reads already do.
         let scratch_dir = self.storage.scratch_dir_for(&meta.working_copy_path);
         let fs: Arc<dyn JjKikiFs> =
-            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir, None));
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir, None, 0));
 
         // On Linux (FUSE), the kernel tears down the mount when the
         // daemon's process exits — the path is usually a clean empty dir
@@ -1326,7 +1326,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // RPC layer already does at `service.rs`.
         let scratch_dir = self.storage.scratch_dir_for(&req.path);
         let fs: Arc<dyn JjKikiFs> =
-            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir, None));
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir, None, 0));
 
         // Production path validates and binds; test path skips both so
         // unit tests can use arbitrary string paths.
@@ -2202,8 +2202,11 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             (mount.fs.clone(), mount.store.clone())
         };
 
+        // Convert millis → seconds for the VFS mtime.
+        let commit_mtime_secs = req.commit_timestamp_millis / 1000;
+
         // The VFS swap validates the tree exists in the store.
-        fs.check_out(new_tree_id).await.map_err(|e| match e {
+        fs.check_out(new_tree_id, commit_mtime_secs).await.map_err(|e| match e {
             FsError::StoreMiss => Status::failed_precondition(format!(
                 "tree {} not in store; call WriteTree first",
                 hex_bytes(&new_tree_id.0)
@@ -2654,6 +2657,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             // manually checks out a commit after clone. Future: read
             // remote's HEAD ref to provide initial content.
             initial_tree_id: Vec::new(),
+            initial_commit_timestamp_millis: 0,
         }))
     }
 
@@ -2867,18 +2871,24 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // Resolve the default branch's root tree so the CLI can issue an
         // initial CheckOut after workspace init. Without this, the workspace
         // starts with an empty tree until the user manually checks out a commit.
-        let initial_tree_id = if let Some(ref branch) = default_branch {
+        let (initial_tree_id, initial_commit_timestamp_millis) = if let Some(ref branch) =
+            default_branch
+        {
             bookmarks
                 .iter()
                 .find(|(bm_name, _)| bm_name == branch)
                 .and_then(|(_, commit_id)| {
                     store.read_commit(commit_id).ok().flatten().and_then(|commit| {
-                        commit.root_tree.as_resolved().map(|tid| tid.to_bytes())
+                        let ts = commit.committer.timestamp.timestamp.0;
+                        commit
+                            .root_tree
+                            .as_resolved()
+                            .map(|tid| (tid.to_bytes(), ts))
                     })
                 })
                 .unwrap_or_default()
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
 
         // If we resolved an initial tree, register it with the workspace
@@ -2912,6 +2922,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             bookmarks: reply_bookmarks,
             default_branch: default_branch.unwrap_or_default(),
             initial_tree_id,
+            initial_commit_timestamp_millis,
         }))
     }
 
@@ -3831,6 +3842,7 @@ mod tests {
         svc.check_out(Request::new(CheckOutReq {
             working_copy_path: path.clone(),
             new_tree_id: tree_id.tree_id.clone(),
+            ..Default::default()
         }))
         .await
         .expect("check_out");
@@ -3863,6 +3875,7 @@ mod tests {
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: path.clone(),
                 new_tree_id: bogus,
+                ..Default::default()
             }))
             .await
             .expect_err("expected failed_precondition for unknown tree");
@@ -3886,6 +3899,7 @@ mod tests {
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: "/never/initialized".into(),
                 new_tree_id: vec![0; 20],
+                ..Default::default()
             }))
             .await
             .expect_err("expected not_found");
@@ -4478,6 +4492,7 @@ mod tests {
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: "/tmp/b".into(),
                 new_tree_id: tree_id.0.to_vec(),
+                ..Default::default()
             }))
             .await
             .expect("check_out via remote read-through");
@@ -4519,6 +4534,7 @@ mod tests {
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: "/tmp/repo".into(),
                 new_tree_id: bogus,
+                ..Default::default()
             }))
             .await
             .expect_err("expected failed_precondition");
@@ -4556,6 +4572,7 @@ mod tests {
             .check_out(Request::new(CheckOutReq {
                 working_copy_path: "/tmp/b".into(),
                 new_tree_id: snap.tree_id.clone(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -5289,7 +5306,7 @@ mod tests {
         };
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
         let root = ty::Id(store.empty_tree_id().as_bytes().try_into().unwrap());
-        let fs: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root, None, None, None));
+        let fs: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root, None, None, None, 0));
         let (_transport, attachment) = vfs_handle
             .bind(mount_path.clone(), fs)
             .await

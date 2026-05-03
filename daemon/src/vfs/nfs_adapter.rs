@@ -99,13 +99,18 @@ fn to_fattr3(a: Attr) -> fattr3 {
         rdev: specdata3::default(),
         fsid: 0,
         fileid: a.inode,
-        // Times stay zeroed until M5/M6 — the VFS hasn't seen any
-        // mutations yet, and the macOS NFS client mostly cares about
-        // ctime/mtime to decide whether to revalidate. With `actimeo=0`
-        // (planned mount option, §4.2) it revalidates anyway.
-        atime: nfstime3::default(),
-        mtime: nfstime3::default(),
-        ctime: nfstime3::default(),
+        atime: nfstime3 {
+            seconds: a.mtime_secs as u32,
+            nseconds: 0,
+        },
+        mtime: nfstime3 {
+            seconds: a.mtime_secs as u32,
+            nseconds: 0,
+        },
+        ctime: nfstime3 {
+            seconds: a.mtime_secs as u32,
+            nseconds: 0,
+        },
     }
 }
 
@@ -404,7 +409,7 @@ mod tests {
         ];
         let root_id_bytes = store.write_tree(&entries).unwrap();
         let root_id = Id(root_id_bytes.try_into().expect("20-byte tree id"));
-        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None, None, None));
+        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None, None, None, 0));
         NfsAdapter::new(kiki)
     }
 

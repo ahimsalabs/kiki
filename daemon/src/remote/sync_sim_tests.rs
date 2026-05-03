@@ -285,6 +285,7 @@ impl SyncSim {
                 self.svc_b.check_out(Request::new(CheckOutReq {
                     working_copy_path: "/tmp/sim_b".into(),
                     new_tree_id: tree_id.0.to_vec(),
+                    ..Default::default()
                 })),
             );
             assert!(
@@ -433,6 +434,7 @@ async fn cross_service_snapshot_and_checkout() {
         .check_out(Request::new(CheckOutReq {
             working_copy_path: "/tmp/b".into(),
             new_tree_id: snap.tree_id.clone(),
+            ..Default::default()
         }))
         .await
         .unwrap();

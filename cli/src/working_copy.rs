@@ -392,11 +392,14 @@ impl LockedWorkingCopy for LockedKikiWorkingCopy {
         // the new tree. CheckoutStats stays default until the VFS
         // write path (M6) gives us a real tree-diff to count.
         let path_str = path_to_str(&self.wc.working_copy_path)?.to_string();
+        let commit_ts_millis = commit.committer().timestamp.timestamp.0;
+
         self.wc
             .client
             .check_out(CheckOutReq {
                 working_copy_path: path_str,
                 new_tree_id: resolved_tree_id.to_bytes(),
+                commit_timestamp_millis: commit_ts_millis,
             })
             .map_err(|e| CheckoutError::Other {
                 message: "daemon CheckOut RPC failed".into(),
@@ -433,11 +436,13 @@ impl LockedWorkingCopy for LockedKikiWorkingCopy {
             }
         })?;
         let path_str = path_to_str(&self.wc.working_copy_path)?.to_string();
+        let commit_ts_millis = commit.committer().timestamp.timestamp.0;
         self.wc
             .client
             .check_out(CheckOutReq {
                 working_copy_path: path_str,
                 new_tree_id: resolved_tree_id.to_bytes(),
+                commit_timestamp_millis: commit_ts_millis,
             })
             .map_err(|e| ResetError::Other {
                 message: "daemon CheckOut RPC failed during reset".into(),

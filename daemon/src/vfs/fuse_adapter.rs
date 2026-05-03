@@ -116,15 +116,16 @@ fn to_file_attr(a: Attr) -> FileAttr {
         FileKind::Regular if a.executable => 0o755,
         FileKind::Regular => 0o644,
     };
+    let ts = Timestamp::new(a.mtime_secs, 0);
     FileAttr {
         ino: a.inode,
         size: a.size,
         // Block count: rounded up to 512-byte sectors. POSIX expects this
         // for `du` to work; kernel computes nothing from it on our path.
         blocks: a.size.div_ceil(512),
-        atime: Timestamp::new(0, 0),
-        mtime: Timestamp::new(0, 0),
-        ctime: Timestamp::new(0, 0),
+        atime: ts,
+        mtime: ts,
+        ctime: ts,
         kind: file_kind_to_fuse(a.kind),
         perm,
         nlink: 1,
@@ -712,7 +713,7 @@ mod tests {
         ];
         let root_id_bytes = store.write_tree(&entries).unwrap();
         let root_id = Id(root_id_bytes.try_into().expect("20-byte tree id"));
-        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None, None, None));
+        let kiki: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root_id, None, None, None, 0));
         FuseAdapter::new(kiki)
     }
 

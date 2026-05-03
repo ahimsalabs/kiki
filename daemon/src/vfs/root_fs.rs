@@ -748,6 +748,7 @@ impl RootFs {
             info.remote_store.clone(),
             Some(scratch_dir),
             if wt_gitdir.exists() { Some(wt_gitdir) } else { None },
+            0, // mtime set on first check_out from jj
         );
         let local_refs = LocalRefs::new(info.store.database());
 
@@ -843,6 +844,7 @@ impl RootFs {
                 kind: FileKind::Directory,
                 size: 0,
                 executable: false,
+                mtime_secs: 0,
             })
         } else {
             Err(FsError::NotFound)
@@ -977,7 +979,7 @@ impl JjKikiFs for RootFs {
         }
     }
 
-    async fn check_out(&self, _new_root_tree: Id) -> Result<(), FsError> {
+    async fn check_out(&self, _new_root_tree: Id, _commit_mtime_secs: i64) -> Result<(), FsError> {
         // check_out is called directly on per-workspace KikiFs by the
         // service, never through the FUSE adapter on RootFs.
         Err(FsError::PermissionDenied)
@@ -1604,7 +1606,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            fs.check_out(Id([0; 20])).await,
+            fs.check_out(Id([0; 20]), 0).await,
             Err(FsError::PermissionDenied),
         );
         assert_eq!(fs.snapshot().await, Err(FsError::PermissionDenied));
@@ -2065,7 +2067,7 @@ mod tests {
             let handle = fs.get_workspace("repo", "feature").await.unwrap();
             handle.fs
         };
-        feature_kikifs.check_out(root_tree).await.unwrap();
+        feature_kikifs.check_out(root_tree, 0).await.unwrap();
 
         // Now read the file through RootFs in "feature".
         let ws_feature = fs.lookup(repo_ino, "feature").await.unwrap();

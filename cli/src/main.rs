@@ -1357,45 +1357,54 @@ async fn run_clone_command(
     let client = daemon_client::connect_or_start(command_helper.settings())
         .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
 
-    let (workspace_path, initial_tree_id) = match classify_clone_url(&args.url) {
-        CloneSource::KikiRemote(url) => {
-            if args.remote.is_some() {
-                return Err(user_error(
-                    "--remote is only valid when cloning from a git URL; \
-                     the clone URL is already a kiki remote",
-                ));
+    let (workspace_path, initial_tree_id, initial_commit_ts) =
+        match classify_clone_url(&args.url) {
+            CloneSource::KikiRemote(url) => {
+                if args.remote.is_some() {
+                    return Err(user_error(
+                        "--remote is only valid when cloning from a git URL; \
+                         the clone URL is already a kiki remote",
+                    ));
+                }
+                writeln!(ui.status(), "Cloning {}...", url)?;
+                let reply = client
+                    .clone_repo(proto::jj_interface::CloneReq {
+                        url,
+                        name: args.name.clone().unwrap_or_default(),
+                    })
+                    .map_err(|e| rpc_error("Clone failed", e))?
+                    .into_inner();
+                (
+                    reply.workspace_path,
+                    reply.initial_tree_id,
+                    reply.initial_commit_timestamp_millis,
+                )
             }
-            writeln!(ui.status(), "Cloning {}...", url)?;
-            let reply = client
-                .clone_repo(proto::jj_interface::CloneReq {
-                    url,
-                    name: args.name.clone().unwrap_or_default(),
-                })
-                .map_err(|e| rpc_error("Clone failed", e))?
-                .into_inner();
-            (reply.workspace_path, reply.initial_tree_id)
-        }
-        CloneSource::Git(git_url) => {
-            writeln!(ui.status(), "Cloning from git: {}...", git_url)?;
-            let reply = client
-                .git_clone(proto::jj_interface::GitCloneReq {
-                    git_url: git_url.clone(),
-                    name: args.name.clone().unwrap_or_default(),
-                    kiki_remote: args.remote.clone().unwrap_or_default(),
-                })
-                .map_err(|e| rpc_error("Clone failed", e))?
-                .into_inner();
-            if !reply.default_branch.is_empty() {
-                writeln!(
-                    ui.status(),
-                    "Fetched {} bookmark(s), default branch: {}",
-                    reply.bookmarks.len(),
-                    reply.default_branch,
-                )?;
+            CloneSource::Git(git_url) => {
+                writeln!(ui.status(), "Cloning from git: {}...", git_url)?;
+                let reply = client
+                    .git_clone(proto::jj_interface::GitCloneReq {
+                        git_url: git_url.clone(),
+                        name: args.name.clone().unwrap_or_default(),
+                        kiki_remote: args.remote.clone().unwrap_or_default(),
+                    })
+                    .map_err(|e| rpc_error("Clone failed", e))?
+                    .into_inner();
+                if !reply.default_branch.is_empty() {
+                    writeln!(
+                        ui.status(),
+                        "Fetched {} bookmark(s), default branch: {}",
+                        reply.bookmarks.len(),
+                        reply.default_branch,
+                    )?;
+                }
+                (
+                    reply.workspace_path,
+                    reply.initial_tree_id,
+                    reply.initial_commit_timestamp_millis,
+                )
             }
-            (reply.workspace_path, reply.initial_tree_id)
-        }
-    };
+        };
 
     let wc_path = std::path::PathBuf::from(&workspace_path);
 
@@ -1431,6 +1440,7 @@ async fn run_clone_command(
             .check_out(proto::jj_interface::CheckOutReq {
                 working_copy_path: workspace_path.clone(),
                 new_tree_id: initial_tree_id,
+                commit_timestamp_millis: initial_commit_ts,
             })
         {
             // Rollback on CheckOut failure too.
