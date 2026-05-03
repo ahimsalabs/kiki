@@ -167,6 +167,38 @@ fn mount_nfs_at(path: &std::path::Path, port: u16) -> anyhow::Result<()> {
     }
 }
 
+/// Detach the FUSE mount at `path` during graceful shutdown.
+///
+/// We can't rely on `fuse3::MountHandle::drop` because it spawns a
+/// `tokio::task::spawn(inner_unmount())` that races the runtime teardown
+/// and often never executes, leaving a stale ENOTCONN mountpoint.
+#[cfg(target_os = "linux")]
+fn unmount_fuse(path: &std::path::Path) {
+    match std::process::Command::new("fusermount3")
+        .args(["-u", &path.to_string_lossy()])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!(mount_root = %path.display(), "FUSE mount unmounted");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                mount_root = %path.display(),
+                stderr = %stderr.trim(),
+                "fusermount3 -u failed during shutdown; mount may need manual cleanup"
+            );
+        }
+        Err(e) => {
+            warn!(
+                mount_root = %path.display(),
+                error = %e,
+                "could not run fusermount3 during shutdown"
+            );
+        }
+    }
+}
+
 /// Detach the NFS kernel mount at `path` during graceful shutdown.
 #[cfg(target_os = "macos")]
 fn unmount_nfs(path: &std::path::Path) {
@@ -470,14 +502,20 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
         }
     };
 
-    // Cleanup: unmount the managed namespace on macOS. On Linux,
-    // dropping the FUSE MountHandle (inside the service) triggers
-    // fusermount3 -u automatically. On macOS the NFS kernel mount
-    // persists independently of the NFS server task, so we detach
-    // it explicitly before the server is torn down.
+    // Cleanup: explicitly unmount the managed namespace before the
+    // tokio runtime tears down. On macOS the NFS kernel mount persists
+    // independently of the NFS server task; on Linux the fuse3
+    // MountHandle::drop spawns a tokio task to call fusermount3 -u,
+    // but that task races the runtime shutdown and often never runs,
+    // leaving a stale ENOTCONN mountpoint. Explicit unmount avoids
+    // the race on both platforms.
     #[cfg(target_os = "macos")]
     if !config.disable_mount {
         unmount_nfs(&config.mount_root);
+    }
+    #[cfg(target_os = "linux")]
+    if !config.disable_mount {
+        unmount_fuse(&config.mount_root);
     }
 
     // Cleanup: remove socket and PID file.

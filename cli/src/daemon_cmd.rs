@@ -243,6 +243,7 @@ fn stop_daemon() -> Result<(), CommandError> {
             let alive = unsafe { libc::kill(pid, 0) == 0 };
             if !alive {
                 println!("Daemon stopped");
+                cleanup_stale_mountpoint();
                 return Ok(());
             }
         }
@@ -257,7 +258,63 @@ fn stop_daemon() -> Result<(), CommandError> {
             return Err(user_error(format!("failed to send SIGTERM to {pid}: {err}")));
         }
     }
+    cleanup_stale_mountpoint();
     Ok(())
+}
+
+/// Best-effort cleanup of a stale FUSE/NFS mount left behind after the
+/// daemon exits. The daemon itself unmounts during graceful shutdown, but
+/// if it was killed or the unmount raced the runtime teardown, the
+/// mountpoint can linger as ENOTCONN (Linux) or ESTALE (macOS).
+fn cleanup_stale_mountpoint() {
+    let mount_root = store::paths::default_mount_root();
+    // If stat succeeds the mount is either live or a plain directory —
+    // nothing to clean up.
+    if mount_root.exists() {
+        return;
+    }
+    // The path exists as an inode but stat fails → stale mount.
+    // On some systems, exists() returning false is enough signal —
+    // but we also need the directory entry to be present. A quick
+    // read_dir on the parent confirms the entry is there.
+    if let Some(name) = mount_root.file_name() {
+        if let Some(parent) = mount_root.parent() {
+            let entry_exists = std::fs::read_dir(parent)
+                .ok()
+                .and_then(|mut entries| entries.find(|e| {
+                    e.as_ref().ok().map_or(false, |e| e.file_name() == name)
+                }))
+                .is_some();
+            if !entry_exists {
+                return; // Directory doesn't exist at all, nothing to unmount.
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("fusermount3")
+            .args(["-u", &mount_root.to_string_lossy()])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                println!("Cleaned up stale FUSE mount at {}", mount_root.display());
+            }
+            _ => {} // Best-effort; the next daemon start will retry.
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("umount")
+            .args(["-f", &mount_root.to_string_lossy()])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                println!("Cleaned up stale NFS mount at {}", mount_root.display());
+            }
+            _ => {}
+        }
+    }
 }
 
 fn show_logs(args: &DaemonLogsArgs) -> Result<(), CommandError> {
