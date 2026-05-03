@@ -207,6 +207,20 @@ impl NFSFileSystem for NfsAdapter {
     // Write side (M6) — dispatches into JjKikiFs.
     // ------------------------------------------------------------------
 
+    /// NB: nfsserve unconditionally returns `stable_how::FILE_SYNC` for
+    /// every write (see `nfs_handlers.rs` in nfsserve 0.11). This tells
+    /// the NFS client the data is committed to stable storage, but our
+    /// writes go to an in-memory slab (`DirtyFile`) that is only
+    /// persisted on `snapshot`. This is a semantic mismatch with RFC
+    /// 1813 §3.3.7, but does not cause data loss in practice because:
+    ///
+    /// 1. The NFS server is `127.0.0.1`-only — the client (jj-lib) runs
+    ///    in the same daemon process and calls `snapshot` for durability.
+    /// 2. nfsserve's `NFSFileSystem::write` trait method has no way to
+    ///    return a stability level; fixing this requires upstream changes
+    ///    to nfsserve.
+    /// 3. If the daemon crashes, jj's own crash-recovery (rebase onto
+    ///    last committed op) handles the lost working-copy state.
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         self.inner
             .write(id, offset, data)
