@@ -1116,6 +1116,87 @@ mod tests {
         assert!(store.write_tree(&entries).is_err());
     }
 
+    // ---- non-UTF-8 tree entry name handling ----
+
+    /// Regression: git tree entries with non-UTF-8 filenames exist in
+    /// the wild. `read_tree` must return `Err` (not panic or produce
+    /// mojibake) when encountering one.
+    #[test]
+    fn read_tree_rejects_non_utf8_entry_name() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+
+        // Construct a raw git tree object with a non-UTF-8 filename.
+        // Git tree format: repeated [mode SP name NUL sha1-bytes].
+        let mode = b"100644 ";
+        let name_bytes: &[u8] = &[0xff, 0xfe, 0x2e, 0x74, 0x78, 0x74]; // invalid UTF-8 + ".txt"
+        let null = b"\0";
+        let fake_sha1 = [0u8; 20]; // doesn't need to point to a real blob
+
+        let mut tree_data = Vec::new();
+        tree_data.extend_from_slice(mode);
+        tree_data.extend_from_slice(name_bytes);
+        tree_data.extend_from_slice(null);
+        tree_data.extend_from_slice(&fake_sha1);
+
+        let tree_id = store
+            .write_git_object_bytes(GitObjectKind::Tree, &tree_data)
+            .expect("write raw tree object");
+
+        let result = store.read_tree(&tree_id);
+        assert!(
+            result.is_err(),
+            "read_tree should reject non-UTF-8 entry name"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("UTF-8") || msg.contains("utf-8") || msg.contains("Utf8"),
+            "error should mention UTF-8, got: {msg}"
+        );
+    }
+
+    /// Non-ASCII UTF-8 names (e.g. CJK, emoji) are valid git tree
+    /// entries and must round-trip through write_tree/read_tree.
+    #[test]
+    fn tree_round_trip_non_ascii_utf8_names() {
+        let settings = test_settings();
+        let store = GitContentStore::new_in_memory(&settings);
+
+        // Write a blob to get a valid id.
+        let blob_id = store.write_file(b"content").expect("write_file");
+
+        let entries = vec![
+            GitTreeEntry {
+                name: "日本語.txt".into(),
+                kind: GitEntryKind::File { executable: false },
+                id: blob_id.clone(),
+            },
+            GitTreeEntry {
+                name: "über".into(),
+                kind: GitEntryKind::File { executable: false },
+                id: blob_id.clone(),
+            },
+            GitTreeEntry {
+                name: "café".into(),
+                kind: GitEntryKind::Symlink,
+                id: blob_id.clone(),
+            },
+        ];
+
+        let tree_id = store.write_tree(&entries).expect("write_tree");
+        let read_back = store
+            .read_tree(&tree_id)
+            .expect("read_tree")
+            .expect("tree should be present");
+
+        // Git sorts tree entries by name bytes; verify all names survive.
+        let mut expected_names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        expected_names.sort();
+        let mut actual_names: Vec<&str> = read_back.iter().map(|e| e.name.as_str()).collect();
+        actual_names.sort();
+        assert_eq!(actual_names, expected_names);
+    }
+
     // ---- operation_ids_matching_prefix coverage ----
 
     #[test]
@@ -1241,9 +1322,21 @@ mod proptests {
         proptest::collection::vec(any::<u8>(), 20)
     }
 
-    /// Valid tree entry names: non-empty, no '/' or NUL.
+    /// Valid tree entry names: non-empty, no '/' or NUL. Includes
+    /// non-ASCII UTF-8 characters (CJK, accented Latin, etc.) to
+    /// exercise the full Unicode range that git tree entries support.
     fn arb_entry_name() -> impl Strategy<Value = String> {
-        "[a-zA-Z0-9_.][a-zA-Z0-9_.\\-]{0,15}"
+        prop_oneof![
+            4 => "[a-zA-Z0-9_.][a-zA-Z0-9_.\\-]{0,15}".prop_map(|s| s),
+            1 => prop_oneof![
+                Just("über.txt".to_owned()),
+                Just("café".to_owned()),
+                Just("日本語.rs".to_owned()),
+                Just("données".to_owned()),
+                Just("ñoño".to_owned()),
+                Just("Ελληνικά".to_owned()),
+            ],
+        ]
     }
 
     fn arb_entry_kind() -> impl Strategy<Value = GitEntryKind> {
