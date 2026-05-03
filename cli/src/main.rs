@@ -46,8 +46,6 @@ pub(crate) struct InitArgs {
 enum KikiCommands {
     Init(InitArgs),
     Status,
-    /// Git remote operations (push, fetch, remote management)
-    Git(GitArgs),
     /// Daemon lifecycle management
     Daemon(daemon_cmd::DaemonArgs),
 }
@@ -835,9 +833,6 @@ async fn run_kk_command(
             )?;
 
             Ok(())
-        }
-        KikiCommands::Git(git_args) => {
-            run_git_command(ui, command_helper, &client, git_args).await
         }
         KikiCommands::Daemon(_) => {
             // Handled above before daemon connection.

@@ -131,7 +131,7 @@ fn init_with_remote(
     let repo_path = test_env.env_root().join(repo_name);
     test_env.jj_cmd_ok(
         &repo_path,
-        &["kk", "git", "remote", "add", remote_name, remote_url],
+        &["git", "remote", "add", remote_name, remote_url],
     );
     repo_path
 }
@@ -148,12 +148,12 @@ fn test_git_fetch_and_push_local() {
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
     // List remotes.
-    let (stdout, _) = test_env.jj_cmd_ok(&repo, &["kk", "git", "remote", "list"]);
+    let (stdout, _) = test_env.jj_cmd_ok(&repo, &["git", "remote", "list"]);
     assert!(stdout.contains("origin"), "remote list: {stdout}");
 
     // Fetch.
     let (stdout, _) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
     assert!(stdout.contains("origin/main"), "fetch: {stdout}");
 
     // Verify bookmarks.
@@ -172,13 +172,13 @@ fn test_git_fetch_and_push_local() {
     test_env.jj_cmd_ok(&repo, &["bookmark", "set", "main", "-r", "@-"]);
     let (_, stderr) = test_env.jj_cmd_ok(
         &repo,
-        &["kk", "git", "push", "--remote", "origin", "--bookmark", "main"],
+        &["git", "push", "--remote", "origin", "--bookmark", "main"],
     );
     assert!(stderr.contains("Done"), "push: {stderr}");
 
     // Re-fetch: should succeed (idempotent — pushed commit is now on remote).
     let (stdout, stderr) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
     // The main ref still points to the same commit we just pushed.
     assert!(stdout.contains("origin/main"), "re-fetch: {stdout}");
     assert!(stderr.contains("Fetching"), "re-fetch: {stderr}");
@@ -193,7 +193,7 @@ fn test_git_fetch_empty_repo() {
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
     let (_, stderr) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
     assert!(
         stderr.contains("Nothing new"),
         "expected 'Nothing new' for empty repo, stderr: {stderr}"
@@ -215,7 +215,7 @@ fn test_git_fetch_multiple_bookmarks() {
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
     let (stdout, _) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
     assert!(stdout.contains("origin/main"), "fetch: {stdout}");
     assert!(stdout.contains("origin/feature"), "fetch: {stdout}");
 
@@ -239,7 +239,7 @@ fn test_git_fetch_diverged_local_bookmark() {
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
     // First fetch — sets local `main` to the upstream commit.
-    test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+    test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
 
     // Advance local `main` with a local-only commit.
     test_env.jj_cmd_ok(&repo, &["new", "main"]);
@@ -264,7 +264,7 @@ fn test_git_fetch_diverged_local_bookmark() {
 
     // Second fetch — remote main advanced, but local main diverged.
     let (stdout, _) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
     assert!(stdout.contains("origin/main"), "fetch: {stdout}");
 
     // Local main should be unchanged (diverged — not fast-forwarded).
@@ -293,7 +293,7 @@ fn test_git_fetch_fast_forward_local_bookmark() {
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
     // First fetch.
-    test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+    test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
 
     // Record local main.
     let (log_before, _) = test_env.jj_cmd_ok(&repo, &["log", "-r", "main", "--no-graph", "-T", "commit_id.short(12)"]);
@@ -312,7 +312,7 @@ fn test_git_fetch_fast_forward_local_bookmark() {
 
     // Second fetch.
     let (stdout, _) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
     assert!(stdout.contains("origin/main"), "fetch: {stdout}");
 
     // Local main should have been fast-forwarded.
@@ -340,7 +340,7 @@ fn test_git_push_all_multiple_bookmarks() {
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
     // Fetch to get main.
-    test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+    test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
 
     // Create a second bookmark `dev` on a new commit.
     test_env.jj_cmd_ok(&repo, &["new", "main"]);
@@ -350,7 +350,7 @@ fn test_git_push_all_multiple_bookmarks() {
 
     // Push --all.
     let (_, stderr) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "push", "--remote", "origin", "--all"]);
+        test_env.jj_cmd_ok(&repo, &["git", "push", "--remote", "origin", "--all"]);
     // Should mention both bookmarks.
     assert!(stderr.contains("main"), "push --all stderr: {stderr}");
     assert!(stderr.contains("dev"), "push --all stderr: {stderr}");
@@ -364,11 +364,11 @@ fn test_git_push_no_bookmark_arg() {
     let url = create_bare_repo(test_env.env_root(), "upstream", seed_single_branch);
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
-    test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+    test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
 
     let stderr = test_env.jj_cmd_cli_error(
         &repo,
-        &["kk", "git", "push", "--remote", "origin"],
+        &["git", "push", "--remote", "origin"],
     );
     assert!(
         stderr.contains("no bookmarks specified"),
@@ -384,7 +384,7 @@ fn test_git_push_non_fast_forward() {
     let repo = init_with_remote(&test_env, "repo", "origin", &url);
 
     // Fetch to get main.
-    test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+    test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
 
     // Push a new commit upstream so remote is ahead.
     push_extra_commit(
@@ -406,7 +406,7 @@ fn test_git_push_non_fast_forward() {
     // Push should fail (non-fast-forward).
     let stderr = test_env.jj_cmd_internal_error(
         &repo,
-        &["kk", "git", "push", "--remote", "origin", "--bookmark", "main"],
+        &["git", "push", "--remote", "origin", "--bookmark", "main"],
     );
     assert!(
         stderr.contains("rejected") || stderr.contains("non-fast-forward"),
@@ -432,22 +432,22 @@ fn test_git_multiple_remotes() {
         test_env.jj_cmd_ok(test_env.env_root(), &["kk", "init", "", "repo"]);
     assert!(stderr.contains("Initialized repo"));
     let repo = test_env.env_root().join("repo");
-    test_env.jj_cmd_ok(&repo, &["kk", "git", "remote", "add", "alpha", &url_a]);
-    test_env.jj_cmd_ok(&repo, &["kk", "git", "remote", "add", "beta", &url_b]);
+    test_env.jj_cmd_ok(&repo, &["git", "remote", "add", "alpha", &url_a]);
+    test_env.jj_cmd_ok(&repo, &["git", "remote", "add", "beta", &url_b]);
 
     // List should show both.
-    let (stdout, _) = test_env.jj_cmd_ok(&repo, &["kk", "git", "remote", "list"]);
+    let (stdout, _) = test_env.jj_cmd_ok(&repo, &["git", "remote", "list"]);
     assert!(stdout.contains("alpha"), "list: {stdout}");
     assert!(stdout.contains("beta"), "list: {stdout}");
 
     // Fetch from alpha.
     let (stdout, _) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "alpha"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "alpha"]);
     assert!(stdout.contains("alpha/main"), "fetch alpha: {stdout}");
 
     // Fetch from beta.
     let (stdout, _) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "beta"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "beta"]);
     assert!(stdout.contains("beta/main"), "fetch beta: {stdout}");
 
     // Both remote-tracking refs should be visible.
@@ -466,7 +466,7 @@ fn test_git_remote_add_duplicate() {
     // Adding the same remote name again should error.
     let stderr = test_env.jj_cmd_internal_error(
         &repo,
-        &["kk", "git", "remote", "add", "origin", "file:///other"],
+        &["git", "remote", "add", "origin", "file:///other"],
     );
     assert!(
         stderr.contains("already exists") || stderr.contains("remote add"),
@@ -475,11 +475,11 @@ fn test_git_remote_add_duplicate() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: `kiki git` dispatch hook (no `kk` prefix)
+// Tests: `kiki git` dispatch hook
 // ---------------------------------------------------------------------------
 
-/// Full round-trip via `kiki git` (not `kiki kk git`): verifies the dispatch
-/// hook intercepts on kiki-backend repos and routes through the daemon.
+/// Full round-trip via `kiki git`: verifies the dispatch hook intercepts on
+/// kiki-backend repos and routes through the daemon.
 #[test]
 fn test_git_dispatch_hook_round_trip() {
     let test_env = TestEnvironment::default();
@@ -638,7 +638,7 @@ fn test_git_fetch_and_push_round_trip() {
     let repo = init_with_remote(&test_env, "repo", "origin", &clone_url);
 
     let (stdout, _) =
-        test_env.jj_cmd_ok(&repo, &["kk", "git", "fetch", "--remote", "origin"]);
+        test_env.jj_cmd_ok(&repo, &["git", "fetch", "--remote", "origin"]);
     assert!(stdout.contains("origin/main"), "fetch: {stdout}");
 
     test_env.jj_cmd_ok(&repo, &["new", "main"]);
@@ -648,7 +648,7 @@ fn test_git_fetch_and_push_round_trip() {
 
     let (_, stderr) = test_env.jj_cmd_ok(
         &repo,
-        &["kk", "git", "push", "--remote", "origin", "--bookmark", "main"],
+        &["git", "push", "--remote", "origin", "--bookmark", "main"],
     );
     assert!(stderr.contains("Done"), "push: {stderr}");
 }
