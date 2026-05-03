@@ -245,7 +245,7 @@ async fn validate_op_store_blob_id(
 /// caller treats this as best-effort).
 fn bookmarks_from_view_bytes(data: &[u8]) -> Vec<(String, Vec<u8>)> {
     use jj_lib::protos::simple_op_store as op_proto;
-    use prost014::Message as _;
+    use prost::Message as _;
 
     let Ok(view) = op_proto::View::decode(data) else {
         return Vec::new();

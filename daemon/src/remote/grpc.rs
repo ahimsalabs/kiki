@@ -79,7 +79,10 @@ impl GrpcRemoteStore {
         let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let path = path.clone();
-                async move { tokio::net::UnixStream::connect(path).await }
+                async move {
+                    let stream = tokio::net::UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                }
             }))
             .await
             .with_context(|| format!("connecting to UDS remote at {display}"))?;

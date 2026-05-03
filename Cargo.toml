@@ -38,7 +38,7 @@ jj-lib-proc-macros = {version = "0.40", default-features = true}
 nfsserve = "0.10"
 parking_lot = "0.12.3"
 pollster = "0.4"
-prost = "0.12"
+prost = "0.14"
 proto = { path = "./proto" }
 rand = "0.9"
 # Layer B (PLAN.md §8): per-mount durable storage. redb 2.x is pure-Rust,
@@ -54,8 +54,8 @@ tokio-stream = { version = "0.1.14", features = ["net"] }
 tower = { version = "0.4", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 toml = "0.8"
-tonic = "0.11.0"
-tonic-reflection = "0.11.0"
+tonic = "0.14"
+tonic-reflection = "0.14"
 tracing = "0.1"
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

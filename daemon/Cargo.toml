@@ -27,7 +27,6 @@ libc.workspace = true
 nfsserve.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
-prost014 = { package = "prost", version = "0.14" }
 proto = { path = "../proto" }
 rand.workspace = true
 redb.workspace = true

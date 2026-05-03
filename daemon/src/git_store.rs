@@ -570,7 +570,7 @@ pub enum GitEntryKind {
 /// format so that the bytes written to the extras table are directly
 /// consumable by `GitBackend::read_commit`.
 fn serialize_extras_for_replication(commit: &backend::Commit) -> Vec<u8> {
-    use prost014::Message;
+    use prost::Message;
 
     let mut proto = jj_lib::protos::git_store::Commit {
         change_id: commit.change_id.to_bytes(),
@@ -1047,8 +1047,8 @@ mod tests {
         assert!(extras.is_some(), "extras should be present for a written commit");
 
         // The extras should contain the change-id and predecessors.
-        // Verify by deserializing with prost014.
-        use prost014::Message;
+        // Verify by deserializing with prost.
+        use prost::Message;
         let decoded = jj_lib::protos::git_store::Commit::decode(
             extras.unwrap().as_slice(),
         )
@@ -1424,7 +1424,7 @@ mod proptests {
             change_id_bytes in proptest::collection::vec(any::<u8>(), 16),
             predecessor_ids in proptest::collection::vec(arb_20_bytes(), 0..4),
         ) {
-            use prost014::Message;
+            use prost::Message;
 
             let commit = backend::Commit {
                 parents: vec![CommitId::from_bytes(&[0; 20])],
@@ -1479,7 +1479,7 @@ mod proptests {
         fn write_read_extras_through_store(
             change_id_bytes in proptest::collection::vec(any::<u8>(), 16),
         ) {
-            use prost014::Message;
+            use prost::Message;
 
             let settings = test_settings();
             let store = GitContentStore::new_in_memory(&settings);

@@ -343,7 +343,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
     // Reflection + remote store services.
     let reflection_svc = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
-        .build()?;
+        .build_v1()?;
 
     let served_blobs_dir = config.storage_dir.join("served_blobs");
     let remote_backend: Arc<dyn RemoteStore> =

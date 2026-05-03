@@ -36,7 +36,10 @@ impl BlockingJujutsuInterfaceClient {
                 .connect_with_connector(tower::service_fn(
                     move |_: tonic::transport::Uri| {
                         let path = path_clone.clone();
-                        async move { tokio::net::UnixStream::connect(path).await }
+                        async move {
+                            let stream = tokio::net::UnixStream::connect(path).await?;
+                            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                        }
                     },
                 ))
                 .await
