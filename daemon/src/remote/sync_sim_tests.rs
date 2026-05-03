@@ -96,6 +96,10 @@ struct SyncSim {
     /// Tree IDs from snapshots on each service.
     snapshot_trees_a: Vec<Id>,
     snapshot_trees_b: Vec<Id>,
+    /// How many cross-reads actually compared data vs were skipped
+    /// (no blobs from the other service yet).
+    cross_reads_exercised: usize,
+    cross_reads_skipped: usize,
     rt: tokio::runtime::Runtime,
 }
 
@@ -132,6 +136,8 @@ impl SyncSim {
             written: Vec::new(),
             snapshot_trees_a: Vec::new(),
             snapshot_trees_b: Vec::new(),
+            cross_reads_exercised: 0,
+            cross_reads_skipped: 0,
             rt,
         }
     }
@@ -211,7 +217,10 @@ impl SyncSim {
                             "cross-read from {origin} of {}'s blob returned wrong data",
                             blob.origin
                         );
+                        self.cross_reads_exercised += 1;
                     }
+                } else {
+                    self.cross_reads_skipped += 1;
                 }
             }
             SyncOp::Snapshot => {
@@ -296,7 +305,20 @@ impl SyncSim {
         }
     }
 
+    /// Returns true if at least one CrossRead op actually compared data
+    /// (i.e. was not vacuously skipped due to no blobs from the other
+    /// service). Use this after `run()` to detect coverage holes.
+    fn had_exercised_cross_reads(&self) -> bool {
+        self.cross_reads_exercised > 0
+    }
 
+    /// Count how many CrossRead ops appear in a schedule.
+    fn count_cross_reads(schedule: &[ScheduleStep]) -> usize {
+        schedule
+            .iter()
+            .filter(|s| matches!(s, ScheduleStep::A(SyncOp::CrossRead) | ScheduleStep::B(SyncOp::CrossRead)))
+            .count()
+    }
 }
 
 enum Who {
@@ -337,7 +359,29 @@ fn arb_schedule_step() -> impl Strategy<Value = ScheduleStep> {
 }
 
 fn arb_schedule() -> impl Strategy<Value = Vec<ScheduleStep>> {
-    prop::collection::vec(arb_schedule_step(), 2..20)
+    // Seed both services with a write so CrossRead ops always have
+    // data from the other side to exercise (fixes coverage hole
+    // where random schedules could generate CrossReads before any
+    // writes, causing silent vacuous passes).
+    (
+        arb_content(),
+        arb_content(),
+        prop::collection::vec(arb_schedule_step(), 2..20),
+    )
+        .prop_map(|(data_a, data_b, tail)| {
+            let mut schedule = vec![
+                ScheduleStep::A(SyncOp::WriteFile {
+                    name: "seed_a".into(),
+                    data: data_a,
+                }),
+                ScheduleStep::B(SyncOp::WriteFile {
+                    name: "seed_b".into(),
+                    data: data_b,
+                }),
+            ];
+            schedule.extend(tail);
+            schedule
+        })
 }
 
 // ---- Deterministic tests ----
@@ -559,17 +603,71 @@ async fn cas_ref_not_clobbered_by_second_init() {
     }
 }
 
+/// Regression: a schedule of [CrossRead, CrossRead] with no writes
+/// would silently pass — the cross-reads skip because there are no
+/// blobs from the other service. With the seeded schedule strategy,
+/// this schedule now includes writes from both services up front, so
+/// cross-reads are always exercised.
+#[test]
+fn cross_read_is_not_vacuous_with_seeded_writes() {
+    let mut sim = SyncSim::new();
+    // Seed writes from both services.
+    sim.apply_op(
+        &Who::A,
+        &SyncOp::WriteFile {
+            name: "seed".into(),
+            data: b"from-A".to_vec(),
+        },
+    );
+    sim.apply_op(
+        &Who::B,
+        &SyncOp::WriteFile {
+            name: "seed".into(),
+            data: b"from-B".to_vec(),
+        },
+    );
+    // Now cross-reads should actually exercise.
+    sim.apply_op(&Who::A, &SyncOp::CrossRead);
+    sim.apply_op(&Who::B, &SyncOp::CrossRead);
+    assert!(
+        sim.had_exercised_cross_reads(),
+        "cross-reads should have been exercised after seeded writes, \
+         but exercised={}, skipped={}",
+        sim.cross_reads_exercised,
+        sim.cross_reads_skipped,
+    );
+    assert_eq!(sim.cross_reads_exercised, 2);
+    assert_eq!(sim.cross_reads_skipped, 0);
+    sim.verify_no_data_loss();
+}
+
 // ---- Property tests ----
 
 proptest! {
     /// Core convergence property: run an arbitrary interleaved schedule
     /// of operations on two services sharing a remote, then verify
     /// that every blob written by either side is readable from both.
+    ///
+    /// The schedule is seeded with writes from both services so that
+    /// CrossRead ops are always exercised (not vacuously skipped).
     #[test]
     fn no_data_loss_under_interleaving(schedule in arb_schedule()) {
         let mut sim = SyncSim::new();
         sim.run(&schedule);
         sim.verify_no_data_loss();
+        // If the schedule contained cross-reads, at least one must
+        // have actually compared data (not been vacuously skipped).
+        if SyncSim::count_cross_reads(&schedule) > 0 {
+            prop_assert!(
+                sim.had_exercised_cross_reads(),
+                "schedule had {} CrossRead ops but none were exercised \
+                 (all skipped due to no other-service blobs). \
+                 exercised={}, skipped={}",
+                SyncSim::count_cross_reads(&schedule),
+                sim.cross_reads_exercised,
+                sim.cross_reads_skipped,
+            );
+        }
     }
 
     /// After running an arbitrary schedule, if A snapshotted at least
