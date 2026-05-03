@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use redb::{Database, ReadableTable, TableDefinition};
 
+use crate::fi::buggify;
 use crate::remote::{validate_ref_name, CasOutcome};
 
 /// Per-mount refs table. See module docs for schema rationale.
@@ -100,6 +101,14 @@ impl LocalRefs {
                 CasOutcome::Updated
             }
         };
+        // BUGGIFY(cas-ref-commit): Inject failure before txn.commit() to
+        // test that get_ref returns the pre-CAS value (redb rolls back).
+        if buggify!(100) {
+            return Err(anyhow::anyhow!(
+                "[BUGGIFY] simulated redb commit failure in cas_ref"
+            ));
+        }
+
         // Always commit: on Conflict the txn is a no-op but committing
         // keeps the API symmetric (no abort path) and redb collapses
         // empty txns cheaply.

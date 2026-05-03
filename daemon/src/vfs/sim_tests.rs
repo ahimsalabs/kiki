@@ -685,3 +685,100 @@ fn verify_parent_consistency(tree: &ModelTree, path: &[&str]) {
         }
     }
 }
+
+// ---- Consistency checker integration ----
+
+/// Verify that after every successful snapshot, the tree graph stored in
+/// the git ODB is complete (no dangling references). This tests the
+/// invariant that `snapshot_node` writes all children before writing
+/// the parent tree.
+#[tokio::test]
+async fn snapshot_produces_complete_tree_graph() {
+    use crate::check::check_tree_complete;
+
+    let settings = test_settings();
+    let store = Arc::new(GitContentStore::new_in_memory(&settings));
+    let root = empty_root(&store);
+    let fs = KikiFs::new(store.clone(), root, None, None, None, 0);
+
+    // Build a non-trivial tree.
+    let (dir, _) = fs.mkdir(ROOT_INODE, "src").await.unwrap();
+    let (f1, _) = fs.create_file(dir, "main.rs", false).await.unwrap();
+    fs.write(f1, 0, b"fn main() {}").await.unwrap();
+    let (f2, _) = fs.create_file(dir, "lib.rs", false).await.unwrap();
+    fs.write(f2, 0, b"pub mod utils;").await.unwrap();
+    let (sub, _) = fs.mkdir(dir, "utils").await.unwrap();
+    let (f3, _) = fs.create_file(sub, "mod.rs", false).await.unwrap();
+    fs.write(f3, 0, b"pub fn helper() {}").await.unwrap();
+    fs.create_file(ROOT_INODE, "README.md", false).await.unwrap();
+    fs.symlink(ROOT_INODE, "link", "src/main.rs").await.unwrap();
+
+    // Snapshot and verify completeness.
+    let snap = fs.snapshot().await.unwrap();
+    let result = check_tree_complete(&store, &snap.0);
+    result.assert_ok();
+    // 1 root tree + 1 src tree + 1 utils tree + 4 blobs (3 files + 1 symlink) + 1 readme (empty)
+    assert!(result.objects_visited >= 7, "visited: {}", result.objects_visited);
+}
+
+/// Under fault injection, snapshot may fail partway through. Verify that
+/// the *last successful* snapshot still has a complete tree graph, even
+/// when BUGGIFY injects failures in subsequent attempts.
+///
+/// Runs on a dedicated thread to avoid global FI state bleeding into
+/// parallel tests.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn buggify_snapshot_failure_preserves_prior_consistency() {
+    use crate::check::check_tree_complete;
+    use crate::fi;
+
+    // Run on a dedicated thread so FI enable/disable doesn't leak.
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let settings = test_settings();
+            let store = Arc::new(GitContentStore::new_in_memory(&settings));
+            let root = empty_root(&store);
+            let fs = KikiFs::new(store.clone(), root, None, None, None, 0);
+
+            // First: build state and take a clean snapshot (no fault injection).
+            let (f, _) = fs.create_file(ROOT_INODE, "safe.txt", false).await.unwrap();
+            fs.write(f, 0, b"safe content").await.unwrap();
+            let good_snap = fs.snapshot().await.unwrap();
+
+            // Verify the clean snapshot is complete.
+            let result = check_tree_complete(&store, &good_snap.0);
+            result.assert_ok();
+
+            // Enable fault injection on THIS thread only (thread-local RNG).
+            fi::set_seed(42);
+            fi::reset_thread_local();
+            fi::enable();
+
+            let (f2, _) = fs.create_file(ROOT_INODE, "risky.txt", false).await.unwrap();
+            fs.write(f2, 0, b"might not persist").await.unwrap();
+
+            // Snapshot may fail due to BUGGIFY. Either way, the prior
+            // snapshot must remain valid.
+            let snap_result = fs.snapshot().await;
+
+            fi::disable();
+
+            // The original good snapshot is still complete regardless.
+            let result = check_tree_complete(&store, &good_snap.0);
+            result.assert_ok();
+
+            // If the second snapshot DID succeed, it should also be complete.
+            if let Ok(new_snap) = snap_result {
+                let result = check_tree_complete(&store, &new_snap.0);
+                result.assert_ok();
+            }
+        });
+    })
+    .join()
+    .expect("buggify test thread panicked");
+}

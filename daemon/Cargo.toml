@@ -47,6 +47,9 @@ tracing.workspace = true
 tempfile = "3.14.0"
 zstd.workspace = true
 
+[features]
+fault-injection = []
+
 [dev-dependencies]
 assert_matches = "1.5.0"
 proptest = "1"

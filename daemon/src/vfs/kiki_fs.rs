@@ -37,6 +37,7 @@ use jj_lib::gitignore::GitIgnoreFile;
 use parking_lot::Mutex;
 
 use crate::{
+    fi::buggify,
     git_store::{GitContentStore, GitEntryKind, GitTreeEntry},
     remote::{
         RemoteStore,
@@ -1005,6 +1006,16 @@ impl KikiFs {
                         id: child_content_id.0.to_vec(),
                     });
                 }
+                // BUGGIFY(snapshot-tree-write): Inject failure after children
+                // are committed but before the parent tree is written. Tests
+                // that orphaned child objects don't corrupt subsequent ops.
+                if buggify!(50) {
+                    return Err(FsError::StoreError(
+                        "[BUGGIFY] simulated write_tree failure after children committed"
+                            .to_string(),
+                    ));
+                }
+
                 let id_bytes = self.store.write_tree(&entries).map_err(store_err)?;
                 let id = Id(id_bytes
                     .as_slice()

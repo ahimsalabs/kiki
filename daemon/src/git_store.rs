@@ -194,6 +194,17 @@ impl GitContentStore {
     // ---- Content reads (concurrent, bypasses GitBackend mutex) ----
 
     /// Read a file blob from the git ODB. Returns the raw file content.
+    /// Cheap existence check: does an object with this ID exist in the
+    /// git ODB? Does not read or validate the object content.
+    pub fn has_object(&self, id: &[u8]) -> Result<bool> {
+        let oid = match gix::ObjectId::try_from(id) {
+            Ok(oid) => oid,
+            Err(_) => return Err(anyhow!("invalid git object id ({} bytes)", id.len())),
+        };
+        let repo = self.git_backend.git_repo();
+        Ok(repo.objects.exists(&oid))
+    }
+
     pub fn read_file(&self, id: &[u8]) -> Result<Option<Vec<u8>>> {
         let oid = match gix::ObjectId::try_from(id) {
             Ok(oid) => oid,

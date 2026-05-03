@@ -16,6 +16,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 use super::{BlobKind, RemoteStore};
+use crate::fi::buggify;
 use crate::git_store::{GitContentStore, GitObjectKind};
 
 /// Why a read-through fetch failed.
@@ -103,6 +104,17 @@ pub async fn fetch_git_object(
         source: anyhow!("BlobKind::{kind} is not a git object"),
     })?;
     let bytes = fetch_bytes(remote, kind, requested_id).await?;
+
+    // BUGGIFY(fetch-local-write): Inject failure after successful remote
+    // fetch but before local ODB write. Tests that the VFS correctly
+    // retries a failed fetch on next read (no stale cache entry).
+    if buggify!(50) {
+        return Err(FetchError::LocalWrite {
+            kind,
+            source: anyhow!("[BUGGIFY] simulated local write failure after fetch"),
+        });
+    }
+
     let got_id = store
         .write_git_object_bytes(git_kind, &bytes)
         .map_err(|source| FetchError::LocalWrite { kind, source })?;

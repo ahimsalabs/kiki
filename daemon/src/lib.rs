@@ -18,6 +18,8 @@ use crate::vfs::RootFs;
 use crate::vfs::root_fs::{WorkspaceRegistration, WorkspaceState as RootFsWorkspaceState};
 use crate::vfs_mgr::*;
 
+pub mod check;
+pub mod fi;
 pub mod git_ops;
 pub mod git_store;
 pub mod hash;
@@ -231,6 +233,9 @@ fn unmount_nfs(path: &std::path::Path) {
 ///
 /// Entry point for `kiki kk daemon run`.
 pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
+    // Initialize fault injection from environment (no-op without feature).
+    fi::init_from_env();
+
     info!("Starting daemon with configuration: {config:#?}");
 
     // Ensure runtime directory exists.
