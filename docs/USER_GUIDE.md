@@ -4,9 +4,9 @@ kiki is an experimental remote backend for [jj](https://jj-vcs.github.io/jj/late
 It serves the working copy as a virtual filesystem (FUSE on Linux, NFS on macOS)
 backed by a daemon that handles storage, caching, and remote synchronization.
 
-> **Status:** experimental. The core workflow (init, edit, commit, sync between
-> peers) works end-to-end on Linux. macOS support is present but less tested.
-> Not yet suitable for production repositories.
+> **Status:** experimental. The core workflow (clone, edit, commit, sync between
+> peers, multiple workspaces) works end-to-end on Linux. macOS support is present
+> but less tested. Not yet suitable for production repositories.
 
 ## Architecture overview
 
@@ -14,16 +14,18 @@ backed by a daemon that handles storage, caching, and remote synchronization.
 graph LR
     CLI["kiki<br/>(jj superset)"] -- "gRPC (UDS)" --> Daemon
     Daemon -- "dir:// / s3:// / ssh:// / kiki://" --> Remote["Remote Store"]
-    Daemon -- mount --> VFS["Working copy<br/>(FUSE / NFS)"]
+    Daemon -- "single FUSE mount" --> VFS["/mnt/kiki/<br/>repo/workspace/"]
 ```
 
 - **kiki** (`kiki`): A jj superset binary that talks to the local daemon over
   a Unix domain socket. Stores no persistent data itself. All standard jj
   commands (`kiki log`, `kiki new`, `kiki describe`, `kiki diff`, etc.) work
-  normally. The `kk` subcommand provides kiki-specific operations.
+  normally. Top-level commands handle repo and workspace lifecycle (`kiki clone`,
+  `kiki workspace`). The `kk` subcommand provides other kiki-specific operations.
 - **Daemon**: Long-lived process on the local machine, auto-started on first
-  command. Mounts repos as virtual filesystems, manages a durable per-mount
-  store (redb), and optionally syncs blobs and operation state to a remote.
+  command. Serves a single FUSE mount at `/mnt/kiki/` containing all repos and
+  workspaces. Manages per-repo git stores (shared across workspaces), a durable
+  redb database, and optionally syncs blobs and operation state to a remote.
   No manual configuration needed.
 - **Remote** (`dir://`, `s3://`, `ssh://`, or `kiki://`): Content-addressed
   blob store with compare-and-swap mutable refs. `s3://` remotes use the AWS
@@ -35,9 +37,12 @@ graph LR
 ## Prerequisites
 
 - **Linux:** `fusermount3` (usually provided by the `fuse3` package). It ships
-  as a setuid binary on most distros, so no `sudo` is needed to mount.
+  as a setuid binary on most distros, so no `sudo` is needed to mount. One-time
+  setup for the mount root: `sudo mkdir -p /mnt/kiki && sudo chown $USER /mnt/kiki`.
 - **macOS:** `mount_nfs` (ships with macOS). No extra packages required, but
-  loopback NFS has occasional version-specific quirks.
+  loopback NFS has occasional version-specific quirks. The managed workspace
+  namespace (`/mnt/kiki/`) requires the macOS NFS RootFs adapter (not yet
+  available) — macOS currently uses per-workspace NFS mounts via `kk init`.
 - **Rust toolchain:** edition 2024 (nightly or stable 1.85+).
 - **jj** 0.40.x (jj-lib 0.40 is the pinned dependency).
 
@@ -77,6 +82,11 @@ For power users, `~/.config/kiki/config.toml` can override defaults:
 ```toml
 # All fields are optional.
 
+# Mount root for the managed workspace namespace.
+# Default: /mnt/kiki
+# Requires one-time setup: sudo mkdir -p /mnt/kiki && sudo chown $USER /mnt/kiki
+# mount_root = "/mnt/kiki"
+
 # TCP listener for daemon-to-daemon remote access (kiki:// scheme).
 # Default: disabled.
 # grpc_addr = "[::1]:12000"
@@ -99,15 +109,16 @@ For power users, `~/.config/kiki/config.toml` can override defaults:
 
 ## Getting started
 
-### 1. Initialize a repository
+### 1. Clone a repository
 
 The daemon starts automatically on your first command — no manual setup.
+A single FUSE mount at `/mnt/kiki/` serves all repos and workspaces.
 
 ```bash
-kiki kk init <remote> [destination]
+kiki clone <url> [--name <name>]
 ```
 
-**`<remote>`** is the remote store URL. Supported schemes:
+**`<url>`** is the remote store URL. Supported schemes:
 
 | Scheme    | Example                          | Description |
 |-----------|----------------------------------|-------------|
@@ -116,39 +127,88 @@ kiki kk init <remote> [destination]
 | `ssh://`  | `ssh://user@host/data/store`     | SSH transport. Needs only the `kiki` binary on the server. The local daemon manages a persistent SSH tunnel. |
 | `kiki://` | `kiki://myserver:12000`          | Another kiki daemon's gRPC endpoint. Enables peer-to-peer sync (e.g., over Tailscale). |
 | `grpc://` | `grpc://[::1]:12000`             | Alias for `kiki://`. |
-| (empty)   | `""`                             | No remote. Local-only operation with redb-backed storage. |
 
-**`[destination]`** is the directory to create the repo in (default: `.`).
+**`--name`** overrides the repo name (default: derived from the URL's last
+path component). The repo name becomes a directory under `/mnt/kiki/`.
 
 Examples:
 
 ```bash
-# Local-only repo (no remote)
-kiki kk init "" my-project
+# Clone from a filesystem remote
+kiki clone "dir:///shared/kiki-store"
+cd /mnt/kiki/kiki-store/default
 
-# Repo backed by a filesystem remote
-kiki kk init "dir:///shared/kiki-store" my-project
+# Clone from S3
+kiki clone "s3://my-bucket/repos/my-project"
+cd /mnt/kiki/my-project/default
 
-# Repo backed by S3
-kiki kk init "s3://my-bucket/repos/my-project" my-project
+# Clone over SSH
+kiki clone "ssh://user@myserver/data/myproject"
+cd /mnt/kiki/myproject/default
 
-# Repo syncing over SSH (no daemon needed on the server)
-kiki kk init "ssh://user@myserver/data/kiki-store" my-project
+# Clone with a custom name
+kiki clone "ssh://user@myserver/data/myproject" --name mp
+cd /mnt/kiki/mp/default
 
-# Repo syncing to another daemon (e.g., over Tailscale)
-kiki kk init "kiki://myserver:12000" my-project
+# Clone from another daemon (e.g., over Tailscale)
+kiki clone "kiki://myserver:12000" --name myproject
+cd /mnt/kiki/myproject/default
 ```
 
-On Linux, `kiki kk init` tells the daemon to FUSE-mount the working copy at the
-destination directory. On macOS, the CLI shells out to `mount_nfs` after the
-daemon sets up the NFS server.
+Each clone creates a `default` workspace. The workspace appears immediately
+at `/mnt/kiki/<name>/default/`.
+
+### 2. Create workspaces
+
+Workspaces are lightweight — they share the repo's git object store and
+only track their own checkout pointer and dirty state. Creating a workspace
+is instant.
+
+```bash
+kiki workspace create <repo>/<workspace> [--revision <rev>]
+```
+
+Examples:
+
+```bash
+# Create a workspace for a feature branch
+kiki workspace create myproject/fix-auth
+cd /mnt/kiki/myproject/fix-auth
+
+# Create a workspace at a specific revision
+kiki workspace create myproject/review --revision @--
+
+# List workspaces
+kiki workspace list myproject
+
+# Delete a workspace
+kiki workspace delete myproject/fix-auth
+```
+
+The default checkout target is the parents of the source workspace's
+working-copy commit (matching `jj workspace add` behavior). Use
+`--revision` to override.
+
+### Ad-hoc mounts (legacy)
+
+The `kiki kk init` command remains available for one-off mounts outside
+the managed namespace:
+
+```bash
+kiki kk init <remote> [destination]
+```
+
+This creates a standalone mount at `destination` (default: `.`) without
+registering it in the `/mnt/kiki/` namespace. Useful for testing or
+when you need a mount at a specific path. See [Ad-hoc mounts](#ad-hoc-mounts)
+for details.
 
 ### 3. Use standard jj commands
 
-Once initialized, all standard jj commands work via the `kiki` binary:
+Once cloned, all standard jj commands work via the `kiki` binary:
 
 ```bash
-cd my-project
+cd /mnt/kiki/myproject/default
 
 # Create files (writes go through the VFS to the daemon)
 mkdir src
@@ -180,6 +240,10 @@ The daemon snapshots the working copy automatically on each kiki command, just
 like regular jj. The difference is that snapshots happen in the daemon's
 in-memory inode slab and persist to the redb store, rather than scanning the
 filesystem.
+
+Commands work in any workspace — `cd /mnt/kiki/myproject/fix-auth` and run
+`kiki log` to see the same repo's history from a different working-copy
+commit.
 
 ### 4. Daemon management
 
@@ -219,10 +283,12 @@ This means:
 
 ```bash
 # Machine A
-kiki kk init "dir:///shared/remote" project
+kiki clone "dir:///shared/remote" --name project
+cd /mnt/kiki/project/default
 
 # Machine B
-kiki kk init "dir:///shared/remote" project
+kiki clone "dir:///shared/remote" --name project
+cd /mnt/kiki/project/default
 
 # Both machines see each other's commits and operations
 ```
@@ -251,10 +317,12 @@ reads/writes the shared store directory directly:
 
 ```bash
 # Machine A
-kiki kk init "ssh://user@server/data/remote" project
+kiki clone "ssh://user@server/data/myproject"
+cd /mnt/kiki/myproject/default
 
 # Machine B
-kiki kk init "ssh://user@server/data/remote" project
+kiki clone "ssh://user@server/data/myproject"
+cd /mnt/kiki/myproject/default
 
 # Both machines see each other's commits and operations
 ```
@@ -270,7 +338,8 @@ as the remote for another. Use `kiki://` (or the `grpc://` alias). Requires
 #   grpc_addr = "0.0.0.0:12000"
 
 # Machine B: use Machine A as the remote (e.g., over Tailscale)
-kiki kk init "kiki://machine-a:12000" project
+kiki clone "kiki://machine-a:12000" --name project
+cd /mnt/kiki/project/default
 ```
 
 ## Working with GitHub
@@ -282,9 +351,9 @@ standard git protocol.
 ### Setup
 
 ```bash
-# Initialize a local repo
-kiki kk init "" my-project
-cd my-project
+# Clone a local repo (no kiki remote)
+kiki clone "dir:///tmp/my-project-store" --name my-project
+cd /mnt/kiki/my-project/default
 
 # Create a GitHub repo (or use an existing one)
 # Then add it as a remote:
@@ -331,8 +400,8 @@ Use an `ssh://` URL to sync with a remote machine. Only the `kiki` binary
 needs to be on the server.
 
 ```bash
-kiki kk init ssh://user@my-server/data/myproject ~/work/myproject
-cd ~/work/myproject
+kiki clone ssh://user@my-server/data/myproject
+cd /mnt/kiki/myproject/default
 
 # Work normally — syncs to the server over SSH
 kiki new -m "fix bug"
@@ -344,7 +413,7 @@ through the shared store on the server.
 
 ### How it works
 
-On `kiki kk init ssh://...`, the local daemon:
+On `kiki clone ssh://...`, the local daemon:
 
 1. **Discovers** the remote socket: `ssh user@host kiki kk daemon socket-path`
 2. **Starts** the remote daemon if not running: `ssh user@host kiki kk daemon run --managed`
@@ -382,8 +451,9 @@ daemons sharing the same remote serialize ref updates via compare-and-swap.
   lazy VFS this is less important than for on-disk working copies.
 - **Daemon restart drops kernel file handles.** The inode slab is in-memory;
   applications with open file descriptors across a daemon restart will see
-  ESTALE. Mount state and store data are preserved (redb), so re-running
-  commands after restart works fine.
+  ESTALE. Repo and workspace metadata are preserved (`repos.toml`,
+  `workspace.toml`), so the daemon re-creates the namespace and lazily
+  re-hydrates workspaces on restart.
 - **Synchronous remote push.** `Snapshot` blocks until all new blobs land on
   the remote. Fine for localhost and `dir://`; will need an async push queue
   for higher-latency network remotes.
@@ -397,20 +467,25 @@ If `KIKI_SOCKET_PATH` is set, the CLI won't auto-start the daemon.
 Check with `kiki kk daemon status`. Otherwise the daemon auto-starts —
 check `kiki kk daemon logs` for errors.
 
-**"mount failed" / FUSE errors on init**
-Check that `fusermount3` is installed and setuid. On most Linux distros:
+**"mount failed" / FUSE errors on clone**
+Check that `fusermount3` is installed and setuid, and that the mount root
+exists with correct ownership:
 ```bash
 which fusermount3
 ls -la $(which fusermount3)  # should show the setuid bit
+ls -ld /mnt/kiki             # should be owned by your user
+# If missing:
+sudo mkdir -p /mnt/kiki && sudo chown $USER /mnt/kiki
 ```
 
 **Stale mount after daemon crash**
 If the daemon crashes and leaves a stale FUSE mount, unmount it manually:
 ```bash
-fusermount3 -u /path/to/repo
+fusermount3 -u /mnt/kiki
 ```
-Then restart the daemon (`kiki kk daemon run`). It rehydrates persisted
-mounts on startup.
+Then restart the daemon (`kiki kk daemon run`). It re-reads `repos.toml`
+and workspace metadata, re-binds the FUSE mount, and lazily hydrates
+workspaces on first access.
 
 **Verbose logging**
 ```bash

@@ -4,8 +4,8 @@ A virtual filesystem for your repos. Built on
 [jj](https://jj-vcs.github.io/jj/latest/), stored as git.
 
 ```bash
-kiki kk init ssh://devbox/repos/myproject ~/work/myproject
-cd ~/work/myproject
+kiki clone ssh://devbox/repos/myproject
+cd /mnt/kiki/myproject/default
 vim src/main.rs       # files appear on read, sync on write
 ```
 
@@ -14,9 +14,11 @@ vim src/main.rs       # files appear on read, sync on write
 
 ## What is this
 
-A daemon serves your repo as a mount point — FUSE on Linux, NFS
-on macOS. Files are fetched lazily on read and synced to a remote
-store in the background. No checkout step, no full clone.
+A daemon serves your repos through a single mount at `/mnt/kiki/`.
+Each repo gets lightweight workspaces — files are fetched lazily on
+read and synced to a remote store in the background. No checkout
+step, no full clone. Multiple workspaces share a single git object
+store, so creating a new workspace is instant.
 
 Same idea as Google's
 [CitC](https://abseil.io/resources/swe-book/html/ch16.html#clients_in_the_cloud_citc)
@@ -27,7 +29,8 @@ but built on jj and open source.
 ## jj superset
 
 The `kiki` binary wraps `jj` — every jj command works unchanged.
-kiki adds a daemon, a virtual filesystem layer, and remote sync.
+kiki adds a daemon, a virtual filesystem layer, remote sync, and
+managed workspaces.
 
 ```bash
 kiki log                        # this is jj log
@@ -35,8 +38,18 @@ kiki new -m "add feature"       # this is jj new
 kiki describe -m "fix auth bug" # this is jj describe
 ```
 
-The `kk` subcommand handles kiki-specific operations that would
-collide with jj builtins (`kk init`, `kk status`, `kk daemon`).
+Top-level kiki commands handle repo and workspace lifecycle:
+
+```bash
+kiki clone ssh://server/repo    # clone into /mnt/kiki/repo/default
+kiki workspace create repo/fix  # new workspace at /mnt/kiki/repo/fix
+kiki workspace list repo        # list workspaces
+kiki workspace delete repo/fix  # remove a workspace
+```
+
+The `kk` subcommand handles other kiki-specific operations
+(`kk status`, `kk daemon`). `kk init` remains available for
+ad-hoc mounts outside the managed namespace.
 
 ## Git-native storage
 
@@ -59,26 +72,28 @@ kiki (CLI)
   │  gRPC over Unix socket
   ▼
 daemon
-  ├─ GitBackend    bare git repo (content store)
+  ├─ RootFs        /mnt/kiki/<repo>/<workspace>/ namespace
+  ├─ GitBackend    bare git repo (content store, shared per repo)
   ├─ RemoteStore   dir:// · s3:// · ssh:// · kiki:// (grpc)
   └─ VFS           FUSE (Linux) · NFS (macOS)
 ```
 
 The daemon auto-starts on first command and runs in the
-background. It manages the mount, the local object cache, and
-background sync. `kiki kk daemon status` shows what's running.
+background. A single FUSE mount at `/mnt/kiki/` serves all repos
+and workspaces. `kiki kk daemon status` shows what's running.
 
 ## Status
 
 **Working:** read/write/snapshot, FUSE and NFS mounts, background
 sync, multi-machine sharing via `dir://` / `s3://` / `ssh://` / `kiki://`,
-git push and fetch to GitHub/GitLab, operation log sharing.
+git push and fetch to GitHub/GitLab, operation log sharing,
+`.gitignore`-aware VFS, daemon lifecycle.
 
-**In progress:** `.gitignore`-aware VFS, async offline push queue,
-daemon lifecycle (launchd/systemd auto-start).
+**In progress:** [managed workspaces](./docs/M12-WORKSPACES.md)
+(`kiki clone`, `kiki workspace`, single-mount RootFs namespace),
+async offline push queue.
 
-**Designed:** [managed workspaces](./docs/WORKSPACES.md),
-[code review](./docs/REVIEW.md),
+**Designed:** [code review](./docs/REVIEW.md),
 [auth](./docs/AUTH.md),
 [ref protection](./docs/REF_PROTECTION.md).
 
