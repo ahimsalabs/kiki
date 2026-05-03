@@ -22,6 +22,7 @@ mod inode;
 #[cfg(any(target_os = "macos", test))]
 pub mod nfs_adapter;
 mod kiki_fs;
+pub mod root_fs;
 #[cfg(test)]
 mod sim_tests;
 
@@ -40,6 +41,7 @@ pub use inode::ROOT_INODE;
 #[cfg(target_os = "macos")]
 pub use nfs_adapter::NfsAdapter;
 pub use kiki_fs::{FsError, JjKikiFs, KikiFs};
+pub use root_fs::RootFs;
 // `FileKind` is consumed only by tests today (the M10 §10.6 service-
 // level read-through tests that walk a `readdir` result for a kind
 // assertion). Re-exported under `cfg(test)` so production builds

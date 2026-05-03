@@ -80,6 +80,8 @@ fn fs_err_to_errno(e: FsError) -> Errno {
         FsError::NotASymlink => libc::EINVAL,
         FsError::AlreadyExists => libc::EEXIST,
         FsError::NotEmpty => libc::ENOTEMPTY,
+        FsError::PermissionDenied => libc::EACCES,
+        FsError::CrossDevice => libc::EXDEV,
         FsError::StoreMiss | FsError::StoreError(_) => libc::EIO,
     };
     raw.into()

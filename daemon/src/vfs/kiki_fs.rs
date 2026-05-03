@@ -121,6 +121,12 @@ pub enum FsError {
     AlreadyExists,
     /// `rmdir` on a directory that still has children.
     NotEmpty,
+    /// Operation not permitted on this target (e.g. mutation of a
+    /// RootFs synthetic directory). Maps to EACCES / NFS3ERR_ACCES.
+    PermissionDenied,
+    /// Rename across mount/workspace boundaries. Maps to EXDEV /
+    /// NFS3ERR_XDEV.
+    CrossDevice,
     /// A tree, file, or symlink id present in an inode is missing from
     /// the store. With the GitContentStore this only happens after a
     /// check_out into a tree whose blobs aren't reachable — either a
@@ -142,6 +148,8 @@ impl std::fmt::Display for FsError {
             FsError::NotASymlink => f.write_str("not a symlink"),
             FsError::AlreadyExists => f.write_str("entry already exists"),
             FsError::NotEmpty => f.write_str("directory not empty"),
+            FsError::PermissionDenied => f.write_str("permission denied"),
+            FsError::CrossDevice => f.write_str("cross-device operation"),
             FsError::StoreMiss => f.write_str("missing entry in content store"),
             FsError::StoreError(msg) => write!(f, "store error: {msg}"),
         }

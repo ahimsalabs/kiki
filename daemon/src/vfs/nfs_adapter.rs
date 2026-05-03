@@ -54,6 +54,8 @@ fn fs_err_to_nfs(e: FsError) -> nfsstat3 {
         FsError::NotASymlink => nfsstat3::NFS3ERR_INVAL,
         FsError::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
         FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
+        FsError::PermissionDenied => nfsstat3::NFS3ERR_ACCES,
+        FsError::CrossDevice => nfsstat3::NFS3ERR_XDEV,
         FsError::StoreMiss | FsError::StoreError(_) => nfsstat3::NFS3ERR_IO,
     }
 }
