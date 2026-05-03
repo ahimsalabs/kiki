@@ -1782,9 +1782,11 @@ async fn run_workspace_command(
 
 /// `kiki workspace create [repo/]<workspace>`
 ///
-/// 1. WorkspaceCreate RPC (daemon allocates slot, pending state)
-/// 2. jj workspace init at the returned path
-/// 3. WorkspaceFinalize RPC (transition to active)
+/// 1. Load source workspace to get @- parents (for sibling WC commit)
+/// 2. WorkspaceCreate RPC (daemon allocates slot, pending state)
+/// 3. jj workspace init at the returned path
+/// 4. Create sibling WC commit parented at source's @-
+/// 5. WorkspaceFinalize RPC (transition to active)
 async fn run_workspace_create(
     ui: &mut Ui,
     command_helper: &CommandHelper,
@@ -1793,7 +1795,34 @@ async fn run_workspace_create(
 ) -> Result<(), CommandError> {
     let (repo, workspace) = parse_workspace_spec(&args.name, command_helper)?;
 
-    // Step 1: WorkspaceCreate RPC (pending state).
+    // Step 1: Load source workspace to determine @- parents.
+    //
+    // Like `jj workspace add`, the new workspace's WC commit should be a
+    // sibling of the source workspace's WC commit (both parented at @-).
+    // If we're not inside a workspace, fall back to root commit (empty tree).
+    let source_parent_ids: Vec<jj_lib::backend::CommitId> =
+        if let Ok(source_ws) = command_helper.workspace_helper(ui) {
+            let source_repo = source_ws.repo();
+            let wc_commit_id = source_repo
+                .view()
+                .get_wc_commit_id(source_ws.workspace_name());
+            if let Some(wc_id) = wc_commit_id {
+                let wc_commit = source_repo.store().get_commit(wc_id)?;
+                wc_commit
+                    .parents()
+                    .await?
+                    .iter()
+                    .map(|c| c.id().clone())
+                    .collect()
+            } else {
+                vec![source_repo.store().root_commit().id().clone()]
+            }
+        } else {
+            // Not inside a workspace — use root commit as fallback.
+            vec![]
+        };
+
+    // Step 2: WorkspaceCreate RPC (pending state).
     let reply = client
         .workspace_create(proto::jj_interface::WorkspaceCreateReq {
             repo: repo.clone(),
@@ -1805,7 +1834,7 @@ async fn run_workspace_create(
     let wc_path = std::path::PathBuf::from(&reply.workspace_path);
     let wc_path_str = &reply.workspace_path;
 
-    // Step 2: jj workspace init at the managed path.
+    // Step 3: jj workspace init at the managed path.
     // Same factory setup as clone, but using a workspace-specific name.
     let wc_path_for_op_heads = wc_path_str.to_string();
     let kiki_op_heads_initializer = move |settings: &jj_lib::settings::UserSettings,
@@ -1866,16 +1895,72 @@ async fn run_workspace_create(
 
     // If jj init fails, the workspace stays in pending state. The daemon
     // will clean it up on restart or the user can `kiki workspace delete`.
-    if let Err(e) = init_result {
-        // Best-effort cleanup: delete the pending workspace.
-        let _ = client.workspace_delete(proto::jj_interface::WorkspaceDeleteReq {
-            repo: repo.clone(),
-            workspace: workspace.clone(),
-        });
-        return Err(e.into());
+    let (new_workspace, new_repo) = match init_result {
+        Ok(result) => result,
+        Err(e) => {
+            // Best-effort cleanup: delete the pending workspace.
+            let _ = client.workspace_delete(proto::jj_interface::WorkspaceDeleteReq {
+                repo: repo.clone(),
+                workspace: workspace.clone(),
+            });
+            return Err(e.into());
+        }
+    };
+
+    // Step 4: Create sibling WC commit parented at source's @-.
+    //
+    // init_with_factories created a WC commit parented at the root commit
+    // (empty tree). Replace it with one parented at the source workspace's
+    // @- so the two workspaces are siblings (matching `jj workspace add`).
+    if !source_parent_ids.is_empty() {
+        let store = new_repo.store().clone();
+        // Fetch parent commits from the shared store (KikiBackend routes
+        // through the daemon's shared git repo).
+        let mut parent_commits = Vec::with_capacity(source_parent_ids.len());
+        for id in &source_parent_ids {
+            parent_commits.push(store.get_commit(id)?);
+        }
+        let tree =
+            jj_lib::rewrite::merge_commit_trees(new_repo.as_ref(), &parent_commits).await?;
+
+        let mut tx = new_repo.start_transaction();
+        let new_wc_commit = tx
+            .repo_mut()
+            .new_commit(source_parent_ids, tree)
+            .write()
+            .await
+            .map_err(|e| {
+                internal_error_with_message("failed to create workspace WC commit", e)
+            })?;
+        tx.repo_mut()
+            .edit(ws_name.to_owned(), &new_wc_commit)
+            .await
+            .map_err(|e| {
+                internal_error_with_message("failed to edit workspace WC commit", e)
+            })?;
+        // edit() abandons the old root-parented WC commit, which records
+        // a rewrite. Rebase descendants before committing.
+        tx.repo_mut().rebase_descendants().await.map_err(|e| {
+            internal_error_with_message("failed to rebase descendants", e)
+        })?;
+        let new_repo = tx
+            .commit("create initial working-copy commit")
+            .await
+            .map_err(|e| {
+                internal_error_with_message("failed to commit workspace transaction", e)
+            })?;
+
+        // Check out the parent tree via the working copy so the daemon's
+        // VFS serves the correct files immediately.
+        let mut locked_wc = new_workspace.working_copy().start_mutation()?;
+        locked_wc.check_out(&new_wc_commit).await.map_err(|e| {
+            internal_error_with_message("failed to check out workspace tree", e)
+        })?;
+        let op_id = new_repo.operation().id().clone();
+        locked_wc.finish(op_id).await?;
     }
 
-    // Step 3: Finalize — transition from pending to active.
+    // Step 5: Finalize — transition from pending to active.
     client
         .workspace_finalize(proto::jj_interface::WorkspaceFinalizeReq {
             repo: repo.clone(),
