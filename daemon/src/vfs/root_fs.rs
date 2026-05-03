@@ -537,6 +537,30 @@ impl RootFs {
         inner.repos.get(repo).map(|r| r.remote_store.clone())
     }
 
+    /// Get the kiki remote URL for a repo. `None` = repo not found.
+    pub fn repo_url(&self, repo: &str) -> Option<String> {
+        let inner = self.inner.lock();
+        inner.repos.get(repo).map(|r| r.url.clone())
+    }
+
+    /// Set or clear the kiki remote store and URL on an existing repo.
+    /// Returns `false` if the repo is not registered.
+    pub fn set_repo_remote(
+        &self,
+        repo: &str,
+        url: String,
+        remote_store: Option<Arc<dyn RemoteStore>>,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        if let Some(entry) = inner.repos.get_mut(repo) {
+            entry.url = url;
+            entry.remote_store = remote_store;
+            true
+        } else {
+            false
+        }
+    }
+
     // ── Internal ────────────────────────────────────────────────
 
     /// Hydrate a workspace (phase 2, no lock held). Creates a `KikiFs`

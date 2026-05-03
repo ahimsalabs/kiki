@@ -226,6 +226,12 @@ service JujutsuInterface {
   // Optionally attaches a kiki remote for real-time sync.
   rpc GitClone(GitCloneReq) returns (GitCloneReply) {}
 
+  // M13 — kiki-native remote management (§M13-GIT-CLONE.md §kiki remote).
+  // Each repo has zero-or-one kiki remote for full-fidelity sync.
+  rpc RemoteAdd(RemoteAddReq) returns (RemoteAddReply) {}
+  rpc RemoteRemove(RemoteRemoveReq) returns (RemoteRemoveReply) {}
+  rpc RemoteShow(RemoteShowReq) returns (RemoteShowReply) {}
+
   // Detect external git HEAD changes. Returns the current HEAD from
   // the bare git repo if it differs from the last daemon-exported HEAD.
   // Used by the CLI to import `git commit` results before snapshot.
@@ -683,4 +689,29 @@ message GitCloneReply {
   repeated GitFetchedBookmark bookmarks = 2;
   // Default branch name (e.g. "main", "master").
   string default_branch = 3;
+}
+
+// ── M13 — kiki remote management ─────────────────────────────────
+
+message RemoteAddReq {
+  // Repo name in the managed namespace.
+  string repo = 1;
+  // Kiki remote URL (s3://..., kiki://..., kiki+ssh://..., dir://...).
+  string url = 2;
+}
+message RemoteAddReply {}
+
+message RemoteRemoveReq {
+  // Repo name.
+  string repo = 1;
+}
+message RemoteRemoveReply {}
+
+message RemoteShowReq {
+  // Repo name.
+  string repo = 1;
+}
+message RemoteShowReply {
+  // Current kiki remote URL. Empty = no kiki remote attached.
+  string url = 1;
 }

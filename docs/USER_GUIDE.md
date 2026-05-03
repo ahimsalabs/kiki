@@ -431,6 +431,35 @@ cd my-project
 
 You fetch their work into your kiki workspace with `kiki git fetch`.
 
+## Managing the kiki remote
+
+Each repo can have zero or one kiki-native remote — a full-fidelity sync
+channel that carries git objects, jj operations, change-ids, predecessors,
+and workspace state.
+
+```bash
+# Show the current kiki remote (or "(none)")
+kiki remote show
+
+# Attach a kiki remote to an existing repo
+kiki remote add s3://team-bucket/myproject
+
+# Remove the kiki remote (repo continues to work local-only)
+kiki remote remove
+```
+
+Run these from inside a managed workspace (`/mnt/kiki/<repo>/<workspace>/`);
+the repo is inferred from cwd.
+
+When you attach a kiki remote (`kiki remote add`), the daemon:
+1. Validates connectivity by pushing the empty tree
+2. Replicates your git remote configuration (origin, etc.) to the kiki remote
+3. Subsequent writes flow through to the remote automatically
+
+When someone else clones from your kiki remote, they inherit the git remote
+configuration — so `kiki git remote list` shows the same origins without
+manual setup.
+
 ## Syncing over SSH
 
 Use a `kiki+ssh://` URL to sync with a remote machine. Only the `kiki` binary

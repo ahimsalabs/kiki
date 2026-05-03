@@ -45,6 +45,8 @@ kiki clone git@github.com:org/repo.git  # clone into /mnt/kiki/repo/default
 kiki workspace create repo/fix  # new workspace at /mnt/kiki/repo/fix
 kiki workspace list repo        # list workspaces
 kiki workspace delete repo/fix  # remove a workspace
+kiki remote add s3://bucket/repo  # attach a kiki remote for team sync
+kiki remote show                  # show current kiki remote
 ```
 
 The `kk` subcommand handles other kiki-specific operations

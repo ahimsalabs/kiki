@@ -346,6 +346,35 @@ impl BlockingJujutsuInterfaceClient {
         rt.block_on(client.git_clone(request))
     }
 
+    // ---- M13: kiki remote management ----------------------------------
+
+    pub fn remote_add(
+        &self,
+        request: impl tonic::IntoRequest<RemoteAddReq>,
+    ) -> Result<tonic::Response<RemoteAddReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.remote_add(request))
+    }
+
+    pub fn remote_remove(
+        &self,
+        request: impl tonic::IntoRequest<RemoteRemoveReq>,
+    ) -> Result<tonic::Response<RemoteRemoveReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.remote_remove(request))
+    }
+
+    pub fn remote_show(
+        &self,
+        request: impl tonic::IntoRequest<RemoteShowReq>,
+    ) -> Result<tonic::Response<RemoteShowReply>, tonic::Status> {
+        let mut client = self.client.lock().unwrap();
+        let rt = self.rt.lock().unwrap();
+        rt.block_on(client.remote_show(request))
+    }
+
     // ---- M12: managed-workspace RPCs ---------------------------------
 
     /// Calls the proto `Clone` RPC. Named `clone_repo` to avoid

@@ -90,14 +90,12 @@ pub struct NfsConfigToml {
 #[allow(dead_code)]
 pub fn configured_mount_root() -> std::path::PathBuf {
     let config_path = store::paths::config_path();
-    if config_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&config_path) {
-            if let Ok(cfg) = toml::from_str::<KikiConfig>(&contents) {
-                if let Some(root) = cfg.mount_root {
-                    return root;
-                }
-            }
-        }
+    if config_path.exists()
+        && let Ok(contents) = std::fs::read_to_string(&config_path)
+        && let Ok(cfg) = toml::from_str::<KikiConfig>(&contents)
+        && let Some(root) = cfg.mount_root
+    {
+        return root;
     }
     store::paths::default_mount_root()
 }

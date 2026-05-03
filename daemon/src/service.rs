@@ -646,7 +646,7 @@ impl JujutsuService {
     ///
     /// Used by existing RPCs once they route through RootFs (next commit)
     /// and by tests now.
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::result_large_err)]
     fn resolve_workspace(&self, working_copy_path: &str) -> Result<(String, String), Status> {
         let mount_root = self.mount_root.as_ref().ok_or_else(|| {
             Status::failed_precondition("managed workspaces not configured")
@@ -672,6 +672,7 @@ impl JujutsuService {
     }
 
     /// Get the `RootFs` or return an error.
+    #[allow(clippy::result_large_err)]
     fn require_root_fs(&self) -> Result<&Arc<RootFs>, Status> {
         self.root_fs.as_ref().ok_or_else(|| {
             Status::failed_precondition("managed workspaces not configured")
@@ -679,6 +680,7 @@ impl JujutsuService {
     }
 
     /// Construct the full workspace path: `<mount_root>/<repo>/<workspace>`.
+    #[allow(clippy::result_large_err)]
     fn workspace_path(&self, repo: &str, ws: &str) -> Result<String, Status> {
         let mount_root = self.mount_root.as_ref().ok_or_else(|| {
             Status::failed_precondition("managed workspaces not configured")
@@ -2077,14 +2079,41 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         request: Request<GitRemoteAddReq>,
     ) -> Result<Response<GitRemoteAddReply>, Status> {
         let req = request.into_inner();
-        let store = store_for(&self.mounts, &req.working_copy_path).await?;
+        let (store, remote) = mount_handles(&self.mounts, &req.working_copy_path).await?;
         let git_path = store.git_repo_path().to_path_buf();
+        let git_path_for_metadata = git_path.clone();
         tokio::task::spawn_blocking(move || {
             crate::git_ops::remote_add(&git_path, &req.name, &req.url)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
         .map_err(|e| Status::internal(format!("git remote add: {e:#}")))?;
+
+        // If a kiki remote is attached, update git remote metadata (M13).
+        if let Some(ref rs) = remote {
+            let metadata_bytes =
+                tokio::task::spawn_blocking(move || {
+                    crate::git_ops::collect_git_remotes_metadata(&git_path_for_metadata)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+                .map_err(|e| Status::internal(format!("collecting git remotes: {e:#}")))?;
+            // Best-effort: update the ref (overwrite any previous value).
+            let new_val = bytes::Bytes::from(metadata_bytes);
+            let current = rs
+                .get_ref(crate::git_ops::GIT_REMOTES_REF)
+                .await
+                .ok()
+                .flatten();
+            let _ = rs
+                .cas_ref(
+                    crate::git_ops::GIT_REMOTES_REF,
+                    current.as_ref(),
+                    Some(&new_val),
+                )
+                .await;
+        }
+
         Ok(Response::new(GitRemoteAddReply {}))
     }
 
@@ -2305,6 +2334,41 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
                 (rs, None)
             };
 
+        // Seed git remotes from the kiki remote (M13 §git-remote-metadata).
+        // If the kiki remote has a `git_remotes` ref, configure those git
+        // remotes on the local bare repo so the cloner inherits the config.
+        if let Some(ref rs) = remote_store {
+            match rs.get_ref(crate::git_ops::GIT_REMOTES_REF).await {
+                Ok(Some(data)) => {
+                    let git_path = store.git_repo_path().to_path_buf();
+                    let data_vec = data.to_vec();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        let metadata = crate::git_ops::parse_git_remotes_metadata(&data_vec)?;
+                        for entry in &metadata.git_remotes {
+                            if let Err(e) =
+                                crate::git_ops::remote_add(&git_path, &entry.name, &entry.url)
+                            {
+                                tracing::warn!(
+                                    remote = %entry.name,
+                                    error = %format!("{e:#}"),
+                                    "skipping git remote seed (may already exist)"
+                                );
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+                    {
+                        tracing::warn!(error = %format!("{e:#}"), "git remote seed failed");
+                    }
+                }
+                Ok(None) => {} // No git remotes ref on the remote — nothing to seed.
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "reading git_remotes ref");
+                }
+            }
+        }
+
         // Register repo with RootFs.
         root_fs.register_repo(
             name.clone(),
@@ -2471,6 +2535,38 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             None
         };
 
+        // If a kiki remote was attached, replicate git remote metadata
+        // so subsequent kiki-native clones inherit the origin config.
+        if let Some(ref rs) = remote_store {
+            let git_path = store.git_repo_path().to_path_buf();
+            let metadata_bytes =
+                tokio::task::spawn_blocking(move || {
+                    crate::git_ops::collect_git_remotes_metadata(&git_path)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+                .map_err(|e| Status::internal(format!("collecting git remotes: {e:#}")))?;
+            if !metadata_bytes.is_empty() {
+                // Best-effort: don't fail the clone if metadata push fails.
+                let new_val = bytes::Bytes::from(metadata_bytes);
+                let current = rs
+                    .get_ref(crate::git_ops::GIT_REMOTES_REF)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Err(e) = rs
+                    .cas_ref(
+                        crate::git_ops::GIT_REMOTES_REF,
+                        current.as_ref(),
+                        Some(&new_val),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %format!("{e:#}"), "failed to push git_remotes ref");
+                }
+            }
+        }
+
         // Register repo with RootFs. Use the kiki remote URL (or empty)
         // as the repo URL — the git origin is stored in the bare git
         // repo's config.
@@ -2555,6 +2651,176 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             bookmarks: reply_bookmarks,
             default_branch: default_branch.unwrap_or_default(),
         }))
+    }
+
+    // ── M13: kiki remote management ──────────────────────────────
+
+    #[tracing::instrument(skip(self))]
+    async fn remote_add(
+        &self,
+        request: Request<RemoteAddReq>,
+    ) -> Result<Response<RemoteAddReply>, Status> {
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        // Validate repo exists.
+        let store = root_fs.repo_store(&req.repo).ok_or_else(|| {
+            Status::not_found(format!("repo {:?} not registered", req.repo))
+        })?;
+
+        // Check no kiki remote already attached.
+        if let Some(Some(_)) = root_fs.repo_remote_store(&req.repo) {
+            return Err(Status::already_exists(format!(
+                "repo {:?} already has a kiki remote; remove it first with `kiki remote remove`",
+                req.repo
+            )));
+        }
+
+        // Establish the remote store (SSH tunnel, S3, dir://, grpc, etc.).
+        let remote_store: Arc<dyn RemoteStore> =
+            if remote::parse_kiki_ssh_url(&req.url)
+                .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?
+                .is_some()
+            {
+                let tunnels_dir = self.tunnels_dir.as_deref().ok_or_else(|| {
+                    Status::internal("SSH tunnels not available in test mode")
+                })?;
+                let (rs, _tunnel) = remote::establish_ssh_remote(&req.url, tunnels_dir)
+                    .await
+                    .map_err(|e| Status::internal(format!("SSH tunnel: {e:#}")))?;
+                rs
+            } else if remote::is_s3_url(&req.url) {
+                remote::establish_s3_remote(&req.url)
+                    .await
+                    .map_err(|e| Status::internal(format!("S3 remote: {e:#}")))?
+            } else {
+                remote::parse(&req.url)
+                    .map_err(|e| Status::invalid_argument(format!("remote: {e:#}")))?
+                    .ok_or_else(|| {
+                        Status::invalid_argument("remote URL cannot be empty")
+                    })?
+            };
+
+        // Push the empty tree to validate connectivity. Full
+        // push_reachable_blobs happens per-workspace on snapshot.
+        let root_tree_id = store.empty_tree_id().as_bytes().to_vec();
+        push_git_object_if_missing(
+            &store,
+            remote_store.as_ref(),
+            BlobKind::Tree,
+            &root_tree_id,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("pushing to remote: {e:#}")))?;
+
+        // Replicate git remote metadata to the kiki remote so other
+        // cloners inherit the git remote config (M13 §git-remote-metadata).
+        let git_path = store.git_repo_path().to_path_buf();
+        let metadata_bytes =
+            tokio::task::spawn_blocking(move || {
+                crate::git_ops::collect_git_remotes_metadata(&git_path)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+            .map_err(|e| Status::internal(format!("collecting git remotes: {e:#}")))?;
+        if !metadata_bytes.is_empty() {
+            let new_val = bytes::Bytes::from(metadata_bytes);
+            let current = remote_store
+                .get_ref(crate::git_ops::GIT_REMOTES_REF)
+                .await
+                .ok()
+                .flatten();
+            remote_store
+                .cas_ref(
+                    crate::git_ops::GIT_REMOTES_REF,
+                    current.as_ref(),
+                    Some(&new_val),
+                )
+                .await
+                .map_err(|e| Status::internal(format!("writing git_remotes ref: {e:#}")))?;
+        }
+
+        // Update RootFs in-memory state.
+        root_fs.set_repo_remote(&req.repo, req.url.clone(), Some(remote_store));
+
+        // Persist to repos.toml.
+        let storage_dir = match &self.storage {
+            StorageConfig::OnDisk { root } => root.clone(),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "RemoteAdd requires on-disk storage",
+                ))
+            }
+        };
+        let repos_path = crate::repo_meta::repos_config_path(&storage_dir);
+        let mut repos_cfg = crate::repo_meta::ReposConfig::read_or_default(&repos_path)
+            .map_err(metadata_status("reading repos.toml"))?;
+        if let Some(entry) = repos_cfg.repos.get_mut(&req.repo) {
+            entry.url = req.url.clone();
+        }
+        repos_cfg
+            .write_to(&repos_path)
+            .map_err(metadata_status("persisting repos.toml"))?;
+
+        info!(repo = %req.repo, url = %req.url, "attached kiki remote");
+        Ok(Response::new(RemoteAddReply {}))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn remote_remove(
+        &self,
+        request: Request<RemoteRemoveReq>,
+    ) -> Result<Response<RemoteRemoveReply>, Status> {
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        // Validate repo exists.
+        if root_fs.repo_store(&req.repo).is_none() {
+            return Err(Status::not_found(format!(
+                "repo {:?} not registered",
+                req.repo
+            )));
+        }
+
+        // Clear in-memory remote.
+        root_fs.set_repo_remote(&req.repo, String::new(), None);
+
+        // Persist to repos.toml.
+        let storage_dir = match &self.storage {
+            StorageConfig::OnDisk { root } => root.clone(),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "RemoteRemove requires on-disk storage",
+                ))
+            }
+        };
+        let repos_path = crate::repo_meta::repos_config_path(&storage_dir);
+        let mut repos_cfg = crate::repo_meta::ReposConfig::read_or_default(&repos_path)
+            .map_err(metadata_status("reading repos.toml"))?;
+        if let Some(entry) = repos_cfg.repos.get_mut(&req.repo) {
+            entry.url = String::new();
+        }
+        repos_cfg
+            .write_to(&repos_path)
+            .map_err(metadata_status("persisting repos.toml"))?;
+
+        info!(repo = %req.repo, "detached kiki remote");
+        Ok(Response::new(RemoteRemoveReply {}))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn remote_show(
+        &self,
+        request: Request<RemoteShowReq>,
+    ) -> Result<Response<RemoteShowReply>, Status> {
+        let req = request.into_inner();
+        let root_fs = self.require_root_fs()?;
+
+        let url = root_fs.repo_url(&req.repo).ok_or_else(|| {
+            Status::not_found(format!("repo {:?} not registered", req.repo))
+        })?;
+
+        Ok(Response::new(RemoteShowReply { url }))
     }
 
     #[tracing::instrument(skip(self))]
@@ -2775,14 +3041,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         if let StorageConfig::OnDisk { root } = &self.storage {
             let ws_dir =
                 crate::repo_meta::workspace_dir(root, &req.repo, &req.workspace);
-            if ws_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&ws_dir) {
-                    warn!(
-                        path = %ws_dir.display(),
-                        error = %e,
-                        "failed to remove workspace directory"
-                    );
-                }
+            if ws_dir.exists()
+                && let Err(e) = std::fs::remove_dir_all(&ws_dir)
+            {
+                warn!(
+                    path = %ws_dir.display(),
+                    error = %e,
+                    "failed to remove workspace directory"
+                );
             }
         }
 

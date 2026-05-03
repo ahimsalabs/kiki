@@ -285,6 +285,55 @@ pub fn read_local_refs(git_repo_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(bookmarks)
 }
 
+/// Remove a named remote from the bare git repo.
+pub fn remote_remove(git_repo_path: &Path, name: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["remote", "remove", name])
+        .current_dir(git_repo_path)
+        .output()
+        .context("spawning git remote remove")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git remote remove failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+// ── Git remote metadata (M13 §git-remote-metadata-replication) ──────
+
+/// The ref name used to store git remote metadata on a kiki remote.
+pub const GIT_REMOTES_REF: &str = "git_remotes";
+
+/// Serialized git remote metadata for replication on the kiki remote.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GitRemotesMetadata {
+    pub git_remotes: Vec<GitRemoteEntry>,
+}
+
+/// A single git remote entry.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GitRemoteEntry {
+    pub name: String,
+    pub url: String,
+}
+
+/// Read git remotes from the bare repo and serialize to JSON bytes.
+pub fn collect_git_remotes_metadata(git_repo_path: &Path) -> Result<Vec<u8>> {
+    let remotes = remote_list(git_repo_path)?;
+    let metadata = GitRemotesMetadata {
+        git_remotes: remotes
+            .into_iter()
+            .map(|(name, url)| GitRemoteEntry { name, url })
+            .collect(),
+    };
+    serde_json::to_vec(&metadata).context("serializing git remote metadata")
+}
+
+/// Parse git remote metadata from JSON bytes.
+pub fn parse_git_remotes_metadata(data: &[u8]) -> Result<GitRemotesMetadata> {
+    serde_json::from_slice(data).context("parsing git remote metadata")
+}
+
 /// Detect the default branch after a `git fetch`.
 ///
 /// Checks `refs/remotes/<remote>/HEAD` (set by `git fetch` when the
@@ -296,27 +345,27 @@ pub fn detect_default_branch(git_repo_path: &Path, remote: &str) -> Result<Optio
 
     // Try refs/remotes/<remote>/HEAD (symbolic ref → refs/remotes/<remote>/<branch>).
     let head_ref_name = format!("refs/remotes/{remote}/HEAD");
-    if let Ok(head_ref) = repo.find_reference(&head_ref_name) {
-        if let Some(target_name) = head_ref.inner.target.try_name() {
-            let target = target_name.as_bstr().to_string();
-            if let Some(branch) = target.strip_prefix(&prefix) {
-                return Ok(Some(branch.to_owned()));
-            }
+    if let Ok(head_ref) = repo.find_reference(&head_ref_name)
+        && let Some(target_name) = head_ref.inner.target.try_name()
+    {
+        let target = target_name.as_bstr().to_string();
+        if let Some(branch) = target.strip_prefix(&prefix) {
+            return Ok(Some(branch.to_owned()));
         }
     }
 
     // Fallback: check for well-known branch names in remote-tracking refs.
     let mut branches = Vec::new();
-    if let Ok(refs) = repo.references() {
-        if let Ok(iter) = refs.prefixed(prefix.as_bytes()) {
-            for r in iter {
-                let Ok(r) = r else { continue };
-                let name = r.name().as_bstr().to_string();
-                if let Some(branch) = name.strip_prefix(&prefix) {
-                    if branch != "HEAD" {
-                        branches.push(branch.to_owned());
-                    }
-                }
+    if let Ok(refs) = repo.references()
+        && let Ok(iter) = refs.prefixed(prefix.as_bytes())
+    {
+        for r in iter {
+            let Ok(r) = r else { continue };
+            let name = r.name().as_bstr().to_string();
+            if let Some(branch) = name.strip_prefix(&prefix)
+                && branch != "HEAD"
+            {
+                branches.push(branch.to_owned());
             }
         }
     }
@@ -532,5 +581,61 @@ mod tests {
             files.contains("file.txt"),
             "index should contain file.txt, got: {files}"
         );
+    }
+
+    #[test]
+    fn remote_remove_works() {
+        let (_tmp, git_dir) = init_bare_repo();
+        remote_add(&git_dir, "origin", "https://github.com/test/repo.git").unwrap();
+        assert_eq!(remote_list(&git_dir).unwrap().len(), 1);
+
+        remote_remove(&git_dir, "origin").unwrap();
+        assert!(remote_list(&git_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_remove_nonexistent_fails() {
+        let (_tmp, git_dir) = init_bare_repo();
+        assert!(remote_remove(&git_dir, "noexist").is_err());
+    }
+
+    #[test]
+    fn git_remotes_metadata_roundtrip() {
+        let metadata = GitRemotesMetadata {
+            git_remotes: vec![
+                GitRemoteEntry {
+                    name: "origin".into(),
+                    url: "git@github.com:org/repo.git".into(),
+                },
+                GitRemoteEntry {
+                    name: "upstream".into(),
+                    url: "https://github.com/other/repo.git".into(),
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&metadata).unwrap();
+        let back = parse_git_remotes_metadata(&bytes).unwrap();
+        assert_eq!(metadata, back);
+    }
+
+    #[test]
+    fn collect_git_remotes_metadata_from_repo() {
+        let (_tmp, git_dir) = init_bare_repo();
+        remote_add(&git_dir, "origin", "https://github.com/test/repo.git").unwrap();
+        remote_add(&git_dir, "upstream", "git@github.com:fork/repo.git").unwrap();
+
+        let bytes = collect_git_remotes_metadata(&git_dir).unwrap();
+        let metadata = parse_git_remotes_metadata(&bytes).unwrap();
+        assert_eq!(metadata.git_remotes.len(), 2);
+        assert!(metadata.git_remotes.iter().any(|r| r.name == "origin"));
+        assert!(metadata.git_remotes.iter().any(|r| r.name == "upstream"));
+    }
+
+    #[test]
+    fn collect_git_remotes_metadata_empty_repo() {
+        let (_tmp, git_dir) = init_bare_repo();
+        let bytes = collect_git_remotes_metadata(&git_dir).unwrap();
+        let metadata = parse_git_remotes_metadata(&bytes).unwrap();
+        assert!(metadata.git_remotes.is_empty());
     }
 }

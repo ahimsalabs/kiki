@@ -1,19 +1,21 @@
 # kiki: Implementation Plan
 
 Status: active. Transport architecture decided (§4.3 Path C). M1–M10.7
-done — see milestone index below for per-milestone detail. 330 tests
-(250 daemon + 17 CLI + 41 integration + 22 store) pass; `cargo clippy
---workspace --all-targets -- -D warnings` is clean. SSH remote
-transport (`kiki+ssh://`) landed. **M10.7 (gitignore-aware VFS +
-redirections) landed:** `.gitignore` rules loaded at checkout, new
-files tagged `ignored` at creation, `snapshot_node` skips ignored
-inodes. `.kiki-redirections` file redirects configured dirs
-(`node_modules/`, `target/`, etc.) to local scratch storage via
-symlinks — all I/O bypasses FUSE entirely. Hot-reload on `.gitignore`
-and `.kiki-redirections` writes. **M12 (managed workspaces) active:**
-single `RootFs` FUSE mount at `/mnt/kiki/`, per-repo shared git
-store, cheap workspace creation, lazy hydration. Next up: M12
-implementation, M11 (async push queue). Last updated: 2026-05-02
+done — see milestone index below for per-milestone detail. 356 daemon
+tests + 22 store tests pass; `cargo clippy --workspace --all-targets
+-- -D warnings` is clean. SSH remote transport (`kiki+ssh://`) landed.
+**M10.7 (gitignore-aware VFS + redirections) landed:** `.gitignore`
+rules loaded at checkout, new files tagged `ignored` at creation,
+`snapshot_node` skips ignored inodes. `.kiki-redirections` file
+redirects configured dirs (`node_modules/`, `target/`, etc.) to local
+scratch storage via symlinks — all I/O bypasses FUSE entirely.
+Hot-reload on `.gitignore` and `.kiki-redirections` writes. **M12
+(managed workspaces) active:** single `RootFs` FUSE mount at
+`/mnt/kiki/`, per-repo shared git store, cheap workspace creation,
+lazy hydration. **M13 (git clone & dual-remote model) landed:**
+`kiki clone git@...` works directly, `kiki remote add/remove/show`
+for kiki-native remotes, git remote metadata replication.
+Next up: M11 (async push queue). Last updated: 2026-05-03
 
 This document captures the roadmap for getting kiki from "scaffold with
 stubs" to "usable read/write VCS", along with a review of assumptions
@@ -49,7 +51,7 @@ wasted effort. If it does, B and C are routine engineering.
 | **Daemon lifecycle** — auto-start, launchd/systemd integration | ✅ done | [`DAEMON_LIFECYCLE.md`](./DAEMON_LIFECYCLE.md) |
 | **M11** — async push queue + offline resilience | active | [`M11-PUSH-QUEUE.md`](./M11-PUSH-QUEUE.md) |
 | **M12 — Workspaces** — single RootFs mount, managed namespace, multi-workspace orchestration | active | [`M12-WORKSPACES.md`](./M12-WORKSPACES.md), [`WORKSPACES.md`](./WORKSPACES.md) |
-| **M13 — Git clone & dual-remote model** — first-class git URLs, `kiki remote`, `kiki+ssh://` rename | active | [`M13-GIT-CLONE.md`](./M13-GIT-CLONE.md) |
+| **M13 — Git clone & dual-remote model** — first-class git URLs, `kiki remote`, `kiki+ssh://` rename | ✅ done | [`M13-GIT-CLONE.md`](./M13-GIT-CLONE.md) |
 | **Linear history & segment index** — `linear` ref protection, O(1) ancestor queries | future | [`LINEAR_HISTORY.md`](./LINEAR_HISTORY.md) |
 | **Inode GC** — evict unused inodes from memory (critical for macOS NFS) | future | §10 |
 | **Graceful restart / takeover** — fd-passing so daemon upgrades don't unmount | future | §10 |

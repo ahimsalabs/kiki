@@ -130,6 +130,8 @@ enum KikiSubcommand {
     Kk(KikiArgs),
     /// Clone a remote repo into the managed workspace namespace
     Clone(CloneCommandArgs),
+    /// Manage the kiki-native remote (full-fidelity sync)
+    Remote(RemoteCommandArgs),
 }
 
 /// Clone a remote repo into the managed namespace (`/mnt/kiki/<name>/default`).
@@ -175,6 +177,31 @@ fn classify_clone_url(url: &str) -> CloneSource {
         // Everything else is git: https, http, git, ssh, etc.
         _ => CloneSource::Git(url.to_string()),
     }
+}
+
+// ── M13: kiki remote management ─────────────────────────────────────
+
+#[derive(Debug, Clone, clap::Args)]
+struct RemoteCommandArgs {
+    #[command(subcommand)]
+    command: RemoteCommands,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum RemoteCommands {
+    /// Attach a kiki remote for full-fidelity sync
+    Add(RemoteAddArgs),
+    /// Detach the kiki remote
+    Remove,
+    /// Show the current kiki remote
+    Show,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct RemoteAddArgs {
+    /// Kiki remote URL (s3://..., kiki://..., kiki+ssh://..., dir://...)
+    #[arg(value_hint = clap::ValueHint::Url)]
+    url: String,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -683,6 +710,9 @@ async fn run_kk_command(
     match command {
         KikiSubcommand::Clone(args) => {
             return run_clone_command(ui, command_helper, args).await;
+        }
+        KikiSubcommand::Remote(args) => {
+            return run_remote_command(ui, command_helper, args).await;
         }
         KikiSubcommand::Kk(_) => {} // fall through to existing dispatch below
     }
@@ -1373,15 +1403,15 @@ fn create_link(
             link_path.display()
         )));
     }
-    if let Some(parent) = link_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                user_error_with_message(
-                    format!("creating parent directory {}", parent.display()),
-                    e,
-                )
-            })?;
-        }
+    if let Some(parent) = link_path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            user_error_with_message(
+                format!("creating parent directory {}", parent.display()),
+                e,
+            )
+        })?;
     }
     std::os::unix::fs::symlink(target, link_path).map_err(|e| {
         user_error_with_message(
@@ -1394,6 +1424,74 @@ fn create_link(
         )
     })?;
     Ok(())
+}
+
+// ── M13: kiki remote CLI commands ───────────────────────────────────
+
+/// `kiki remote add/remove/show`
+///
+/// Manages the kiki-native remote for the current repo. Repo is inferred
+/// from cwd (you must be inside a managed workspace).
+async fn run_remote_command(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    args: RemoteCommandArgs,
+) -> Result<(), CommandError> {
+    let client = daemon_client::connect_or_start(command_helper.settings())
+        .map_err(|e| user_error_with_message("failed to connect to kiki daemon", e))?;
+
+    let repo = infer_repo_from_cwd(command_helper).ok_or_else(|| {
+        user_error(
+            "cannot infer repo from current directory; \
+             run this command from inside a managed workspace under /mnt/kiki/<repo>/",
+        )
+    })?;
+
+    match args.command {
+        RemoteCommands::Add(add_args) => {
+            writeln!(
+                ui.status(),
+                "Attaching kiki remote {} to {}...",
+                add_args.url,
+                repo,
+            )?;
+            client
+                .remote_add(proto::jj_interface::RemoteAddReq {
+                    repo: repo.clone(),
+                    url: add_args.url.clone(),
+                })
+                .map_err(|e| user_error_with_message("RemoteAdd RPC failed", e))?;
+            writeln!(
+                ui.status(),
+                "Done. Kiki remote attached: {}",
+                add_args.url,
+            )?;
+            Ok(())
+        }
+        RemoteCommands::Remove => {
+            client
+                .remote_remove(proto::jj_interface::RemoteRemoveReq {
+                    repo: repo.clone(),
+                })
+                .map_err(|e| user_error_with_message("RemoteRemove RPC failed", e))?;
+            writeln!(ui.status(), "Kiki remote detached from {}.", repo)?;
+            Ok(())
+        }
+        RemoteCommands::Show => {
+            let reply = client
+                .remote_show(proto::jj_interface::RemoteShowReq {
+                    repo: repo.clone(),
+                })
+                .map_err(|e| user_error_with_message("RemoteShow RPC failed", e))?
+                .into_inner();
+            if reply.url.is_empty() {
+                writeln!(ui.stdout_formatter(), "(none)")?;
+            } else {
+                writeln!(ui.stdout_formatter(), "{}", reply.url)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `kiki workspace create/list/delete`

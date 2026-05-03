@@ -339,13 +339,12 @@ impl RemoteStore for S3RemoteStore {
             })?;
 
             for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    // Strip the prefix to get the ref name.
-                    if let Some(name) = key.strip_prefix(&prefix) {
-                        if !name.is_empty() && !name.contains('/') {
-                            names.push(name.to_owned());
-                        }
-                    }
+                if let Some(key) = obj.key()
+                    && let Some(name) = key.strip_prefix(&prefix)
+                    && !name.is_empty()
+                    && !name.contains('/')
+                {
+                    names.push(name.to_owned());
                 }
             }
 
