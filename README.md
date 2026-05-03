@@ -5,7 +5,7 @@ A virtual filesystem for your repos. Built on
 
 ```bash
 kiki clone git@github.com:myorg/myproject.git
-cd /mnt/kiki/myproject/default
+cd ~/kiki/myproject/default
 vim src/main.rs       # files appear on read, sync on write
 ```
 
@@ -14,7 +14,7 @@ vim src/main.rs       # files appear on read, sync on write
 
 ## What is this
 
-A daemon serves your repos through a single mount at `/mnt/kiki/`.
+A daemon serves your repos through a single mount at `~/kiki/`.
 Each repo gets lightweight workspaces — files are fetched lazily on
 read and synced to a remote store in the background. No checkout
 step, no full clone. Multiple workspaces share a single git object
@@ -41,8 +41,8 @@ kiki describe -m "fix auth bug" # this is jj describe
 Top-level kiki commands handle repo and workspace lifecycle:
 
 ```bash
-kiki clone git@github.com:org/repo.git  # clone into /mnt/kiki/repo/default
-kiki workspace create repo/fix  # new workspace at /mnt/kiki/repo/fix
+kiki clone git@github.com:org/repo.git  # clone into ~/kiki/repo/default
+kiki workspace create repo/fix  # new workspace at ~/kiki/repo/fix
 kiki workspace list repo        # list workspaces
 kiki workspace delete repo/fix  # remove a workspace
 kiki remote add s3://bucket/repo  # attach a kiki remote for team sync
@@ -76,14 +76,14 @@ kiki (CLI)
   │  gRPC over Unix socket
   ▼
 daemon
-  ├─ RootFs        /mnt/kiki/<repo>/<workspace>/ namespace
+  ├─ RootFs        ~/kiki/<repo>/<workspace>/ namespace
   ├─ GitBackend    bare git repo (content store, shared per repo)
   ├─ RemoteStore   dir:// · s3:// · kiki+ssh:// · kiki:// (grpc)
   └─ VFS           FUSE (Linux) · NFS (macOS)
 ```
 
 The daemon auto-starts on first command and runs in the
-background. A single FUSE mount at `/mnt/kiki/` serves all repos
+background. A single mount at `~/kiki/` (FUSE on Linux, NFS on macOS) serves all repos
 and workspaces. `kiki kk daemon status` shows what's running.
 
 ## Status
@@ -92,7 +92,7 @@ and workspaces. `kiki kk daemon status` shows what's running.
 sync, multi-machine sharing via `dir://` / `s3://` / `kiki+ssh://` / `kiki://`,
 git push and fetch to GitHub/GitLab, operation log sharing,
 `.gitignore`-aware VFS, daemon lifecycle, managed workspaces
-(`kiki clone`, `kiki workspace`, single RootFs mount at `/mnt/kiki/`),
+(`kiki clone`, `kiki workspace`, single RootFs mount at `~/kiki/`),
 first-class git clone with immediate content materialization,
 colocated git support (`git commit` inside mounts visible in `kiki log`).
 
