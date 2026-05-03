@@ -843,12 +843,10 @@ fn git_commit_visible_in_kiki_log() {
     env.kiki_cmd_ok(&ws_path, &["log", "--no-graph", "--limit", "1"]);
 
     // Write a file and commit it via stock git (not jj/kiki).
-    // The FUSE mount has different ownership, so git's safe.directory
-    // check must be relaxed.
     std::fs::write(ws_path.join("colocated.txt"), "git was here\n").unwrap();
 
     let git_add = std::process::Command::new("git")
-        .args(["-c", "safe.directory=*", "add", "colocated.txt"])
+        .args(["add", "colocated.txt"])
         .current_dir(&ws_path)
         .output()
         .expect("git add");
@@ -860,7 +858,6 @@ fn git_commit_visible_in_kiki_log() {
 
     let git_commit = std::process::Command::new("git")
         .args([
-            "-c", "safe.directory=*",
             "-c", "user.name=Test User",
             "-c", "user.email=test@test.com",
             "commit", "-m", "colocated commit",

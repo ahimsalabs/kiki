@@ -9,6 +9,12 @@
 //!   repos/
 //!     <repo_name>/
 //!       git_store/                      # shared bare git repo
+//!         git/
+//!           worktrees/
+//!             <workspace_name>/         # per-workspace git worktree gitdir
+//!               HEAD                    #   own HEAD (detached)
+//!               index                   #   own staging area
+//!               commondir               #   → "../.." (shared objects)
 //!       store.redb                      # shared redb (op-store, LocalRefs)
 //!       workspaces/
 //!         <workspace_name>/
@@ -203,6 +209,24 @@ pub fn workspace_config_path(
     ws_name: &str,
 ) -> PathBuf {
     workspace_dir(storage_dir, repo_name, ws_name).join("workspace.toml")
+}
+
+/// Per-workspace git worktree gitdir inside the shared bare repo.
+///
+/// `<storage_dir>/repos/<repo_name>/git_store/git/worktrees/<ws_name>/`
+///
+/// This directory holds the workspace's own HEAD, index, and a
+/// `commondir` file pointing back to the shared bare repo. It enables
+/// stock `git add`/`git commit` per workspace without index collisions.
+pub fn workspace_worktree_gitdir(
+    storage_dir: &Path,
+    repo_name: &str,
+    ws_name: &str,
+) -> PathBuf {
+    repo_git_store_path(storage_dir, repo_name)
+        .join("git")
+        .join("worktrees")
+        .join(ws_name)
 }
 
 /// `<storage_dir>/repos/<repo_name>/workspaces/<ws_name>/scratch/`
@@ -494,6 +518,10 @@ mod tests {
         assert_eq!(
             workspace_scratch_dir(s, "mono", "default"),
             PathBuf::from("/data/kiki/repos/mono/workspaces/default/scratch")
+        );
+        assert_eq!(
+            workspace_worktree_gitdir(s, "mono", "default"),
+            PathBuf::from("/data/kiki/repos/mono/git_store/git/worktrees/default")
         );
     }
 

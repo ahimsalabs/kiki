@@ -153,21 +153,25 @@ pub fn fetch(
     Ok(bookmarks)
 }
 
-/// Write HEAD as a detached head pointing at `commit_oid` in the bare git repo.
-pub fn export_head(git_repo_path: &Path, commit_oid: &[u8]) -> Result<()> {
+/// Write HEAD as a detached head pointing at `commit_oid`.
+///
+/// `git_repo_path` is the shared bare repo (used for object verification).
+/// `head_dir` is where the HEAD file is written — either the bare repo
+/// itself (legacy mounts) or a per-workspace worktree gitdir (managed
+/// workspaces).
+pub fn export_head(git_repo_path: &Path, head_dir: &Path, commit_oid: &[u8]) -> Result<()> {
     let repo = gix::open(git_repo_path).context("opening git repo for export_head")?;
     let oid = gix::ObjectId::try_from(commit_oid)
         .map_err(|_| anyhow!("invalid commit id for export_head"))?;
     if !repo.objects.exists(&oid) {
         anyhow::bail!("commit {} not found in git ODB", oid);
     }
-    repo.reference(
-        "HEAD",
-        oid,
-        gix::refs::transaction::PreviousValue::Any,
-        "kiki export head",
-    )
-    .context("setting HEAD")?;
+    // Write detached HEAD directly. For worktree gitdirs, gix::open
+    // would need commondir support; writing the file is simpler and
+    // matches git's own format.
+    let head_path = head_dir.join("HEAD");
+    std::fs::write(&head_path, format!("{oid}\n"))
+        .with_context(|| format!("writing HEAD at {}", head_path.display()))?;
     Ok(())
 }
 
@@ -200,23 +204,31 @@ pub fn export_bookmarks(git_repo_path: &Path, bookmarks: &[(String, Vec<u8>)]) -
 
 /// Reset the git index to match a tree object in the bare repo.
 ///
-/// Rebuilds `<git_repo>/index` so that `git status`, `git diff`, and
-/// `git add` work correctly when run from the FUSE mount. The index
-/// should match the "committed" tree (the checkout target), so `git
-/// status` shows the same diff as `jj diff`.
-pub fn reset_index(git_repo_path: &Path, tree_oid: &[u8]) -> Result<()> {
+/// Rebuilds the index so that `git status`, `git diff`, and `git add`
+/// work correctly when run from the FUSE mount. The index should match
+/// the "committed" tree (the checkout target), so `git status` shows
+/// the same diff as `jj diff`.
+///
+/// `git_repo_path` is the shared bare repo (has the tree objects).
+/// `index_dir` is where the index file is written — either the bare
+/// repo (legacy) or a per-workspace worktree gitdir (managed).
+pub fn reset_index(git_repo_path: &Path, index_dir: &Path, tree_oid: &[u8]) -> Result<()> {
     let repo = gix::open(git_repo_path).context("opening git repo for reset_index")?;
     let oid = gix::ObjectId::try_from(tree_oid)
         .map_err(|_| anyhow!("invalid tree id for reset_index"))?;
+    let index_path = index_dir.join("index");
     let mut index = if oid.is_null() || !repo.objects.exists(&oid) {
         // Empty or missing tree → empty index.
         gix::index::File::from_state(
             gix::index::State::new(repo.object_hash()),
-            repo.index_path(),
+            index_path,
         )
     } else {
-        repo.index_from_tree(&oid)
-            .context("building index from tree")?
+        let mut idx = repo.index_from_tree(&oid)
+            .context("building index from tree")?;
+        // Repoint the index file to the target directory.
+        idx.set_path(index_path);
+        idx
     };
     index
         .write(gix::index::write::Options::default())
@@ -250,14 +262,25 @@ pub fn cleanup_stale_refs(
     Ok(())
 }
 
-/// Read the current HEAD commit from the bare git repo.
-/// Returns `None` if HEAD is unborn or symbolic (not detached).
-pub fn read_head(git_repo_path: &Path) -> Result<Option<Vec<u8>>> {
-    let repo = gix::open(git_repo_path).context("opening git repo for read_head")?;
-    let head = repo.head().context("reading HEAD")?;
-    match head.kind {
-        gix::head::Kind::Detached { target, .. } => Ok(Some(target.as_bytes().to_vec())),
-        _ => Ok(None),
+/// Read the current HEAD commit from a git directory (bare repo or
+/// worktree gitdir). Returns `None` if HEAD is unborn, symbolic, or
+/// the file doesn't exist.
+pub fn read_head(head_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let head_path = head_dir.join("HEAD");
+    let content = match std::fs::read_to_string(&head_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("reading HEAD"),
+    };
+    let trimmed = content.trim();
+    // Symbolic refs (e.g. "ref: refs/heads/main") are not detached.
+    if trimmed.starts_with("ref:") {
+        return Ok(None);
+    }
+    // Parse hex OID.
+    match gix::ObjectId::from_hex(trimmed.as_bytes()) {
+        Ok(oid) => Ok(Some(oid.as_bytes().to_vec())),
+        Err(_) => Ok(None),
     }
 }
 
@@ -283,6 +306,57 @@ pub fn read_local_refs(git_repo_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         bookmarks.push((short_str, oid.as_bytes().to_vec()));
     }
     Ok(bookmarks)
+}
+
+/// Initialize a per-workspace git worktree directory inside the shared
+/// bare repo's `worktrees/` namespace.
+///
+/// Creates the directory structure that makes stock `git status`,
+/// `git add`, and `git commit` work from a FUSE mount whose `.git`
+/// file points at the returned worktree gitdir.
+///
+/// # Layout
+///
+/// ```text
+/// <git_repo_path>/worktrees/<worktree_name>/
+///   commondir   → "../.."            (relative path to the main gitdir)
+///   HEAD        → "ref: refs/heads/main\n"  (unborn; export_head sets it)
+/// ```
+///
+/// Returns the absolute path of the worktree gitdir.
+pub fn init_worktree(
+    git_repo_path: &Path,
+    worktree_name: &str,
+) -> Result<std::path::PathBuf> {
+    let wt_dir = git_repo_path.join("worktrees").join(worktree_name);
+    std::fs::create_dir_all(&wt_dir)
+        .with_context(|| format!("creating worktree dir {}", wt_dir.display()))?;
+
+    // commondir: relative path from worktree gitdir to the main gitdir.
+    // Two levels up: worktrees/<name>/ → <git_repo_path>/
+    std::fs::write(wt_dir.join("commondir"), "../..\n")
+        .context("writing commondir")?;
+
+    // HEAD: start as symbolic ref (unborn). export_head will overwrite
+    // with a detached OID on the first WriteCommit.
+    let head_path = wt_dir.join("HEAD");
+    if !head_path.exists() {
+        std::fs::write(&head_path, "ref: refs/heads/main\n")
+            .context("writing initial HEAD")?;
+    }
+
+    // Ensure core.bare = false so git allows work-tree operations
+    // when opening through the worktree path. This is idempotent.
+    let config_path = git_repo_path.join("config");
+    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+        if config_str.contains("bare = true") {
+            let updated = config_str.replace("bare = true", "bare = false");
+            std::fs::write(&config_path, updated)
+                .context("setting core.bare = false")?;
+        }
+    }
+
+    Ok(wt_dir)
 }
 
 /// Remove a named remote from the bare git repo.
@@ -502,9 +576,28 @@ mod tests {
         let (_tmp, git_dir) = init_bare_repo();
         let commit_oid = create_test_commit(&git_dir);
 
-        export_head(&git_dir, &commit_oid).unwrap();
+        // Write HEAD to the bare repo itself (legacy path).
+        export_head(&git_dir, &git_dir, &commit_oid).unwrap();
         let read_back = read_head(&git_dir).unwrap();
         assert_eq!(read_back, Some(commit_oid));
+    }
+
+    #[test]
+    fn export_head_to_worktree() {
+        let (_tmp, git_dir) = init_bare_repo();
+        let commit_oid = create_test_commit(&git_dir);
+
+        // Init a worktree and write HEAD there.
+        let wt_dir = init_worktree(&git_dir, "ws1").unwrap();
+        export_head(&git_dir, &wt_dir, &commit_oid).unwrap();
+
+        // Read back from the worktree gitdir.
+        let read_back = read_head(&wt_dir).unwrap();
+        assert_eq!(read_back, Some(commit_oid.clone()));
+
+        // The bare repo's HEAD should be unchanged (still symbolic/unborn).
+        let bare_head = read_head(&git_dir).unwrap();
+        assert_ne!(bare_head, Some(commit_oid));
     }
 
     #[test]
@@ -566,8 +659,8 @@ mod tests {
             .trim();
         let tree_oid = gix::ObjectId::from_hex(tree_hex.as_bytes()).unwrap();
 
-        // Reset index to the tree.
-        reset_index(&git_dir, tree_oid.as_bytes()).unwrap();
+        // Reset index to the tree (bare repo = legacy path).
+        reset_index(&git_dir, &git_dir, tree_oid.as_bytes()).unwrap();
 
         // Verify git sees entries in the index.
         let output = Command::new("git")

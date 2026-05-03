@@ -542,7 +542,7 @@ impl JujutsuService {
         // way M9's RPC-layer reads already do.
         let scratch_dir = self.storage.scratch_dir_for(&meta.working_copy_path);
         let fs: Arc<dyn JjKikiFs> =
-            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir));
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir, None));
 
         // On Linux (FUSE), the kernel tears down the mount when the
         // daemon's process exits — the path is usually a clean empty dir
@@ -743,6 +743,18 @@ impl JujutsuService {
         } else {
             None
         }
+    }
+
+    /// Resolve the per-workspace worktree gitdir for a managed workspace.
+    /// Returns `None` for legacy (ad-hoc) mounts.
+    fn worktree_gitdir_for(&self, working_copy_path: &str) -> Option<PathBuf> {
+        let (repo, ws) = self.is_managed(working_copy_path)?;
+        let storage_dir = match &self.storage {
+            StorageConfig::OnDisk { root } => root,
+            _ => return None,
+        };
+        let wt_dir = crate::repo_meta::workspace_worktree_gitdir(storage_dir, &repo, &ws);
+        if wt_dir.exists() { Some(wt_dir) } else { None }
     }
 }
 
@@ -1281,7 +1293,7 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // RPC layer already does at `service.rs`.
         let scratch_dir = self.storage.scratch_dir_for(&req.path);
         let fs: Arc<dyn JjKikiFs> =
-            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir));
+            Arc::new(KikiFs::new(store.clone(), root_tree_id, remote_store.clone(), scratch_dir, None));
 
         // Production path validates and binds; test path skips both so
         // unit tests can use arbitrary string paths.
@@ -1640,11 +1652,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             }
         }
 
-        // Colocation: update HEAD in the bare git repo so stock `git log`
-        // shows the latest state. Best-effort — a failure here doesn't
-        // invalidate the commit itself.
+        // Colocation: update HEAD so stock `git log` shows the latest
+        // state. For managed workspaces, HEAD lives in the per-workspace
+        // worktree gitdir; for legacy mounts, in the bare repo itself.
+        // Best-effort — a failure here doesn't invalidate the commit.
         let git_path = store.git_repo_path().to_path_buf();
-        if let Err(e) = crate::git_ops::export_head(&git_path, &id) {
+        let head_dir = self.worktree_gitdir_for(&req.working_copy_path)
+            .unwrap_or_else(|| git_path.clone());
+        if let Err(e) = crate::git_ops::export_head(&git_path, &head_dir, &id) {
             tracing::warn!("export_head after WriteCommit: {e:#}");
         } else {
             // Track what we exported so Snapshot can detect external changes.
@@ -2084,8 +2099,9 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         // mount). If HEAD differs from what we last exported, surface the
         // new commit id so the CLI can import it.
         let external_git_head = if !last_exported_head.is_empty() {
-            let git_path = store.git_repo_path().to_path_buf();
-            match crate::git_ops::read_head(&git_path) {
+            let head_dir = self.worktree_gitdir_for(&req.working_copy_path)
+                .unwrap_or_else(|| store.git_repo_path().to_path_buf());
+            match crate::git_ops::read_head(&head_dir) {
                 Ok(Some(current_head)) if current_head != last_exported_head => {
                     info!(
                         path = %req.working_copy_path,
@@ -2177,8 +2193,12 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         }
 
         // Best-effort: rebuild the git index to match the checked-out tree.
+        // For managed workspaces, the index lives in the per-workspace
+        // worktree gitdir; for legacy mounts, in the bare repo.
         let git_path = store.git_repo_path().to_path_buf();
-        if let Err(e) = crate::git_ops::reset_index(&git_path, &new_tree_id.0) {
+        let index_dir = self.worktree_gitdir_for(&req.working_copy_path)
+            .unwrap_or_else(|| git_path.clone());
+        if let Err(e) = crate::git_ops::reset_index(&git_path, &index_dir, &new_tree_id.0) {
             warn!("reset_index after CheckOut: {e:#}");
         }
 
@@ -2329,9 +2349,13 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
             };
 
         let git_path = store.git_repo_path().to_path_buf();
+        // Read HEAD from the per-workspace worktree gitdir if available,
+        // otherwise from the shared bare repo.
+        let head_dir = self.worktree_gitdir_for(&req.working_copy_path)
+            .unwrap_or_else(|| git_path.clone());
 
         let new_head = if !last_exported_head.is_empty() {
-            match crate::git_ops::read_head(&git_path) {
+            match crate::git_ops::read_head(&head_dir) {
                 Ok(Some(current_head)) if current_head != last_exported_head => current_head,
                 _ => Vec::new(),
             }
@@ -2525,6 +2549,12 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         std::fs::create_dir_all(&scratch).map_err(|e| {
             Status::internal(format!("creating scratch dir: {e}"))
         })?;
+
+        // Init per-workspace git worktree for colocated git support.
+        let git_path = store.git_repo_path().to_path_buf();
+        if let Err(e) = crate::git_ops::init_worktree(&git_path, "default") {
+            tracing::warn!(error = %format!("{e:#}"), "init_worktree for default (git colocation disabled)");
+        }
 
         // Register default workspace with RootFs (active immediately).
         root_fs
@@ -2731,6 +2761,14 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         std::fs::create_dir_all(&scratch).map_err(|e| {
             Status::internal(format!("creating scratch dir: {e}"))
         })?;
+
+        // Init per-workspace git worktree for colocated git support.
+        {
+            let git_path = store.git_repo_path().to_path_buf();
+            if let Err(e) = crate::git_ops::init_worktree(&git_path, "default") {
+                tracing::warn!(error = %format!("{e:#}"), "init_worktree for default (git colocation disabled)");
+            }
+        }
 
         // Register default workspace with RootFs.
         let empty_tree_clone = empty_tree.clone();
@@ -3058,6 +3096,17 @@ impl jujutsu_interface_server::JujutsuInterface for JujutsuService {
         std::fs::create_dir_all(&scratch).map_err(|e| {
             Status::internal(format!("creating scratch dir: {e}"))
         })?;
+
+        // Init per-workspace git worktree for colocated git support.
+        {
+            let git_path = store.git_repo_path().to_path_buf();
+            if let Err(e) = crate::git_ops::init_worktree(&git_path, &req.workspace) {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "init_worktree for {} (git colocation disabled)", req.workspace
+                );
+            }
+        }
 
         // Register workspace in pending state (hidden from readdir/lookup).
         root_fs
@@ -5116,7 +5165,7 @@ mod tests {
         };
         let store = Arc::new(GitContentStore::new_in_memory(&settings));
         let root = ty::Id(store.empty_tree_id().as_bytes().try_into().unwrap());
-        let fs: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root, None, None));
+        let fs: Arc<dyn JjKikiFs> = Arc::new(KikiFs::new(store, root, None, None, None));
         let (_transport, attachment) = vfs_handle
             .bind(mount_path.clone(), fs)
             .await

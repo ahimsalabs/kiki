@@ -150,7 +150,7 @@ impl Sim {
 
     /// Create a fresh [`KikiFs`] rooted at the last committed snapshot.
     fn new_fs(&self) -> KikiFs {
-        KikiFs::new(self.store.clone(), self.committed_root, None, None)
+        KikiFs::new(self.store.clone(), self.committed_root, None, None, None)
     }
 
     /// Apply `ops[..crash_point]` to a fresh filesystem, then drop it
@@ -379,7 +379,7 @@ async fn basic_write_snapshot_crash_rehydrate() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     // Create and write a file.
     let (ino, _) = fs.create_file(ROOT_INODE, "hello.txt", false).await.unwrap();
@@ -390,7 +390,7 @@ async fn basic_write_snapshot_crash_rehydrate() {
     drop(fs); // crash
 
     // Rehydrate.
-    let fs2 = KikiFs::new(store.clone(), snap_root, None, None);
+    let fs2 = KikiFs::new(store.clone(), snap_root, None, None, None);
     let ino2 = fs2.lookup(ROOT_INODE, "hello.txt").await.unwrap();
     let (data, _) = fs2.read(ino2, 0, u32::MAX).await.unwrap();
     assert_eq!(data, b"world");
@@ -407,7 +407,7 @@ async fn nested_dir_survives_crash_recovery() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     let (dir_ino, _) = fs.mkdir(ROOT_INODE, "src").await.unwrap();
     let (file_ino, _) = fs.create_file(dir_ino, "main.rs", false).await.unwrap();
@@ -416,7 +416,7 @@ async fn nested_dir_survives_crash_recovery() {
     let snap_root = fs.snapshot().await.unwrap();
     drop(fs);
 
-    let fs2 = KikiFs::new(store.clone(), snap_root, None, None);
+    let fs2 = KikiFs::new(store.clone(), snap_root, None, None, None);
     let dir2 = fs2.lookup(ROOT_INODE, "src").await.unwrap();
     let file2 = fs2.lookup(dir2, "main.rs").await.unwrap();
     let (data, _) = fs2.read(file2, 0, u32::MAX).await.unwrap();
@@ -428,7 +428,7 @@ async fn no_snapshot_means_rehydrate_to_empty() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     // Mutations without snapshot.
     fs.create_file(ROOT_INODE, "ephemeral.txt", false)
@@ -438,7 +438,7 @@ async fn no_snapshot_means_rehydrate_to_empty() {
     drop(fs); // crash — no snapshot was taken
 
     // Rehydrate from initial empty root.
-    let fs2 = KikiFs::new(store.clone(), root, None, None);
+    let fs2 = KikiFs::new(store.clone(), root, None, None, None);
     let entries = fs2.readdir(ROOT_INODE).await.unwrap();
     let user_entries: Vec<_> = entries.iter().filter(|e| e.name != ".git").collect();
     assert!(user_entries.is_empty(), "expected empty after crash without snapshot");
@@ -449,7 +449,7 @@ async fn latest_snapshot_wins_after_crash() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     // First generation.
     let (ino, _) = fs.create_file(ROOT_INODE, "f", false).await.unwrap();
@@ -467,7 +467,7 @@ async fn latest_snapshot_wins_after_crash() {
 
     drop(fs); // crash — only snap2 survives
 
-    let fs2 = KikiFs::new(store.clone(), snap2, None, None);
+    let fs2 = KikiFs::new(store.clone(), snap2, None, None, None);
     let ino2 = fs2.lookup(ROOT_INODE, "f").await.unwrap();
     let (data, _) = fs2.read(ino2, 0, u32::MAX).await.unwrap();
     assert_eq!(data, b"v2");
@@ -478,7 +478,7 @@ async fn rename_persists_through_snapshot() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     let (ino, _) = fs.create_file(ROOT_INODE, "old.txt", false).await.unwrap();
     fs.write(ino, 0, b"content").await.unwrap();
@@ -489,7 +489,7 @@ async fn rename_persists_through_snapshot() {
     let snap = fs.snapshot().await.unwrap();
     drop(fs);
 
-    let fs2 = KikiFs::new(store.clone(), snap, None, None);
+    let fs2 = KikiFs::new(store.clone(), snap, None, None, None);
     assert!(fs2.lookup(ROOT_INODE, "old.txt").await.is_err());
     let ino2 = fs2.lookup(ROOT_INODE, "new.txt").await.unwrap();
     let (data, _) = fs2.read(ino2, 0, u32::MAX).await.unwrap();
@@ -501,7 +501,7 @@ async fn remove_reflected_in_snapshot() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     fs.create_file(ROOT_INODE, "gone.txt", false).await.unwrap();
     fs.create_file(ROOT_INODE, "kept.txt", false).await.unwrap();
@@ -511,7 +511,7 @@ async fn remove_reflected_in_snapshot() {
     let snap2 = fs.snapshot().await.unwrap();
     drop(fs);
 
-    let fs2 = KikiFs::new(store.clone(), snap2, None, None);
+    let fs2 = KikiFs::new(store.clone(), snap2, None, None, None);
     assert!(fs2.lookup(ROOT_INODE, "gone.txt").await.is_err());
     assert!(fs2.lookup(ROOT_INODE, "kept.txt").await.is_ok());
 }
@@ -521,7 +521,7 @@ async fn symlink_survives_crash_recovery() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     let (_ino, _) = fs
         .symlink(ROOT_INODE, "link", "/usr/bin/env")
@@ -530,7 +530,7 @@ async fn symlink_survives_crash_recovery() {
     let snap = fs.snapshot().await.unwrap();
     drop(fs);
 
-    let fs2 = KikiFs::new(store.clone(), snap, None, None);
+    let fs2 = KikiFs::new(store.clone(), snap, None, None, None);
     let ino2 = fs2.lookup(ROOT_INODE, "link").await.unwrap();
     let target = fs2.readlink(ino2).await.unwrap();
     assert_eq!(target, "/usr/bin/env");
@@ -541,7 +541,7 @@ async fn snapshot_idempotency_deterministic() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     let (ino, _) = fs.create_file(ROOT_INODE, "f", false).await.unwrap();
     fs.write(ino, 0, b"data").await.unwrap();
@@ -558,7 +558,7 @@ async fn write_extends_preserves_existing_content() {
     let settings = test_settings();
     let store = Arc::new(GitContentStore::new_in_memory(&settings));
     let root = empty_root(&store);
-    let fs = KikiFs::new(store.clone(), root, None, None);
+    let fs = KikiFs::new(store.clone(), root, None, None, None);
 
     let (ino, _) = fs.create_file(ROOT_INODE, "f", false).await.unwrap();
     fs.write(ino, 0, b"hello world").await.unwrap();
@@ -570,7 +570,7 @@ async fn write_extends_preserves_existing_content() {
     let snap2 = fs.snapshot().await.unwrap();
     drop(fs);
 
-    let fs2 = KikiFs::new(store.clone(), snap2, None, None);
+    let fs2 = KikiFs::new(store.clone(), snap2, None, None, None);
     let ino2 = fs2.lookup(ROOT_INODE, "f").await.unwrap();
     let (data, _) = fs2.read(ino2, 0, u32::MAX).await.unwrap();
     assert_eq!(data, b"HELLO world");

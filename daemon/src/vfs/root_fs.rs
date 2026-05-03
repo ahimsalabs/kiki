@@ -688,11 +688,32 @@ impl RootFs {
             &info.ws_name,
         );
 
+        // Per-workspace worktree gitdir for colocated git support.
+        // If the worktree dir doesn't exist yet (pre-existing workspace
+        // from before this feature), init it now.
+        let git_repo_path = info.store.git_repo_path().to_path_buf();
+        let wt_gitdir = crate::repo_meta::workspace_worktree_gitdir(
+            &info.storage_dir,
+            &info.repo_name,
+            &info.ws_name,
+        );
+        if !wt_gitdir.exists() {
+            if let Err(e) = crate::git_ops::init_worktree(&git_repo_path, &info.ws_name) {
+                tracing::warn!(
+                    repo = %info.repo_name,
+                    ws = %info.ws_name,
+                    error = %format!("{e:#}"),
+                    "failed to init worktree gitdir (git colocation disabled)"
+                );
+            }
+        }
+
         let fs = KikiFs::new(
             Arc::clone(&info.store),
             root_tree,
             info.remote_store.clone(),
             Some(scratch_dir),
+            if wt_gitdir.exists() { Some(wt_gitdir) } else { None },
         );
         let local_refs = LocalRefs::new(info.store.database());
 
