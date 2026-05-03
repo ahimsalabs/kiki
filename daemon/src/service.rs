@@ -699,10 +699,12 @@ impl JujutsuService {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(not configured)".into());
         Err(Status::failed_precondition(format!(
-            "the workspace mount is not active at {mount_root}. \
-             Run `kiki kk setup` to configure the mount root, or create it manually:\n\n  \
-             mkdir -p {mount_root}\n\n\
-             Then restart the daemon: `kiki kk daemon stop` and retry."
+            "the workspace mount is not active at {mount_root}.\n\n\
+             If this is a stale mount, unmount it first:\n  \
+             fusermount3 -u {mount_root}\n\n\
+             Then restart the daemon:\n  \
+             kiki kk daemon stop\n\n\
+             Or run `kiki kk setup` to check prerequisites."
         )))
     }
 

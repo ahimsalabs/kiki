@@ -28,6 +28,12 @@ use blocking_client::BlockingJujutsuInterfaceClient;
 use op_heads_store::KikiOpHeadsStore;
 use working_copy::{KikiWorkingCopy, KikiWorkingCopyFactory};
 
+/// Convert a `tonic::Status` into a user-facing `CommandError`, showing only
+/// the gRPC message (not the raw code, details, or metadata).
+fn rpc_error(context: &str, status: tonic::Status) -> CommandError {
+    user_error(format!("{context}: {}", status.message()))
+}
+
 /// Create a new repo in the given directory
 /// If the given directory does not exist, it will be created. If no directory
 /// is given, the current directory is used.
@@ -1280,13 +1286,14 @@ fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
 
     // ── 2. Create mount root ───────────────────────────────────────
     write!(ui.status(), "  mount root ({}) ... ", mount_root.display())?;
-    if mount_root.exists() {
+    let mount_root_ok = if mount_root.exists() {
         // Check we can write to it.
         let probe = mount_root.join(".kiki-setup-probe");
         match std::fs::File::create(&probe) {
             Ok(_) => {
                 let _ = std::fs::remove_file(&probe);
                 writeln!(ui.status(), "ok")?;
+                true
             }
             Err(e) => {
                 writeln!(ui.status(), "NOT WRITABLE")?;
@@ -1296,13 +1303,21 @@ fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
                      Fix with: sudo chown $USER {}",
                     mount_root.display(),
                 )?;
+                false
             }
         }
     } else {
-        // Try to create it directly.
+        // Try to create it directly. AlreadyExists is fine — can happen
+        // when a stale FUSE mountpoint makes `exists()` return false but
+        // the directory inode is still present.
         match std::fs::create_dir_all(&mount_root) {
             Ok(()) => {
                 writeln!(ui.status(), "created")?;
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                writeln!(ui.status(), "ok (already exists)")?;
+                true
             }
             Err(e) => {
                 writeln!(ui.status(), "FAILED")?;
@@ -1315,13 +1330,14 @@ fn run_setup(ui: &mut Ui) -> Result<(), CommandError> {
                     mount_root.display(),
                     mount_root.display(),
                 )?;
+                false
             }
         }
-    }
+    };
 
     // ── 3. Summary ─────────────────────────────────────────────────
     writeln!(ui.status())?;
-    if mount_root.exists() {
+    if mount_root_ok {
         writeln!(
             ui.status(),
             "Ready. Clone a repo to get started:\n\n  \
@@ -1366,7 +1382,7 @@ async fn run_clone_command(
                     url,
                     name: args.name.clone().unwrap_or_default(),
                 })
-                .map_err(|e| user_error_with_message("Clone RPC failed", e))?
+                .map_err(|e| rpc_error("Clone failed", e))?
                 .into_inner();
             (reply.workspace_path, reply.initial_tree_id)
         }
@@ -1378,7 +1394,7 @@ async fn run_clone_command(
                     name: args.name.clone().unwrap_or_default(),
                     kiki_remote: args.remote.clone().unwrap_or_default(),
                 })
-                .map_err(|e| user_error_with_message("GitClone RPC failed", e))?
+                .map_err(|e| rpc_error("Clone failed", e))?
                 .into_inner();
             if !reply.default_branch.is_empty() {
                 writeln!(
@@ -1579,7 +1595,7 @@ async fn run_remote_command(
                     repo: repo.clone(),
                     url: add_args.url.clone(),
                 })
-                .map_err(|e| user_error_with_message("RemoteAdd RPC failed", e))?;
+                .map_err(|e| rpc_error("Failed to add remote", e))?;
             writeln!(
                 ui.status(),
                 "Done. Kiki remote attached: {}",
@@ -1592,7 +1608,7 @@ async fn run_remote_command(
                 .remote_remove(proto::jj_interface::RemoteRemoveReq {
                     repo: repo.clone(),
                 })
-                .map_err(|e| user_error_with_message("RemoteRemove RPC failed", e))?;
+                .map_err(|e| rpc_error("Failed to remove remote", e))?;
             writeln!(ui.status(), "Kiki remote detached from {}.", repo)?;
             Ok(())
         }
@@ -1601,7 +1617,7 @@ async fn run_remote_command(
                 .remote_show(proto::jj_interface::RemoteShowReq {
                     repo: repo.clone(),
                 })
-                .map_err(|e| user_error_with_message("RemoteShow RPC failed", e))?
+                .map_err(|e| rpc_error("Failed to show remote", e))?
                 .into_inner();
             if reply.url.is_empty() {
                 writeln!(ui.stdout_formatter(), "(none)")?;
@@ -1654,7 +1670,7 @@ async fn run_workspace_create(
             repo: repo.clone(),
             workspace: workspace.clone(),
         })
-        .map_err(|e| user_error_with_message("WorkspaceCreate RPC failed", e))?
+        .map_err(|e| rpc_error("Failed to create workspace", e))?
         .into_inner();
 
     let wc_path = std::path::PathBuf::from(&reply.workspace_path);
@@ -1736,7 +1752,7 @@ async fn run_workspace_create(
             repo: repo.clone(),
             workspace: workspace.clone(),
         })
-        .map_err(|e| user_error_with_message("WorkspaceFinalize RPC failed", e))?;
+        .map_err(|e| rpc_error("Failed to finalize workspace", e))?;
 
     writeln!(
         ui.status(),
@@ -1769,7 +1785,7 @@ fn run_workspace_list(
             .workspace_list(proto::jj_interface::WorkspaceListReq {
                 repo: repo.clone(),
             })
-            .map_err(|e| user_error_with_message("WorkspaceList RPC failed", e))?
+            .map_err(|e| rpc_error("Failed to list workspaces", e))?
             .into_inner();
 
         if reply.workspaces.is_empty() {
@@ -1784,7 +1800,7 @@ fn run_workspace_list(
         // List all repos and their workspaces.
         let reply = client
             .repo_list(proto::jj_interface::RepoListReq {})
-            .map_err(|e| user_error_with_message("RepoList RPC failed", e))?
+            .map_err(|e| rpc_error("Failed to list repos", e))?
             .into_inner();
 
         if reply.repos.is_empty() {
@@ -1816,7 +1832,7 @@ fn run_workspace_delete(
             repo: repo.clone(),
             workspace: workspace.clone(),
         })
-        .map_err(|e| user_error_with_message("WorkspaceDelete RPC failed", e))?;
+        .map_err(|e| rpc_error("Failed to delete workspace", e))?;
 
     writeln!(
         ui.status(),

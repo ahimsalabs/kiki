@@ -76,6 +76,64 @@ impl DaemonConfig {
     }
 }
 
+/// Try to unmount a stale FUSE mount at `path`. A mount is "stale" when
+/// the directory inode exists but the FUSE connection is dead (stat returns
+/// ENOTCONN / "Transport endpoint is not connected"). This happens when a
+/// previous daemon crashed without unmounting.
+fn cleanup_stale_mount(path: &std::path::Path) {
+    // Quick check: if stat succeeds, the mount is either live or it's a
+    // plain directory — either way, nothing to clean up.
+    if path.exists() {
+        return;
+    }
+    // The inode exists (create_dir_all returned AlreadyExists) but stat
+    // failed — likely a stale FUSE mount. Try fusermount3 -u.
+    #[cfg(target_os = "linux")]
+    {
+        match std::process::Command::new("fusermount3")
+            .args(["-u", &path.to_string_lossy()])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                info!(
+                    mount_root = %path.display(),
+                    "cleaned up stale FUSE mount"
+                );
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    mount_root = %path.display(),
+                    stderr = %stderr.trim(),
+                    "fusermount3 -u failed; mount may need manual cleanup"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    mount_root = %path.display(),
+                    error = %e,
+                    "could not run fusermount3 to clean stale mount"
+                );
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("umount")
+            .arg(&path.to_string_lossy().to_string())
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                info!(
+                    mount_root = %path.display(),
+                    "cleaned up stale NFS mount"
+                );
+            }
+            _ => {} // Best-effort on macOS.
+        }
+    }
+}
+
 /// Run the daemon. Blocks until shutdown (signal or error).
 ///
 /// Entry point for `kiki kk daemon run`.
@@ -145,6 +203,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
             } else {
                 match std::fs::create_dir_all(&config.mount_root) {
                     Ok(()) => true,
+                    // AlreadyExists: stale mountpoint where exists() returns
+                    // false but the directory inode is present. Safe to proceed.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
                     Err(e) => {
                         warn!(
                             error = %e,
@@ -156,6 +217,12 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), anyhow::Error> {
                 }
             };
             if mount_root_ready {
+                // Clean up a stale FUSE mount left by a previous daemon
+                // that crashed or was killed without unmounting. The
+                // symptom: the directory inode exists but stat() fails
+                // with ENOTCONN ("Transport endpoint is not connected").
+                cleanup_stale_mount(&config.mount_root);
+
                 let mount_path = config.mount_root.to_string_lossy().to_string();
                 match handle.bind(mount_path, Arc::clone(&root_fs) as Arc<dyn crate::vfs::JjKikiFs>).await {
                     Ok((_transport, attachment)) => {
